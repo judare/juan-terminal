@@ -181,6 +181,8 @@ fn light(hex: u32) -> u32 {
         0x1b2230 => 0xe7eef9, // diff hunk header
         0x1c2b20 => 0xe3f5e6, // diff added line
         0x2e1d20 => 0xfce6e8, // diff removed line
+        0x2d5a36 => 0xb4e2bc, // diff added words
+        0x6a2a32 => 0xf5bcc3, // diff removed words
         // Popovers, chips, tracks.
         0x202227 => 0xffffff,
         0x1e2025 => 0xffffff,
