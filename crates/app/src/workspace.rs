@@ -815,13 +815,16 @@ impl Workspace {
             E::RunDev(cmd) => {
                 let already = self.terminals.get(&self.active_key()).is_some_and(|t| t.tabs.iter().any(|v| v.read(cx).dev_dir.as_ref() == Some(&cmd.dir) && !v.read(cx).has_exited()));
                 if !already {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-                    let program = (shell, vec!["-l".to_string(), "-c".to_string(), cmd.command_line()]);
-                    if let Some(view) = self.spawn_terminal_with(Some(cmd.dir.clone()), None, Some(program), window, cx) {
-                        let (label, dir) = (cmd.label.clone(), cmd.dir.clone());
+                    // A normal interactive terminal with the command typed in: same environment
+                    // as running it by hand (`.zshrc` → nvm's node, aliases…). `zsh -l -c` skips
+                    // .zshrc and picked another node.
+                    if let Some(view) = self.spawn_terminal_with(Some(cmd.dir.clone()), None, None, window, cx) {
+                        let (label, dir, line) = (cmd.label.clone(), cmd.dir.clone(), cmd.command_line());
                         view.update(cx, |t, cx| {
                             t.label = Some(format!("dev · {label}"));
                             t.dev_dir = Some(dir);
+                            // Typed ahead: the shell reads it once its startup files are loaded.
+                            t.send_input(&format!("{line}\r"));
                             cx.notify();
                         });
                     }
