@@ -1,5 +1,6 @@
 //! GitHub Actions section under the file tree. Only shown when a repo of the project has
-//! `.github/workflows/*.yml`. Lists the latest runs per repo and workflow (via `gh`), with
+//! `.github/workflows/*.yml`. Lists the latest runs per repo and workflow on the checked-out
+//! branch (via `gh`), with
 //! job progress for running ones, refresh / cancel / re-run, and logs opened as files.
 
 use std::collections::{HashMap, HashSet};
@@ -71,6 +72,8 @@ struct RepoActions {
     name: String,
     path: PathBuf,
     runs: Vec<Run>,
+    /// Local branch the runs are filtered to (empty: detached HEAD, all branches).
+    branch: String,
     loaded: bool,
     loading: bool,
     error: Option<String>,
@@ -117,11 +120,25 @@ fn n(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
 }
 
-fn fetch_runs(dir: &Path) -> Result<Vec<Run>, String> {
+/// Checked-out branch of `dir`, or None on detached HEAD / not a git repo.
+fn current_branch(dir: &Path) -> Option<String> {
+    let out = Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(dir).output().ok()?;
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !b.is_empty() && b != "HEAD").then_some(b)
+}
+
+/// Runs of the checked-out branch (like GitHub's checks for that branch), newest first.
+fn fetch_runs(dir: &Path) -> Result<(String, Vec<Run>), String> {
     let limit = RUNS_PER_REPO.to_string();
-    let out = gh(dir, &["run", "list", "-L", &limit, "--json", "databaseId,number,displayTitle,workflowName,status,conclusion,headBranch,event,createdAt,url"])?;
+    let branch = current_branch(dir).unwrap_or_default();
+    let mut args = vec!["run", "list", "-L", &limit, "--json", "databaseId,number,displayTitle,workflowName,status,conclusion,headBranch,event,createdAt,url"];
+    if !branch.is_empty() {
+        args.extend(["--branch", branch.as_str()]);
+    }
+    let out = gh(dir, &args)?;
     let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
-    Ok(v.as_array()
+    let runs = v
+        .as_array()
         .map(|a| {
             a.iter()
                 .map(|r| Run {
@@ -136,9 +153,14 @@ fn fetch_runs(dir: &Path) -> Result<Vec<Run>, String> {
                     created: s(r, "createdAt"),
                     url: s(r, "url"),
                 })
-                .collect()
+                .collect::<Vec<Run>>()
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
+        .into_iter()
+        // Nightly `schedule` runs aren't commit checks; they'd mask the push/PR result.
+        .filter(|r: &Run| r.event != "schedule")
+        .collect();
+    Ok((branch, runs))
 }
 
 fn fetch_jobs(dir: &Path, run: u64) -> Result<Vec<Job>, String> {
@@ -452,8 +474,9 @@ impl ActionsPanel {
                 repo.loading = false;
                 repo.loaded = true;
                 match res {
-                    Ok(runs) => {
+                    Ok((branch, runs)) => {
                         repo.error = None;
+                        repo.branch = branch;
                         repo.runs = runs;
                     }
                     Err(e) => repo.error = Some(e),
@@ -778,7 +801,10 @@ impl Render for ActionsPanel {
                         }))
                         .child(gpui::svg().path(if collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }).size(px(10.)).text_color(theme::rgb(theme::TEXT_FAINT)))
                         .child(gpui::svg().path("icons/repo.svg").size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)))
-                        .child(div().flex_1().text_size(px(12.)).font_weight(gpui::FontWeight::MEDIUM).child(repo.name.clone()))
+                        .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.)).font_weight(gpui::FontWeight::MEDIUM).child(repo.name.clone()))
+                        .when(!repo.branch.is_empty(), |d| {
+                            d.child(div().flex_shrink_0().max_w(px(140.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(repo.branch.clone()))
+                        })
                         .when(active > 0, |d| d.child(div().text_size(px(10.5)).text_color(theme::rgb(theme::MODIFIED)).child(format!("{active} en curso")))),
                 );
             }
@@ -792,8 +818,12 @@ impl Render for ActionsPanel {
                 body = body.child(div().px(px(22.)).h(px(24.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Cargando ejecuciones…"));
                 continue;
             }
+            if !multi && !repo.branch.is_empty() {
+                body = body.child(div().px(px(14.)).h(px(20.)).text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("Rama {}", repo.branch)));
+            }
             if repo.runs.is_empty() && repo.error.is_none() {
-                body = body.child(div().px(px(22.)).h(px(24.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Sin ejecuciones"));
+                let msg = if repo.branch.is_empty() { "Sin ejecuciones".to_string() } else { format!("Sin ejecuciones en {}", repo.branch) };
+                body = body.child(div().px(px(22.)).h(px(24.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(msg));
                 continue;
             }
             // One row per workflow: its most recent run (runs come newest first).

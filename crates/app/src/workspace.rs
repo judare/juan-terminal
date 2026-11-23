@@ -7,9 +7,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable, MouseButton,
+    AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable, MouseButton,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, PromptLevel, Render, SharedString,
-    Subscription, Task, Window, WindowBounds, actions, div, prelude::*, px, uniform_list,
+    Subscription, Task, Window, WindowBounds, WindowHandle, actions, div, point, prelude::*, px, uniform_list,
 };
 use project_search::{IndexedFile, Root, list_files};
 use terminal_engine::{Palette, SessionConfig, TermDims, TerminalSession};
@@ -31,6 +31,7 @@ actions!(
     workspace,
     [
         NewTerminal,
+        NewWindow,
         CloseTerminal,
         NextTerminal,
         PreviousTerminal,
@@ -212,6 +213,11 @@ pub struct Workspace {
     file_tools: HashMap<PathBuf, crate::editor_view::FileTools>,
     store: StateStore,
     state: WorkspaceState,
+    /// Saves window geometry and the launch project (the first window; passed on when it closes).
+    primary: bool,
+    /// Projects as last read from / written to disk: other windows' changes are merged
+    /// against this so two windows never overwrite each other.
+    synced: Vec<Project>,
     /// settings.toml (schedules, blocked websites); reloaded when saved in the editor.
     settings: Settings,
     /// Projects outside their schedule right now (re-evaluated every 20 s).
@@ -241,7 +247,7 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(store: StateStore, state: WorkspaceState, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: StateStore, state: WorkspaceState, primary: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
                 this.persist(cx);
@@ -261,6 +267,7 @@ impl Workspace {
                 let active = window.is_window_active();
                 this.stay_awake.set(active);
                 if active {
+                    crate::launcher::set_last_workspace(window.window_handle(), cx);
                     this.on_window_activated(cx);
                     if let (Some(repos), Some(gp)) = (this.pending_git_repos.take(), this.git_panel.clone()) {
                         gp.update(cx, |g, cx| g.set_repos(repos, window, cx));
@@ -302,7 +309,9 @@ impl Workspace {
             stay_awake: Default::default(),
             file_tools: HashMap::new(),
             store,
+            synced: state.projects.clone(),
             state,
+            primary,
             settings: Settings::default(),
             locked: HashSet::new(),
             close_warned: None,
@@ -345,6 +354,12 @@ impl Workspace {
             this.state.active_project = this.state.projects.iter().find(|p| !this.locked.contains(&p.id)).map(|p| p.id.clone());
         }
         this.apply_blocked_websites(cx);
+        // Save this window's project when it closes (other windows keep running).
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = weak.update(cx, |this, cx| this.on_close(cx));
+            true
+        });
         this.ide = crate::claude_bridge::start(window, cx);
         this.ensure_project_loaded(window, cx);
         this.sync_ide(cx);
@@ -486,6 +501,10 @@ impl Workspace {
         let key = self.active_key();
         self.refresh_branches();
         if !self.terminals.contains_key(&key) {
+            if let Some(p) = self.active_project() {
+                let dirs = p.expanded.clone();
+                self.expanded.extend(dirs);
+            }
             self.terminals.insert(key.clone(), Tabs::default());
             let saved: Vec<TerminalState> = self.active_project().map(|p| p.terminals.clone()).unwrap_or_default();
             let active = self.active_project().and_then(|p| p.active_terminal).unwrap_or(0);
@@ -1512,6 +1531,9 @@ impl Workspace {
         if self.state.active_project.as_deref() == Some(id) {
             return;
         }
+        if self.focus_project_window(id, window, cx) {
+            return;
+        }
         if self.show_locked(id, window, cx) {
             return;
         }
@@ -1557,9 +1579,67 @@ impl Workspace {
         cx.notify();
     }
 
+    /// If `id` is already open in another window, bring that window forward (a project lives
+    /// in one window only). The pending launcher action moves along with it.
+    fn focus_project_window(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(other) = window_with_project(id, Some(window.window_handle()), cx) else { return false };
+        let pending = self.pending_launch.take().filter(|(pid, _)| pid == id);
+        cx.defer(move |cx| {
+            cx.activate(true);
+            let _ = other.update(cx, |w, window, cx| {
+                window.activate_window();
+                if let Some((pid, action)) = pending {
+                    w.launcher_run(pid, action, window, cx);
+                }
+            });
+        });
+        true
+    }
+
+    /// Open `id` (None = empty) in a new window, cascaded from this one.
+    fn open_project_window(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.persist(cx);
+        let pending = self.pending_launch.take().filter(|(pid, _)| Some(pid) == id.as_ref());
+        let mut state = self.store.load();
+        state.active_project = id;
+        let b = window.bounds();
+        let bounds = Bounds::new(point(b.origin.x + px(28.), b.origin.y + px(28.)), b.size);
+        let store = StateStore::new(self.store.path().parent().map(Path::to_path_buf).unwrap_or_default());
+        cx.defer(move |cx| match crate::open_workspace_window(store, state, bounds, false, cx) {
+            Ok(handle) => {
+                if let Some((pid, action)) = pending {
+                    let _ = handle.update(cx, |w, window, cx| w.launcher_run(pid, action, window, cx));
+                }
+            }
+            Err(e) => crate::startup_log(&format!("new window: {e:#}")),
+        });
+    }
+
+    /// The window is closing: save its project and hand "primary" to another window.
+    fn on_close(&mut self, cx: &mut Context<Self>) {
+        if self.state.autosave {
+            self.save_all(cx);
+        }
+        self.persist(cx);
+        if self.primary {
+            self.primary = false;
+            cx.defer(|cx| {
+                if let Some(next) = workspace_windows(cx).into_iter().next() {
+                    let _ = next.update(cx, |w, _, cx| {
+                        w.primary = true;
+                        w.persist(cx);
+                    });
+                }
+            });
+        }
+    }
+
     /// Ask before leaving a project that has live terminals or unsaved files.
     fn request_switch_project(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.active_project.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if self.focus_project_window(&id, window, cx) {
             return;
         }
         if self.show_locked(&id, window, cx) {
@@ -1594,11 +1674,16 @@ impl Workspace {
             PromptLevel::Warning,
             &format!("Switch to “{new_name}”?"),
             Some(&detail),
-            &["Switch", "Cancel"],
+            &["Switch", "New Window", "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
+            let answer = answer.await;
+            if answer == Ok(1) {
+                let _ = this.update_in(cx, |this, window, cx| this.open_project_window(Some(id.clone()), window, cx));
+                return;
+            }
+            if answer != Ok(0) {
                 let _ = this.update(cx, |this, _| this.pending_launch = None);
                 return;
             }
@@ -1691,7 +1776,8 @@ impl Workspace {
                 }
             }
             let name = self.active_project().map(|p| p.name.clone()).unwrap_or_default();
-            let next = self.state.projects.iter().find(|p| !self.locked.contains(&p.id)).map(|p| p.id.clone());
+            let elsewhere = open_elsewhere(window, cx);
+            let next = self.state.projects.iter().find(|p| !self.locked.contains(&p.id) && !elsewhere.contains(&p.id)).map(|p| p.id.clone());
             self.activate_project(next, window, cx);
             self.close_warned = None;
             self.error = Some(format!("“{name}” closed: outside its hours (files were saved).").into());
@@ -2180,7 +2266,8 @@ impl Workspace {
             project.open_files = tabs.tabs.iter().filter_map(|e| e.read(cx).path().cloned()).collect();
             project.active_file = Some(tabs.active);
         }
-        for project in &mut self.state.projects {
+        // Only projects this window has open: the others' folders belong to other windows.
+        for project in self.state.projects.iter_mut().filter(|p| self.terminals.contains_key(&p.id) || self.editors.contains_key(&p.id)) {
             let roots: Vec<&PathBuf> = project.repositories.iter().map(|r| &r.path).chain(project.root.iter()).collect();
             project.expanded = self.expanded.iter().filter(|p| roots.iter().any(|r| p.starts_with(r))).cloned().collect();
             project.expanded.sort();
@@ -2188,7 +2275,17 @@ impl Workspace {
         self.state.sidebar_width = Some(self.sidebar_width);
         self.state.terminal_panel_width = Some(self.terminal_width);
         self.state.font_size = Some(self.font_size);
-        if let Err(err) = self.store.save(&self.state) {
+        // Merge with what other windows saved since our last sync.
+        let disk = self.store.load();
+        let merged = merge_projects(&self.synced, &self.state.projects, disk.projects);
+        self.state.projects = merged.clone();
+        self.synced = merged;
+        let mut out = self.state.clone();
+        if !self.primary {
+            out.active_project = disk.active_project;
+            out.window = disk.window;
+        }
+        if let Err(err) = self.store.save(&out) {
             self.error = Some(format!("Could not save workspace: {err:#}").into());
         }
     }
@@ -3134,6 +3231,7 @@ impl Render for Workspace {
             .font_family(theme::UI_FONT)
             .text_color(theme::rgb(theme::TEXT))
             .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(|this, _: &NewWindow, window, cx| this.open_project_window(None, window, cx)))
             .on_action(cx.listener(Self::close_terminal))
             .on_action(cx.listener(|this, _: &NextTerminal, w, cx| this.cycle_terminal(true, w, cx)))
             .on_action(cx.listener(|this, _: &PreviousTerminal, w, cx| this.cycle_terminal(false, w, cx)))
@@ -3351,5 +3449,82 @@ mod tests {
             assert!(!is_config_file(n), "{n}");
         }
         assert_eq!(others_key(Path::new("/r")), PathBuf::from("/r/:others:"));
+    }
+}
+
+/// Workspace windows that are still open.
+pub(crate) fn workspace_windows(cx: &App) -> Vec<WindowHandle<Workspace>> {
+    cx.windows().into_iter().filter_map(|w| w.downcast::<Workspace>()).filter(|w| w.read(cx).is_ok()).collect()
+}
+
+/// The window (other than `except`) whose active project is `id`.
+pub(crate) fn window_with_project(id: &str, except: Option<AnyWindowHandle>, cx: &App) -> Option<WindowHandle<Workspace>> {
+    workspace_windows(cx)
+        .into_iter()
+        .filter(|w| Some(AnyWindowHandle::from(*w)) != except)
+        .find(|w| w.read(cx).is_ok_and(|ws| ws.state.active_project.as_deref() == Some(id)))
+}
+
+/// Active projects of the other workspace windows.
+fn open_elsewhere(window: &Window, cx: &App) -> HashSet<String> {
+    let me = window.window_handle();
+    workspace_windows(cx)
+        .into_iter()
+        .filter(|w| AnyWindowHandle::from(*w) != me)
+        .filter_map(|w| w.read(cx).ok().and_then(|ws| ws.state.active_project.clone()))
+        .collect()
+}
+
+impl Workspace {
+    pub(crate) fn active_project_id(&self) -> Option<&str> {
+        self.state.active_project.as_deref()
+    }
+
+    /// Whether `path` is inside this window's active project.
+    pub(crate) fn owns_path(&self, path: &Path) -> bool {
+        self.active_project().is_some_and(|p| p.repositories.iter().map(|r| &r.path).chain(p.root.iter()).any(|r| path.starts_with(r)))
+    }
+}
+
+/// Three-way merge of the project list: `base` is what this window last synced, `ours` its
+/// current list, `disk` what is saved now (possibly by another window). Projects this window
+/// changed, added or removed win; everything else comes from disk.
+fn merge_projects(base: &[Project], ours: &[Project], disk: Vec<Project>) -> Vec<Project> {
+    let find = |list: &[Project], id: &str| list.iter().position(|p| p.id == id);
+    let mut out: Vec<Project> = Vec::with_capacity(disk.len());
+    for d in disk {
+        let b = find(base, &d.id).map(|i| &base[i]);
+        let o = find(ours, &d.id).map(|i| &ours[i]);
+        match (b, o) {
+            (Some(_), None) => {} // removed here
+            (b, Some(o)) if b != Some(o) => out.push(o.clone()),
+            _ => out.push(d),
+        }
+    }
+    for o in ours {
+        if find(&out, &o.id).is_none() && find(base, &o.id).is_none() {
+            out.push(o.clone()); // added here
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn p(id: &str, name: &str) -> Project {
+        Project { id: id.into(), name: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn keeps_changes_from_both_windows() {
+        let base = vec![p("a", "a"), p("b", "b"), p("c", "c")];
+        // This window renamed a, removed c, added d.
+        let ours = vec![p("a", "A"), p("b", "b"), p("d", "d")];
+        // Another window renamed b and added e.
+        let disk = vec![p("a", "a"), p("b", "B"), p("c", "c"), p("e", "e")];
+        let names: Vec<String> = merge_projects(&base, &ours, disk).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["A", "B", "e", "d"]);
     }
 }

@@ -123,6 +123,7 @@ fn main() {
             Menu {
                 name: "File".into(),
                 items: vec![
+                    MenuItem::action("New Window", workspace::NewWindow),
                     MenuItem::action("New Terminal", workspace::NewTerminal),
                     MenuItem::action("Open Project…", workspace::OpenProject),
                     MenuItem::action("Add Repository…", workspace::AddRepository),
@@ -193,21 +194,7 @@ fn main() {
             .map(|w| Bounds::new(point(px(w.x), px(w.y)), size(px(w.width), px(w.height))))
             .unwrap_or_else(|| Bounds::centered(None, size(px(1200.), px(780.)), cx));
 
-        let window: anyhow::Result<gpui::WindowHandle<Workspace>> = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("juan-terminal".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(14.), px(13.))),
-                }),
-                window_min_size: Some(size(px(480.), px(320.))),
-                app_id: Some("dev.juan.terminal".into()),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| Workspace::new(store, state, window, cx)),
-        );
-        let window = match window {
+        let window = match open_workspace_window(store, state, bounds, true, cx) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("juan-terminal: failed to open window: {err:#}");
@@ -219,7 +206,7 @@ fn main() {
         // ⌘Space anywhere: apps, URLs, projects, files (replaces Raycast/Spotlight).
         launcher::init(window, cx);
 
-        // Single-window app for now: closing it quits (state is saved on quit).
+        // Closing the last window quits (state is saved on quit).
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -233,6 +220,31 @@ fn main() {
             eprintln!("startup: window opened in {:?}", started.elapsed());
         }
     });
+}
+
+/// Open a workspace window. `primary` windows also save the window geometry and the active
+/// project used at the next launch; other windows only save their own project.
+pub(crate) fn open_workspace_window(
+    store: StateStore,
+    state: workspace_state::WorkspaceState,
+    bounds: Bounds<gpui::Pixels>,
+    primary: bool,
+    cx: &mut App,
+) -> anyhow::Result<gpui::WindowHandle<Workspace>> {
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("juan-terminal".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(14.), px(13.))),
+            }),
+            window_min_size: Some(size(px(480.), px(320.))),
+            app_id: Some("dev.juan.terminal".into()),
+            ..Default::default()
+        },
+        |window, cx| cx.new(|cx| Workspace::new(store, state, primary, window, cx)),
+    )
 }
 
 fn bind_keys(cx: &mut App) {
@@ -259,6 +271,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", w::NextEditor, Some("Editor")),
         KeyBinding::new("ctrl-shift-tab", w::PreviousEditor, Some("Editor")),
         KeyBinding::new("cmd-t", w::NewTerminal, Some("Workspace")),
+        KeyBinding::new("cmd-shift-n", w::NewWindow, Some("Workspace")),
         KeyBinding::new("cmd-w", w::CloseTerminal, Some("Workspace")),
         KeyBinding::new("cmd-shift-]", w::NextTerminal, Some("Workspace")),
         KeyBinding::new("cmd-shift-[", w::PreviousTerminal, Some("Workspace")),

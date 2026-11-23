@@ -16,11 +16,10 @@ rm -rf "$WORK"
 mkdir -p "$WORK/Contents/MacOS" "$WORK/Contents/Resources"
 cp target/release/juan-terminal "$WORK/Contents/MacOS/juan-terminal"
 
-# Icon: SVG -> 1024 PNG (Quick Look) -> iconset -> icns.
+# Icon: 1024 PNG (rounded photo) -> iconset -> icns.
 ICONSET=target/bundle/AppIcon.iconset
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
-qlmanage -t -s 1024 -o target/bundle packaging/icon.svg >/dev/null 2>&1
-PNG=target/bundle/icon.svg.png
+PNG=packaging/icon.png
 for s in 16 32 128 256 512; do
   sips -z $s $s "$PNG" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
   sips -z $((s*2)) $((s*2)) "$PNG" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
