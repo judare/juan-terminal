@@ -127,7 +127,6 @@ enum Row {
     Project { id: String, name: SharedString, active: bool, expanded: bool },
     Repo { pid: String, name: SharedString, path: PathBuf, branch: Option<String>, missing: bool, expanded: bool },
     Entry { entry: DirEntry, depth: usize, expanded: bool, dimmed: bool },
-    AddRepo { pid: String },
 }
 
 struct ContextMenu {
@@ -2125,7 +2124,6 @@ impl Workspace {
                     }
                 }
             }
-            rows.push(Row::AddRepo { pid: project.id.clone() });
         }
         Rc::new(rows)
     }
@@ -2336,17 +2334,6 @@ impl Workspace {
                     )
                     .into_any_element()
             }
-            Row::AddRepo { pid } => inner
-                .id(ix)
-                .pl(px(14.))
-                .text_size(px(12.))
-                .text_color(theme::rgb(theme::TEXT_FAINT))
-                .hover(|s| s.bg(theme::rgb(theme::HOVER)).text_color(theme::rgb(theme::TEXT_MUTED)))
-                .child(div().w(px(12.)).flex_none())
-                .child(icon("icons/plus.svg", theme::TEXT_FAINT))
-                .child("Add repository")
-                .on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.prompt_add_repository(pid.clone(), w, cx)))
-                .into_any_element(),
         };
         // Full-width row with a small inset so hover/selection backgrounds span the sidebar.
         div().w_full().px(px(6.)).child(el).into_any_element()
