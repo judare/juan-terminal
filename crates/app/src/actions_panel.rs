@@ -84,7 +84,8 @@ pub struct ActionsPanel {
     jobs: HashMap<u64, Vec<Job>>,
     /// Runs whose job list is shown.
     expanded_runs: HashSet<u64>,
-    collapsed_repos: HashSet<PathBuf>,
+    /// Repos shown open (collapsed by default).
+    expanded_repos: HashSet<PathBuf>,
     /// Section open (else only its header shows).
     pub expanded: bool,
     /// On screen (Files mode, sidebar visible): polling runs only then.
@@ -250,6 +251,28 @@ fn status_text(status: &str, conclusion: &str) -> String {
     if is_active(status) || conclusion.is_empty() { status.replace('_', " ") } else { conclusion.replace('_', " ") }
 }
 
+/// Most recent run of each workflow (runs come newest first).
+fn latest_per_workflow(runs: &[Run]) -> Vec<Run> {
+    let mut seen: Vec<&str> = Vec::new();
+    runs.iter()
+        .filter(|r| {
+            let new = !seen.contains(&r.workflow.as_str());
+            if new {
+                seen.push(&r.workflow);
+            }
+            new
+        })
+        .cloned()
+        .collect()
+}
+
+/// (succeeded, total, failed) over finished runs: skipped/cancelled count only in the total.
+fn run_summary(runs: &[Run]) -> (usize, usize, usize) {
+    let ok = runs.iter().filter(|r| r.conclusion == "success").count();
+    let failed = runs.iter().filter(|r| matches!(r.conclusion.as_str(), "failure" | "timed_out" | "startup_failure")).count();
+    (ok, runs.len(), failed)
+}
+
 /// (done, pending, success, failed) over jobs.
 fn job_counts(jobs: &[Job]) -> (usize, usize, usize, usize) {
     let done = jobs.iter().filter(|j| !is_active(&j.status)).count();
@@ -383,7 +406,7 @@ impl ActionsPanel {
             repos: Vec::new(),
             jobs: HashMap::new(),
             expanded_runs: HashSet::new(),
-            collapsed_repos: HashSet::new(),
+            expanded_repos: HashSet::new(),
             expanded: true,
             visible: false,
             busy: HashSet::new(),
@@ -779,9 +802,11 @@ impl Render for ActionsPanel {
         for ix in 0..self.repos.len() {
             let repo = &self.repos[ix];
             let path = repo.path.clone();
-            let collapsed = self.collapsed_repos.contains(&path);
+            let collapsed = multi && !self.expanded_repos.contains(&path);
+            let latest = latest_per_workflow(&repo.runs);
             if multi {
-                let active = repo.runs.iter().filter(|r| r.active()).count();
+                let active = latest.iter().filter(|r| r.active()).count();
+                let summary = (active == 0 && !latest.is_empty()).then(|| run_summary(&latest));
                 body = body.child(
                     div()
                         .id(("actions-repo", ix))
@@ -794,8 +819,8 @@ impl Render for ActionsPanel {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme::rgb(theme::HOVER)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            if !this.collapsed_repos.remove(&path) {
-                                this.collapsed_repos.insert(path.clone());
+                            if !this.expanded_repos.remove(&path) {
+                                this.expanded_repos.insert(path.clone());
                             }
                             cx.notify();
                         }))
@@ -805,7 +830,23 @@ impl Render for ActionsPanel {
                         .when(!repo.branch.is_empty(), |d| {
                             d.child(div().flex_shrink_0().max_w(px(140.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(repo.branch.clone()))
                         })
-                        .when(active > 0, |d| d.child(div().text_size(px(10.5)).text_color(theme::rgb(theme::MODIFIED)).child(format!("{active} en curso")))),
+                        .when(active > 0, |d| d.child(div().text_size(px(10.5)).text_color(theme::rgb(theme::MODIFIED)).child(format!("{active} en curso"))))
+                        .when_some(summary, |d, (ok, total, failed)| {
+                            let (icon, color) = if failed > 0 { ("icons/close.svg", theme::DELETED) } else { ("icons/check.svg", theme::ADDED) };
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.))
+                                    .px(px(5.))
+                                    .h(px(16.))
+                                    .rounded(px(8.))
+                                    .bg(theme::rgb(theme::SELECTED))
+                                    .child(gpui::svg().path(icon).size(px(9.)).text_color(theme::rgb(color)))
+                                    .child(div().text_size(px(10.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(format!("{ok}/{total}"))),
+                            )
+                        }),
                 );
             }
             if collapsed {
@@ -826,20 +867,6 @@ impl Render for ActionsPanel {
                 body = body.child(div().px(px(22.)).h(px(24.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(msg));
                 continue;
             }
-            // One row per workflow: its most recent run (runs come newest first).
-            let mut seen: Vec<&str> = Vec::new();
-            let latest: Vec<Run> = repo
-                .runs
-                .iter()
-                .filter(|r| {
-                    let new = !seen.contains(&r.workflow.as_str());
-                    if new {
-                        seen.push(&r.workflow);
-                    }
-                    new
-                })
-                .cloned()
-                .collect();
             for run in &latest {
                 body = body.child(self.render_run(run, multi, cx));
             }
