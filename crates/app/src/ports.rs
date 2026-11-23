@@ -504,8 +504,11 @@ mod tests {
         std::fs::create_dir_all(d.join("web")).unwrap();
         std::fs::write(d.join("web/package.json"), r#"{"scripts":{"build":"vite build","dev":"vite --port 5173"}}"#).unwrap();
         std::fs::write(d.join("web/pnpm-lock.yaml"), "").unwrap();
-        let c = dev_commands(&[("web".into(), d.join("web")), ("none".into(), d.clone())]);
+        let c = dev_commands(&[("web".into(), d.join("web"))]);
         assert_eq!(c.len(), 1);
+        // From the parent (monorepo layout) it's found one level down.
+        let c2 = dev_commands(&[("mono".into(), d.clone())]);
+        assert!(c2.iter().any(|x| x.contains("[mono/web]")), "{c2:?}");
         assert!(c[0].contains("pnpm run dev") && c[0].contains("vite --port 5173"), "{c:?}");
         let _ = std::fs::remove_dir_all(d);
     }
@@ -603,8 +606,37 @@ pub fn dev_servers_report(app_pid: i32, roots: &[(String, PathBuf)]) -> String {
 
 /// `cd <repo> && <pm> run dev` for repos whose package.json has a dev/start script.
 pub fn dev_commands(roots: &[(String, PathBuf)]) -> Vec<String> {
+    // Monorepos keep apps in subfolders (front/, backend/, apps/web…): look two levels down.
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    for (name, root) in roots {
+        dirs.push((name.clone(), root.clone()));
+        let subs = |d: &PathBuf| -> Vec<PathBuf> {
+            std::fs::read_dir(d)
+                .map(|it| {
+                    it.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| { let n = n.to_string_lossy(); !n.starts_with('.') && n != "node_modules" && n != "dist" && n != "target" }))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for a in subs(root) {
+            for b in subs(&a) {
+                if b.join("package.json").is_file() {
+                    dirs.push((format!("{name}/{}/{}", a.file_name().unwrap().to_string_lossy(), b.file_name().unwrap().to_string_lossy()), b));
+                }
+            }
+            if a.join("package.json").is_file() {
+                dirs.push((format!("{name}/{}", a.file_name().unwrap().to_string_lossy()), a));
+            }
+        }
+    }
+    // Same folder reached from the project root and from the repo: keep the shorter label.
+    dirs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.len().cmp(&b.0.len())));
+    dirs.dedup_by(|a, b| a.1 == b.1);
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = Vec::new();
-    for (name, dir) in roots {
+    for (name, dir) in &dirs {
         let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else { continue };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         let scripts = &v["scripts"];
