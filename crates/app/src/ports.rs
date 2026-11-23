@@ -604,8 +604,33 @@ pub fn dev_servers_report(app_pid: i32, roots: &[(String, PathBuf)]) -> String {
     out
 }
 
-/// `cd <repo> && <pm> run dev` for repos whose package.json has a dev/start script.
+/// A runnable dev script found in the project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevCommand {
+    /// "front", "blokay/backend"…
+    pub label: String,
+    pub dir: PathBuf,
+    /// npm / pnpm / yarn / bun
+    pub pm: &'static str,
+    /// dev / start / serve
+    pub script: String,
+    /// The script's own command line ("vite", "tsx scripts/dev.ts").
+    pub detail: String,
+}
+
+impl DevCommand {
+    pub fn command_line(&self) -> String {
+        format!("{} run {}", self.pm, self.script)
+    }
+}
+
+/// `cd <repo> && <pm> run dev` lines for Claude's list_dev_servers report.
 pub fn dev_commands(roots: &[(String, PathBuf)]) -> Vec<String> {
+    dev_command_list(roots).iter().map(|c| format!("- [{}] cd {} && {}   ({})", c.label, c.dir.display(), c.command_line(), c.detail)).collect()
+}
+
+/// Repo folders (and subfolders, for monorepos) whose package.json has a dev/start script.
+pub fn dev_command_list(roots: &[(String, PathBuf)]) -> Vec<DevCommand> {
     // Monorepos keep apps in subfolders (front/, backend/, apps/web…): look two levels down.
     let mut dirs: Vec<(String, PathBuf)> = Vec::new();
     for (name, root) in roots {
@@ -650,8 +675,8 @@ pub fn dev_commands(roots: &[(String, PathBuf)]) -> Vec<String> {
         } else {
             "npm"
         };
-        let detail = scripts[script].as_str().unwrap_or_default();
-        out.push(format!("- [{name}] cd {} && {pm} run {script}   ({detail})", dir.display()));
+        let detail = scripts[script].as_str().unwrap_or_default().to_string();
+        out.push(DevCommand { label: name.clone(), dir: dir.clone(), pm, script: script.to_string(), detail });
     }
     out
 }

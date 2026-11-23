@@ -20,6 +20,8 @@ pub enum ServersPanelEvent {
     OpenTerminal(SshServer),
     /// A remote file was downloaded to `local`; open it (uploads back on save).
     OpenRemoteFile { server: SshServer, remote: String, local: PathBuf },
+    RunDev(crate::ports::DevCommand),
+    StopDev(PathBuf),
 }
 
 #[derive(Default)]
@@ -57,6 +59,11 @@ struct NamePrompt {
 }
 
 pub struct ServersPanel {
+    dev: Vec<crate::ports::DevCommand>,
+    dev_running: HashSet<PathBuf>,
+    /// Listening ports of running dev servers (by folder).
+    dev_ports: HashMap<PathBuf, Vec<u16>>,
+    dev_poll: Option<gpui::Task<()>>,
     servers: Vec<SshServer>,
     open: HashSet<String>,
     browsers: HashMap<String, Browser>,
@@ -83,7 +90,157 @@ fn human_size(n: u64) -> String {
 
 impl ServersPanel {
     pub fn new() -> Self {
-        Self { servers: Vec::new(), open: HashSet::new(), browsers: HashMap::new(), form: None, prompt: None }
+        Self { dev: Vec::new(), dev_running: HashSet::new(), dev_ports: HashMap::new(), dev_poll: None, servers: Vec::new(), open: HashSet::new(), browsers: HashMap::new(), form: None, prompt: None }
+    }
+
+    /// Dev scripts of the project and which of them run now (their terminal tabs).
+    pub fn set_dev(&mut self, dev: Vec<crate::ports::DevCommand>, running: HashSet<PathBuf>, cx: &mut Context<Self>) {
+        let changed = dev != self.dev || running != self.dev_running;
+        self.dev = dev;
+        self.dev_running = running;
+        self.dev_ports.retain(|k, _| self.dev_running.contains(k));
+        if self.dev_running.is_empty() {
+            self.dev_poll = None;
+        } else if self.dev_poll.is_none() {
+            // Find the ports they listen on (they take a moment to bind).
+            self.dev_poll = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    let dirs: Vec<PathBuf> = match this.update(cx, |this, _| this.dev_running.iter().cloned().collect()) {
+                        Ok(d) => d,
+                        Err(_) => break,
+                    };
+                    let found = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let mut map: HashMap<PathBuf, Vec<u16>> = HashMap::new();
+                            for l in crate::ports::scan().unwrap_or_default() {
+                                let Some(cwd) = &l.cwd else { continue };
+                                // Deepest matching folder wins (front vs repo root).
+                                if let Some(d) = dirs.iter().filter(|d| cwd.starts_with(d)).max_by_key(|d| d.as_os_str().len()) {
+                                    map.entry(d.clone()).or_default().extend(l.ports.iter().map(|p| p.0));
+                                }
+                            }
+                            map
+                        })
+                        .await;
+                    if this
+                        .update(cx, |this, cx| {
+                            if found != this.dev_ports {
+                                this.dev_ports = found;
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    gpui::Timer::after(std::time::Duration::from_secs(3)).await;
+                }
+            }));
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn render_dev(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.dev.is_empty() {
+            return None;
+        }
+        let mut list = div().flex().flex_col().pb(px(6.)).child(
+            div()
+                .flex()
+                .items_center()
+                .pl(px(14.))
+                .pr(px(8.))
+                .h(px(30.))
+                .child(div().text_size(px(10.5)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_MUTED)).child("DEV SERVERS")),
+        );
+        for (ix, d) in self.dev.iter().enumerate() {
+            let running = self.dev_running.contains(&d.dir);
+            let ports = self.dev_ports.get(&d.dir).cloned().unwrap_or_default();
+            let (run_cmd, stop_dir) = (d.clone(), d.dir.clone());
+            let mut row = div()
+                .id(("dev-row", ix))
+                .flex()
+                .items_center()
+                .gap(px(7.))
+                .h(px(34.))
+                .pl(px(14.))
+                .pr(px(6.))
+                .mx(px(4.))
+                .rounded(px(5.))
+                .hover(|st| st.bg(theme::rgb(theme::HOVER)))
+                .child(div().flex_none().size(px(7.)).rounded_full().bg(theme::rgb(if running { theme::ADDED } else { 0x3a3d44 })))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.5)).font_weight(gpui::FontWeight::MEDIUM).child(d.label.clone()))
+                        .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.5)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("{} · {}", d.command_line(), d.detail))),
+                );
+            for p in ports.iter().take(2) {
+                let port = *p;
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("dev-port-{ix}-{port}")))
+                        .flex_none()
+                        .px(px(5.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .bg(theme::rgb(0x1e2a3d))
+                        .hover(|st| st.bg(theme::rgb(0x2b4a7a)))
+                        .text_size(px(11.))
+                        .font_family(theme::MONO_FONT)
+                        .text_color(theme::rgb(theme::ACCENT))
+                        .tooltip(|_, cx| cx.new(|_| Tooltip("Open in browser")).into())
+                        .on_click(move |_, _, cx| cx.open_url(&format!("http://localhost:{port}")))
+                        .child(format!(":{port}")),
+                );
+            }
+            row = row.child(if running {
+                div()
+                    .id(("dev-stop", ix))
+                    .flex_none()
+                    .px(px(8.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .bg(theme::rgb(0x3a1f22))
+                    .hover(|st| st.bg(theme::rgb(0x4a2226)))
+                    .text_size(px(11.))
+                    .text_color(theme::rgb(0xf0b3b8))
+                    .child("■ Stop")
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.emit(ServersPanelEvent::StopDev(stop_dir.clone()))))
+                    .into_any_element()
+            } else {
+                div()
+                    .id(("dev-run", ix))
+                    .flex_none()
+                    .px(px(8.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .bg(theme::rgb(0x1d2b22))
+                    .hover(|st| st.bg(theme::rgb(0x23402a)))
+                    .text_size(px(11.))
+                    .text_color(theme::rgb(0xa8d8a0))
+                    .child("▶ Run")
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.emit(ServersPanelEvent::RunDev(run_cmd.clone()))))
+                    .into_any_element()
+            });
+            list = list.child(row);
+        }
+        Some(list.border_b_1().border_color(theme::rgb(theme::BORDER)).mb(px(4.)).into_any_element())
     }
 
     pub fn set_servers(&mut self, servers: Vec<SshServer>, cx: &mut Context<Self>) {
@@ -614,6 +771,9 @@ fn download_dir(s: &SshServer, remote: &str, dest_dir: &std::path::Path) -> anyh
 impl Render for ServersPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div().id("servers-panel").flex().flex_col().size_full().overflow_y_scroll().pb(px(16.));
+        if let Some(dev) = self.render_dev(cx) {
+            list = list.child(dev);
+        }
         list = list.child(
             div()
                 .flex()
