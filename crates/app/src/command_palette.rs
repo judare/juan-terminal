@@ -57,6 +57,8 @@ pub fn commands() -> Vec<Command> {
         c("View: Increase Font Size", "⌘=", Box::new(w::IncreaseFontSize)),
         c("View: Decrease Font Size", "⌘-", Box::new(w::DecreaseFontSize)),
         c("View: Reset Font Size", "⌘0", Box::new(w::ResetFontSize)),
+        c("App: Settings (schedules, blocked websites)", "⌘,", Box::new(w::OpenSettings)),
+        c("Project: Keep Project Open 1 More Hour (emergency)", "", Box::new(w::ExtendProjectHours)),
         c("App: Quit", "⌘Q", Box::new(w::Quit)),
     ]
 }

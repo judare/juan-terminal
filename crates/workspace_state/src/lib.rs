@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod settings;
+pub use settings::*;
+
 pub const STATE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -58,6 +61,13 @@ pub struct Project {
     /// Omitted when empty so the TOML stays hand-editable (`[[projects.servers]]`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<SshServer>,
+    /// Emergency override of the project's schedule (settings.toml): open until this Unix time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlocked_until: Option<i64>,
+    /// Sidebar icon (PNG/SVG/WebP…). Relative paths resolve against `<state dir>/icons/`.
+    /// When unset, `<state dir>/icons/<id>.{png,svg,webp,jpg}` is used if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<PathBuf>,
 }
 
 /// An SSH destination. Only the key's *path* is stored, never key material or passwords.
@@ -181,6 +191,16 @@ impl Project {
     /// Default working directory for new terminals.
     pub fn default_cwd(&self) -> Option<PathBuf> {
         self.root.clone().or_else(|| self.repositories.first().map(|r| r.path.clone()))
+    }
+
+    /// Resolved icon file, if one is configured or found by convention and exists.
+    pub fn icon_path(&self) -> Option<PathBuf> {
+        let dir = state_dir().join("icons");
+        if let Some(icon) = &self.icon {
+            let path = if icon.is_absolute() { icon.clone() } else { dir.join(icon) };
+            return path.is_file().then_some(path);
+        }
+        ["png", "svg", "webp", "jpg", "jpeg"].iter().map(|ext| dir.join(format!("{}.{ext}", self.id))).find(|p| p.is_file())
     }
 }
 

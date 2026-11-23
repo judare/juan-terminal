@@ -14,8 +14,8 @@ use gpui::{
 use project_search::{IndexedFile, Root, list_files};
 use terminal_engine::{Palette, SessionConfig, TermDims, TerminalSession};
 use workspace_state::{
-    Project, StateStore, TerminalState, WindowGeometry, WorkspaceState, discover_repositories,
-    head_branch, is_git_repo,
+    Project, Settings, StateStore, TerminalState, WindowGeometry, WorkspaceState,
+    discover_repositories, head_branch, is_git_repo,
 };
 
 use crate::editor_view::{EditorEvent, EditorView};
@@ -57,8 +57,21 @@ actions!(
         LintProject,
         FormatFile,
         ToggleCommandPalette,
+        OpenSettings,
+        ExtendProjectHours,
     ]
 );
+
+/// Unix time and the Mac's current UTC offset in seconds (DST included).
+fn clock_now() -> (i64, i64) {
+    // SAFETY: localtime_r only writes into the struct we pass.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        (t as i64, tm.tm_gmtoff as i64)
+    }
+}
 
 const SCRATCH: &str = "";
 const TOP_BAR_HEIGHT: f32 = 38.;
@@ -124,7 +137,7 @@ fn is_config_file(name: &str) -> bool {
 #[derive(Clone)]
 enum Row {
     Hint,
-    Project { id: String, name: SharedString, active: bool, expanded: bool },
+    Project { id: String, name: SharedString, icon: Option<PathBuf>, active: bool, expanded: bool },
     Repo { pid: String, name: SharedString, path: PathBuf, branch: Option<String>, missing: bool, expanded: bool },
     Entry { entry: DirEntry, depth: usize, expanded: bool, dimmed: bool },
 }
@@ -193,6 +206,12 @@ pub struct Workspace {
     file_tools: HashMap<PathBuf, crate::editor_view::FileTools>,
     store: StateStore,
     state: WorkspaceState,
+    /// settings.toml (schedules, blocked websites); reloaded when saved in the editor.
+    settings: Settings,
+    /// Projects outside their schedule right now (re-evaluated every 20 s).
+    locked: HashSet<String>,
+    /// Project already warned that it closes soon.
+    close_warned: Option<String>,
     pub(crate) terminals: HashMap<String, Tabs<TerminalView>>,
     pub(crate) editors: HashMap<String, Tabs<EditorView>>,
     branches: HashMap<PathBuf, Option<String>>,
@@ -274,6 +293,9 @@ impl Workspace {
             file_tools: HashMap::new(),
             store,
             state,
+            settings: Settings::default(),
+            locked: HashSet::new(),
+            close_warned: None,
             terminals: HashMap::new(),
             editors: HashMap::new(),
             branches: HashMap::new(),
@@ -302,9 +324,30 @@ impl Workspace {
         for p in &this.state.projects {
             this.expanded.extend(p.expanded.iter().cloned());
         }
+        let _ = workspace_state::ensure_settings_file();
+        match workspace_state::load_settings() {
+            Ok(s) => this.settings = s,
+            Err(e) => this.error = Some(e.into()),
+        }
+        this.refresh_locks();
+        // Never start inside a project that is outside its hours.
+        if this.state.active_project.as_ref().is_some_and(|id| this.locked.contains(id)) {
+            this.state.active_project = this.state.projects.iter().find(|p| !this.locked.contains(&p.id)).map(|p| p.id.clone());
+        }
+        this.apply_blocked_websites(cx);
         this.ide = crate::claude_bridge::start(window, cx);
         this.ensure_project_loaded(window, cx);
         this.sync_ide(cx);
+        // Project schedules: lock/close projects when their hours end.
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                gpui::Timer::after(std::time::Duration::from_secs(20)).await;
+                if this.update_in(cx, |this, window, cx| this.schedule_tick(window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Git status changes from terminals/Claude don't go through the editor: poll while the
         // window is in front (status is cheap; repaint only happens when it changed).
         cx.spawn_in(window, async move |this, cx| {
@@ -1147,6 +1190,9 @@ impl Workspace {
                 }
                 EditorEvent::SelectionChanged => this.sync_ide(cx),
                 EditorEvent::Saved(path) => {
+                    if *path == workspace_state::settings_path() {
+                        this.reload_settings(window, cx);
+                    }
                     this.upload_if_remote(path, cx);
                     if let Some(gp) = &this.git_panel {
                         gp.update(cx, |g, cx| g.refresh_path(path, cx));
@@ -1331,6 +1377,15 @@ impl Workspace {
         if self.state.active_project.as_deref() == Some(id) {
             return;
         }
+        if self.show_locked(id, window, cx) {
+            return;
+        }
+        self.activate_project(Some(id.to_string()), window, cx);
+    }
+
+    /// Unload the current project and load `new` (None = no project).
+    fn activate_project(&mut self, new: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let id = new.as_deref().unwrap_or(SCRATCH);
         let old = self.active_key();
         self.persist(cx); // records terminal cwds and open files of the old project
         self.terminals.remove(&old);
@@ -1350,7 +1405,7 @@ impl Workspace {
             let repos = self.state.project(id).map(|p| p.repositories.iter().map(|r| (r.name.clone(), r.path.clone())).collect()).unwrap_or_default();
             gp.update(cx, |g, cx| g.set_repos(repos, window, cx));
         }
-        self.state.active_project = Some(id.to_string());
+        self.state.active_project = new.clone();
         self.collapsed.remove(id);
         self.ensure_project_loaded(window, cx);
         if let Some(sp) = self.servers_panel.clone() {
@@ -1365,6 +1420,9 @@ impl Workspace {
     /// Ask before leaving a project that has live terminals or unsaved files.
     fn request_switch_project(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.active_project.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if self.show_locked(&id, window, cx) {
             return;
         }
         let old = self.active_key();
@@ -1408,6 +1466,153 @@ impl Workspace {
                     e.update(cx, |e, cx| e.save(cx));
                 }
                 this.switch_project(&id, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    // ---- schedules & blocked websites -------------------------------------------------
+
+    /// Recompute which projects are outside their hours. True if anything changed.
+    fn refresh_locks(&mut self) -> bool {
+        let (now, offset) = clock_now();
+        let locked: HashSet<String> = self
+            .state
+            .projects
+            .iter()
+            .filter(|p| p.unlocked_until.is_none_or(|t| t <= now) && self.settings.locked_reason(&p.id, now, offset).is_some()).map(|p| p.id.clone()).collect();
+        let changed = locked != self.locked;
+        self.locked = locked;
+        changed
+    }
+
+    /// If `id` is locked, tell the user when it opens and return true.
+    fn show_locked(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.refresh_locks();
+        if !self.locked.contains(id) {
+            return false;
+        }
+        let (now, offset) = clock_now();
+        let hours = self.settings.locked_reason(id, now, offset).unwrap_or_default();
+        let name = self.state.project(id).map(|p| p.name.clone()).unwrap_or_else(|| id.to_string());
+        let answer = window.prompt(
+            PromptLevel::Info,
+            &format!("“{name}” is locked right now"),
+            Some(&format!("Its hours: {hours}.\n\nEmergency? Open it anyway for a while. Schedules are in settings.toml (⌘,).")),
+            &["Open for 1 hour", "Open for 4 hours", "Cancel"],
+            cx,
+        );
+        let id = id.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let hours = match answer.await {
+                Ok(0) => 1,
+                Ok(1) => 4,
+                _ => return,
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.unlock_for(&id, hours * 3600, cx);
+                this.request_switch_project(id.clone(), window, cx);
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Emergency override: `id` stays open `secs` more (from now, or from the current
+    /// override if it's later).
+    fn unlock_for(&mut self, id: &str, secs: i64, cx: &mut Context<Self>) {
+        let (now, _) = clock_now();
+        if let Some(p) = self.state.project_mut(id) {
+            p.unlocked_until = Some(p.unlocked_until.unwrap_or(now).max(now) + secs);
+        }
+        self.close_warned = None;
+        self.refresh_locks();
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn schedule_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.refresh_locks();
+        let Some(active) = self.state.active_project.clone() else {
+            if changed {
+                cx.notify();
+            }
+            return;
+        };
+        if self.locked.contains(&active) {
+            // Hours are over: save files and close the project (terminals get SIGHUP).
+            for e in self.editors.get(&active).map(|t| t.tabs.clone()).unwrap_or_default() {
+                if e.read(cx).is_dirty() {
+                    e.update(cx, |e, cx| e.save(cx));
+                }
+            }
+            let name = self.active_project().map(|p| p.name.clone()).unwrap_or_default();
+            let next = self.state.projects.iter().find(|p| !self.locked.contains(&p.id)).map(|p| p.id.clone());
+            self.activate_project(next, window, cx);
+            self.close_warned = None;
+            self.error = Some(format!("“{name}” closed: outside its hours (files were saved).").into());
+            cx.notify();
+            return;
+        }
+        // Warn 5 minutes before the active project closes.
+        let (now, offset) = clock_now();
+        let soon = now + 5 * 60;
+        let override_ends = self.active_project().and_then(|p| p.unlocked_until).filter(|t| *t > now);
+        if override_ends.is_none_or(|t| t <= soon) && self.settings.locked_reason(&active, soon, offset).is_some() {
+            if self.close_warned.as_deref() != Some(active.as_str()) {
+                self.close_warned = Some(active.clone());
+                let name = self.active_project().map(|p| p.name.clone()).unwrap_or_default();
+                self.error = Some(format!("“{name}” closes in 5 minutes (end of its hours). Open files will be saved. Need more time: ⌘⇧P → “Keep Project Open 1 More Hour”.").into());
+                cx.notify();
+            }
+        } else {
+            self.close_warned = None;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        match workspace_state::ensure_settings_file() {
+            Ok(path) => {
+                self.open_file(&path, true, window, cx);
+                self.pin_active_editor(cx);
+            }
+            Err(e) => self.error = Some(format!("settings.toml: {e}").into()),
+        }
+        cx.notify();
+    }
+
+    /// settings.toml was saved: reload, re-check schedules, update /etc/hosts.
+    fn reload_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match workspace_state::load_settings() {
+            Ok(s) => {
+                self.settings = s;
+                self.error = Some("Settings reloaded".into());
+                self.schedule_tick(window, cx);
+                self.apply_blocked_websites(cx);
+            }
+            Err(e) => self.error = Some(format!("{e} (previous settings kept)").into()),
+        }
+        cx.notify();
+    }
+
+    fn apply_blocked_websites(&mut self, cx: &mut Context<Self>) {
+        let hosts = self.settings.blocked_hosts();
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { crate::website_block::apply(&hosts) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(a) if a.pending > 0 => {
+                        let hours = a.pending_until.map(|t| ((t - clock_now().0).max(0) + 3599) / 3600).unwrap_or(24);
+                        this.error = Some(format!("{} removed website(s) stay blocked for ~{hours} h more (removals take 24 h).", a.pending).into());
+                    }
+                    Ok(a) if a.changed => this.error = Some("Blocked websites updated in /etc/hosts".into()),
+                    Ok(_) => return,
+                    Err(e) => this.error = Some(format!("Blocked websites not applied: {e}").into()),
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -2054,7 +2259,7 @@ impl Workspace {
         for project in &projects {
             let active = self.state.active_project.as_deref() == Some(project.id.as_str());
             let expanded = active && !self.collapsed.contains(&project.id);
-            rows.push(Row::Project { id: project.id.clone(), name: project.name.clone().into(), active, expanded });
+            rows.push(Row::Project { id: project.id.clone(), name: project.name.clone().into(), icon: project.icon_path(), active, expanded });
             if !expanded {
                 continue;
             }
@@ -2153,7 +2358,8 @@ impl Workspace {
                 .child("No projects yet. Open folder…  ⌘O")
                 .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.open_project(&OpenProject, w, cx)))
                 .into_any_element(),
-            Row::Project { id, name, active, expanded } => {
+            Row::Project { id, name, icon: project_icon, active, expanded } => {
+                let locked = self.locked.contains(&id);
                 let group: SharedString = format!("p-{id}").into();
                 let (id_click, id_rm) = (id.clone(), id.clone());
                 inner
@@ -2167,6 +2373,10 @@ impl Workspace {
                         d.on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| this.open_context_menu(e.position, root.clone(), true, true, cx)))
                     })
                     .child(chevron(expanded))
+                    .child(match project_icon {
+                        Some(path) => gpui::img(path).size(px(14.)).flex_none().rounded(px(3.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                        None => icon("icons/project-empty.svg", theme::TEXT_FAINT),
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -2175,21 +2385,18 @@ impl Workspace {
                             .text_ellipsis()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED }))
+                            .text_color(theme::rgb(if active { theme::TEXT } else if locked { theme::TEXT_FAINT } else { theme::TEXT_MUTED }))
                             .child(name),
                     )
-                    .child({
-                        let id_claude = id.clone();
-                        claude_button(SharedString::from(format!("claude-{id}"))).invisible().group_hover(group.clone(), |s| s.visible()).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                    // Outside its hours (settings.toml): can't be opened.
+                    .when(locked, |d| d.child(icon("icons/lock.svg", theme::TEXT_FAINT)))
+                    // Claude only on the selected project, on hover.
+                    .when(active, |d| {
+                        d.child(claude_button(SharedString::from(format!("claude-{id}"))).invisible().group_hover(group.clone(), |s| s.visible()).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
                             cx.stop_propagation();
-                            if this.state.active_project.as_deref() == Some(id_claude.as_str()) {
-                                let cwd = this.active_project().and_then(|p| p.default_cwd());
-                                this.open_claude(cwd, None, w, cx);
-                            } else {
-                                // Switch first (with confirmation), then the user can click again.
-                                this.request_switch_project(id_claude.clone(), w, cx);
-                            }
-                        }))
+                            let cwd = this.active_project().and_then(|p| p.default_cwd());
+                            this.open_claude(cwd, None, w, cx);
+                        })))
                     })
                     .child(
                         icon_button(SharedString::from(format!("rm-{id}")), "icons/close.svg")
@@ -2765,6 +2972,15 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(Self::format_file))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(|this, _: &ExtendProjectHours, _, cx| {
+                if let Some(id) = this.state.active_project.clone() {
+                    this.unlock_for(&id, 3600, cx);
+                    let until = this.active_project().and_then(|p| p.unlocked_until).unwrap_or(0);
+                    let mins = (until - clock_now().0).max(0) / 60;
+                    this.error = Some(format!("Project stays open for {} h {:02} min more (emergency override).", mins / 60, mins % 60).into());
+                }
+            }))
             .on_action(cx.listener(Self::search_in_project))
             .on_action(cx.listener(|this, _: &ShowFiles, _, cx| {
                 this.sidebar_visible = true;

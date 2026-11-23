@@ -44,7 +44,9 @@ pub fn encode_key(k: &KeyInput, modes: KeyModes) -> Option<Cow<'static, [u8]>> {
 
     match k.key {
         "enter" => {
-            return if k.alt { s(b"\x1b\r") } else { s(b"\r") };
+            // Shift/Alt+Enter → ESC CR: Claude Code (and zsh/readline) insert a newline
+            // instead of submitting.
+            return if k.alt || k.shift { s(b"\x1b\r") } else { s(b"\r") };
         }
         "backspace" => {
             return match (k.ctrl, k.alt) {
@@ -201,6 +203,7 @@ mod tests {
     #[test]
     fn basic_keys() {
         assert_eq!(enc("enter", |_| {}), Some(b"\r".to_vec()));
+        assert_eq!(enc("enter", |k| k.shift = true), Some(b"\x1b\r".to_vec()));
         assert_eq!(enc("backspace", |_| {}), Some(b"\x7f".to_vec()));
         assert_eq!(enc("escape", |_| {}), Some(b"\x1b".to_vec()));
         assert_eq!(enc("tab", |k| k.shift = true), Some(b"\x1b[Z".to_vec()));

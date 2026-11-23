@@ -40,6 +40,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("cmd-right", End, ctx),
         KeyBinding::new("enter", Submit, ctx),
+        // Explicit, or the parent's shift-enter (e.g. the editor's Newline) would win.
+        KeyBinding::new("shift-enter", Submit, ctx),
         KeyBinding::new("escape", Cancel, ctx),
     ]);
 }

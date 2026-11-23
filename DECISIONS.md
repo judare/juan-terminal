@@ -59,6 +59,16 @@ style). Files with ≥ 5000 lines open in Source mode to keep layout cost bounde
 `IOPMAssertionCreateWithName(PreventUserIdleDisplaySleep)` while the window is key; released on
 deactivation and on quit. Same mechanism as `caffeinate -d`.
 
+## D13 — Project schedules and blocked websites live in the app (replaces focus-time)
+`settings.toml` is separate from `state.toml` because the user edits it while the app keeps
+rewriting the state file. Schedules only lock projects inside juan-terminal: no root daemon, no
+moving or hiding folders. Website blocking needs root, so the managed `/etc/hosts` block is
+written through `osascript … with administrator privileges`, only at launch or on save and only
+when it differs; no timed (per-schedule) website blocking, which would need a privileged daemon.
+Friction is asymmetric on purpose: a site removed from the list stays blocked for 24 h
+(`unblock-pending.json` records when the removal was first seen), while a locked project can be
+opened at once for 1 or 4 hours, or extended by an hour (`unlocked_until` in state.toml).
+
 ## Dependency policy
 Only crates that are already pulled by GPUI or are essential: `alacritty_terminal`, `ropey`,
 `tree-sitter` + grammars, `serde`, `serde_json`, `toml`, `anyhow`, `futures`, `libc`,
