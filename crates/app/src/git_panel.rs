@@ -404,6 +404,24 @@ pub fn icon_action(id: impl Into<gpui::ElementId>, icon: &'static str, label: &'
 
 pub struct Tooltip(pub &'static str);
 
+/// Tooltip with owned text.
+pub struct DynTooltip(pub SharedString);
+
+impl Render for DynTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .bg(theme::rgb(0x2a2c31))
+            .border_1()
+            .border_color(theme::rgb(theme::BORDER))
+            .text_size(px(11.5))
+            .text_color(theme::rgb(theme::TEXT))
+            .child(self.0.clone())
+    }
+}
+
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
