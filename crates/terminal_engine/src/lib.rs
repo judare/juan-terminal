@@ -4,6 +4,7 @@
 pub mod colors;
 pub mod keys;
 pub mod session;
+mod theme_pty;
 
 pub use alacritty_terminal::event::Event as RawEvent;
 pub use alacritty_terminal::term::cell::Flags as CellFlags;

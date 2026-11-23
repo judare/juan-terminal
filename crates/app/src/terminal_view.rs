@@ -16,7 +16,7 @@ use gpui::{
 };
 use std::collections::HashMap;
 use terminal_engine::{
-    CellFlags, CursorShape, KeyInput, KeyModes, Mark, Palette, Rgb, SessionEvent, parse_mark_uri,
+    CellFlags, CursorShape, KeyInput, KeyModes, Mark, Rgb, SessionEvent, parse_mark_uri,
     SearchHit, Snapshot, TermDims, TerminalSession, encode_key, encode_paste,
 };
 
@@ -201,6 +201,13 @@ struct GridLayout {
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
 
 impl TerminalView {
+    /// Recolor with the current theme and tell theme-aware programs (DEC 2031) right away,
+    /// even when this terminal is in a hidden tab.
+    pub fn apply_theme(&mut self, cx: &mut Context<Self>) {
+        self.session.set_palette(theme::terminal_palette());
+        cx.notify();
+    }
+
     pub fn new(
         jt_id: String,
         session: TerminalSession,
@@ -1139,6 +1146,12 @@ pub struct PrepaintState {
     line_height: Pixels,
 }
 
+/// Terminal chrome color (block separators, chips, find highlights) for the current theme.
+fn ui(hex: u32) -> Rgb {
+    let h = theme::map(hex);
+    Rgb { r: (h >> 16) as u8, g: (h >> 8) as u8, b: h as u8 }
+}
+
 fn hsla(c: Rgb) -> Hsla {
     Rgba { r: c.r as f32 / 255., g: c.g as f32 / 255., b: c.b as f32 / 255., a: 1. }.into()
 }
@@ -1427,11 +1440,12 @@ impl Element for TerminalElement {
             let rows = ((bounds.size.height / cell_height).floor() as u16).max(1);
             let dims = TermDims::new(cols, rows, f32::from(cell_width) as u16, f32::from(cell_height) as u16);
             view.session.resize(dims);
+            view.session.set_palette(theme::terminal_palette());
             view.session.snapshot(&mut view.snapshot);
             view.layout = Some(GridLayout { origin: bounds.origin, size: bounds.size, cell_width, cell_height });
 
             let snap = &view.snapshot;
-            let palette = Palette::dark();
+            let palette = view.session.palette().clone();
             let default_bg = palette.background;
             let selection_bg = palette.selection;
             let mut backgrounds: Vec<(Bounds<Pixels>, Hsla)> = Vec::new();
@@ -1453,8 +1467,8 @@ impl Element for TerminalElement {
                 let run = TextRun { len: t.len(), font: f, color, background_color: None, underline: None, strikethrough: None };
                 text_system.shape_line(SharedString::from(t), size, &[run], None)
             };
-            let error_fg = Rgb { r: 0xf0, g: 0x7a, b: 0x82 };
-            let warn_fg = Rgb { r: 0xe5, g: 0xc0, b: 0x7b };
+            let error_fg = ui(0xf07a82);
+            let warn_fg = ui(0xe5c07b);
             for row in 0..snap.rows {
                 let cells = snap.row(row);
                 // Full-screen apps (vim, htop) are left alone.
@@ -1474,13 +1488,13 @@ impl Element for TerminalElement {
                     RowKind::Header(q, info) => {
                         // Block separator above the header (not for the very top row).
                         if row > 0 {
-                            backgrounds.push((Bounds::new(point(bounds.origin.x - px(8.), row_y - px(1.)), size(row_w + px(16.), px(1.))), hsla(Rgb { r: 0x2a, g: 0x2c, b: 0x32 })));
+                            backgrounds.push((Bounds::new(point(bounds.origin.x - px(8.), row_y - px(1.)), size(row_w + px(16.), px(1.))), hsla(ui(0x2a2c32))));
                         }
                         let mut label = q.get("cwd").cloned().unwrap_or_default();
                         if let Some((_, ms)) = info {
                             label.push_str(&format!(" ({})", fmt_ms(*ms)));
                         }
-                        let line = shape(label, hsla(Rgb { r: 0x8a, g: 0x8f, b: 0x98 }), false, font_size * 0.92);
+                        let line = shape(label, hsla(ui(0x8a8f98)), false, font_size * 0.92);
                         let x = bounds.origin.x + line.width;
                         text.push(TextFragment { origin: point(bounds.origin.x, row_y), line });
                         if let Some((code, _)) = info.filter(|(c, _)| *c != 0) {
@@ -1491,11 +1505,11 @@ impl Element for TerminalElement {
                     }
                     RowKind::LivePrompt(q) => {
                         if row > 0 {
-                            backgrounds.push((Bounds::new(point(bounds.origin.x - px(8.), row_y - px(1.)), size(row_w + px(16.), px(1.))), hsla(Rgb { r: 0x2a, g: 0x2c, b: 0x32 })));
+                            backgrounds.push((Bounds::new(point(bounds.origin.x - px(8.), row_y - px(1.)), size(row_w + px(16.), px(1.))), hsla(ui(0x2a2c32))));
                         }
-                        let green = hsla(Rgb { r: 0xc3, g: 0xe8, b: 0x8d });
-                        let plain = hsla(Rgb { r: 0xd7, g: 0xda, b: 0xe0 });
-                        let muted = hsla(Rgb { r: 0x8a, g: 0x8f, b: 0x98 });
+                        let green = hsla(ui(0xc3e88d));
+                        let plain = hsla(ui(0xd7dae0));
+                        let muted = hsla(ui(0x8a8f98));
                         let mut items: Vec<(Option<&'static str>, String, Hsla)> = Vec::new();
                         if let Some(n) = q.get("node").filter(|n| !n.is_empty()) {
                             items.push((Some("icons/js.svg"), n.clone(), green));
@@ -1507,7 +1521,7 @@ impl Element for TerminalElement {
                             items.push((Some("icons/git.svg"), b.clone(), green));
                             let d = q.get("dirty").cloned().unwrap_or_else(|| "0".into());
                             let dirty = d != "0";
-                            items.push((None, format!("± {d}"), if dirty { hsla(Rgb { r: 0xe5, g: 0xc0, b: 0x7b }) } else { muted }));
+                            items.push((None, format!("± {d}"), if dirty { hsla(ui(0xe5c07b)) } else { muted }));
                         }
                         let chip_h = cell_height - px(2.);
                         let tsize = font_size * 0.88;
@@ -1517,7 +1531,7 @@ impl Element for TerminalElement {
                             let icon_w = if icon.is_some() { px(12.) + px(5.) } else { px(0.) };
                             let w = px(7.) + icon_w + line.width + px(7.);
                             let b = Bounds::new(point(x, row_y + px(1.)), size(w, chip_h));
-                            chips.push((b, hsla(Rgb { r: 0x1c, g: 0x1e, b: 0x23 }), hsla(Rgb { r: 0x34, g: 0x37, b: 0x3e })));
+                            chips.push((b, hsla(ui(0x1c1e23)), hsla(ui(0x34373e))));
                             if let Some(i) = icon {
                                 icons.push((Bounds::new(point(x + px(7.), row_y + (cell_height - px(12.)) / 2.), size(px(12.), px(12.))), SharedString::from(i), muted));
                             }
@@ -1530,7 +1544,7 @@ impl Element for TerminalElement {
                     RowKind::Normal => {}
                 }
                 let tone = if snap.mode.alt_screen { None } else { classify_line(&snap.row_text(row)) };
-                let cmd_fg = Rgb { r: 0xff, g: 0xff, b: 0xff };
+                let cmd_fg = ui(0xffffff);
                 let fg_of = |c: &terminal_engine::SnapCell| match tone {
                     _ if c.mark == Mark::Cmd && c.fg == palette.foreground => cmd_fg,
                     Some(Tone::Error) if c.fg == palette.foreground => error_fg,
@@ -1642,8 +1656,8 @@ impl Element for TerminalElement {
                 let shift = snap.history_size as i32 - s.base as i32;
                 let off = snap.display_offset as i32;
                 let (rows, cols) = (snap.rows as i32, snap.cols);
-                let hit_bg = Hsla { a: 0.28, ..hsla(Rgb { r: 0xe5, g: 0xc0, b: 0x7b }) };
-                let cur_bg = Hsla { a: 0.75, ..hsla(Rgb { r: 0xd1, g: 0x9a, b: 0x66 }) };
+                let hit_bg = Hsla { a: 0.28, ..hsla(ui(0xe5c07b)) };
+                let cur_bg = Hsla { a: 0.75, ..hsla(ui(0xd19a66)) };
                 for (i, h) in s.hits.iter().enumerate() {
                     let (r0, r1) = (h.start.0 - shift + off, h.end.0 - shift + off);
                     if r1 < 0 || r0 >= rows {

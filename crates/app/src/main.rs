@@ -179,6 +179,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("Toggle Sidebar", workspace::ToggleSidebar),
                     MenuItem::action("Toggle Terminal", workspace::ToggleTerminalPanel),
+                    MenuItem::action("Toggle Light / Dark Theme", workspace::ToggleTheme),
                     MenuItem::action("Command Palette…", workspace::ToggleCommandPalette),
                     MenuItem::action("Go to File…", workspace::ToggleQuickOpen),
                     MenuItem::action("Search in Project", workspace::SearchInProject),
@@ -207,6 +208,7 @@ fn main() {
 
         let store = StateStore::default_location();
         let state = store.load();
+        theme::set_light(state.light_theme);
         let bounds = state
             .window
             .filter(|w| w.width >= 400. && w.height >= 300.)
@@ -312,6 +314,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-j", w::ToggleTerminalPanel, Some("Workspace")),
         KeyBinding::new("cmd-p", w::ToggleQuickOpen, Some("Workspace")),
         KeyBinding::new("cmd-shift-p", w::ToggleCommandPalette, Some("Workspace")),
+        KeyBinding::new("cmd-alt-t", w::ToggleTheme, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", w::SearchInProject, Some("Workspace")),
         KeyBinding::new("cmd-shift-e", w::ShowFiles, Some("Workspace")),
         KeyBinding::new("cmd-shift-c", w::OpenClaude, Some("Workspace")),

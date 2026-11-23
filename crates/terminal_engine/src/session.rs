@@ -21,6 +21,7 @@ use anyhow::{Context as _, Result};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
 use crate::colors::Palette;
+use crate::theme_pty::{ThemeState, ThemedPty};
 
 /// Grid geometry in cells plus cell size in pixels (used for TIOCSWINSZ pixel fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +238,7 @@ pub struct TerminalSession {
     sender: EventLoopSender,
     redraw_pending: Arc<AtomicBool>,
     palette: Palette,
+    theme: Arc<ThemeState>,
     dims: TermDims,
     master_fd: i32,
     child_pid: u32,
@@ -253,6 +255,8 @@ impl TerminalSession {
         env.entry("TERM".into()).or_insert_with(|| "xterm-256color".into());
         env.entry("COLORTERM".into()).or_insert_with(|| "truecolor".into());
         env.insert("TERM_PROGRAM".into(), "juan-terminal".into());
+        // Background hint for programs that pick colors from it (vim, less, delta…).
+        env.insert("COLORFGBG".into(), if palette.is_light() { "0;15" } else { "15;0" }.into());
         env.insert("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into());
         // Inherit a UTF-8 locale when launched without one (e.g. from Finder).
         if std::env::var_os("LANG").is_none() {
@@ -286,6 +290,9 @@ impl TerminalSession {
         let term_config = Config { scrolling_history: config.scrollback, ..Config::default() };
         let term = Arc::new(FairMutex::new(Term::new(term_config, &dims, listener.clone())));
 
+        let theme = Arc::new(ThemeState::default());
+        theme.light.store(palette.is_light(), Ordering::Relaxed);
+        let pty = ThemedPty::new(pty, theme.clone()).context("failed to wrap PTY")?;
         let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)
             .context("failed to create PTY event loop")?;
         let sender = event_loop.channel();
@@ -298,6 +305,7 @@ impl TerminalSession {
                 sender,
                 redraw_pending,
                 palette,
+                theme,
                 dims,
                 master_fd,
                 child_pid,
@@ -305,6 +313,20 @@ impl TerminalSession {
             },
             rx,
         ))
+    }
+
+    /// Theme switch: later snapshots and OSC 4/10/11 color queries use the new palette.
+    /// Programs that enabled DEC mode 2031 (Claude Code, neovim…) get a light/dark report.
+    pub fn set_palette(&mut self, palette: Palette) {
+        let light = palette.is_light();
+        self.palette = palette;
+        if self.theme.light.swap(light, Ordering::Relaxed) != light && self.theme.notify.load(Ordering::Relaxed) {
+            self.write(self.theme.report());
+        }
+    }
+
+    pub fn palette(&self) -> &Palette {
+        &self.palette
     }
 
     pub fn dims(&self) -> TermDims {
@@ -861,6 +883,21 @@ mod tests {
         let mut snap = Snapshot::default();
         s.snapshot(&mut snap);
         assert!((0..snap.rows).any(|r| snap.row_text(r) == "got:abc"));
+    }
+
+    #[test]
+    fn theme_query_and_mode_2031_notifications() {
+        let script = "stty -echo -icanon min 9 time 30; printf '\\033[?2031h\\033[?996n'; \
+                      r1=$(dd bs=9 count=1 2>/dev/null); r2=$(dd bs=9 count=1 2>/dev/null); \
+                      echo \"got:$(printf %s \"$r1$r2\" | tr '\\033' E)\"";
+        let (mut s, mut rx) = TerminalSession::spawn(sh(script), TermDims::new(60, 5, 8, 16), Palette::light()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        s.set_palette(Palette::dark());
+        run_until_exit(&mut s, &mut rx);
+        let mut snap = Snapshot::default();
+        s.snapshot(&mut snap);
+        let text: Vec<String> = (0..snap.rows).map(|r| snap.row_text(r)).collect();
+        assert!(text.iter().any(|l| l == "got:E[?997;2nE[?997;1n"), "{text:?}");
     }
 
     #[test]

@@ -25,6 +25,9 @@ pub struct WorkspaceState {
     pub terminal_panel_width: Option<f32>,
     /// Save dirty files when the window loses focus.
     pub autosave: bool,
+    /// Light color theme (default: dark).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub light_theme: bool,
     pub font_size: Option<f32>,
     pub window: Option<WindowGeometry>,
     pub projects: Vec<Project>,

@@ -36,6 +36,7 @@ pub fn commands() -> Vec<Command> {
         c("Editor: Toggle Markdown Live / SVG Preview", "⌘⇧V", Box::new(e::ToggleMarkdownLive)),
         c("Markdown: Insert Table", "", Box::new(e::InsertTable)),
         c("View: Toggle Word Wrap", "⌥Z", Box::new(e::ToggleWordWrap)),
+        c("View: Toggle Light / Dark Theme", "⌘⌥T", Box::new(w::ToggleTheme)),
         c("Editor: Go to Definition", "F12 / ⌘-click", Box::new(e::GoToDefinition)),
         c("Editor: Next Tab", "⌘⇧]", Box::new(w::NextEditor)),
         c("Editor: Previous Tab", "⌘⇧[", Box::new(w::PreviousEditor)),
