@@ -249,6 +249,11 @@ pub struct EditorView {
     layout: Option<Layout>,
     marked_text: Option<String>,
     selecting: bool,
+    /// Drag-select: last pointer position, editor viewport and whether the edge-scroll ticker runs.
+    drag_pos: Option<Point<Pixels>>,
+    drag_viewport: Option<Bounds<Pixels>>,
+    drag_ticking: bool,
+    drag_task: Option<Task<()>>,
     find: Option<FindState>,
     pub disk_conflict: bool,
     font: Font,
@@ -317,6 +322,10 @@ impl EditorView {
             layout: None,
             marked_text: None,
             selecting: false,
+            drag_pos: None,
+            drag_viewport: None,
+            drag_ticking: false,
+            drag_task: None,
             find: None,
             disk_conflict: false,
             font: gpui::font(theme::MONO_FONT),
@@ -1311,15 +1320,104 @@ impl EditorView {
             }
             return;
         }
-        if let Some(pos) = self.pos_at(e.position) {
-            self.doc.set_cursor(pos, true);
-            self.autoscroll = true;
-            cx.notify();
-        }
+        // Dragging is handled by the window-level listener registered in paint (`register_drag`),
+        // which also sees the pointer once it leaves the editor.
     }
 
     fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.selecting = false;
+        self.drag_pos = None;
+    }
+
+    /// How far the drag pointer is above (negative) or below (positive) the viewport.
+    fn drag_overshoot(&self) -> Pixels {
+        let (Some(p), Some(vp)) = (self.drag_pos, self.drag_viewport) else { return px(0.) };
+        let top = vp.origin.y;
+        let bottom = vp.origin.y + vp.size.height;
+        if p.y < top {
+            p.y - top
+        } else if p.y > bottom {
+            p.y - bottom
+        } else {
+            px(0.)
+        }
+    }
+
+    /// Extend the selection to the drag pointer, clamped inside the viewport.
+    fn drag_select(&mut self, cx: &mut Context<Self>) {
+        let (Some(mut p), Some(vp)) = (self.drag_pos, self.drag_viewport) else { return };
+        p.y = p.y.clamp(vp.origin.y + px(1.), vp.origin.y + vp.size.height - px(2.));
+        if let Some(pos) = self.pos_at(p) {
+            if pos != self.doc.selection.head {
+                self.doc.set_cursor(pos, true);
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn drag_moved(&mut self, position: Point<Pixels>, pressed: Option<MouseButton>, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        if pressed != Some(MouseButton::Left) {
+            self.selecting = false;
+            self.drag_pos = None;
+            return;
+        }
+        self.drag_pos = Some(position);
+        self.drag_select(cx);
+        if self.drag_overshoot() != px(0.) && !self.drag_ticking {
+            self.drag_ticking = true;
+            self.drag_task = Some(cx.spawn(async move |this, cx| loop {
+                Timer::after(Duration::from_millis(16)).await;
+                let keep = this.update(cx, |v, cx| v.drag_tick(cx)).unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }));
+        }
+    }
+
+    /// One edge-scroll step while the drag pointer is outside the viewport.
+    fn drag_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let over = self.drag_overshoot();
+        if !self.selecting || over == px(0.) {
+            self.drag_ticking = false;
+            return false;
+        }
+        // Faster the further the pointer is from the edge.
+        let step = (px(4.) + over.abs() * 0.5).min(px(160.));
+        let y = if over < px(0.) { self.scroll.y - step } else { self.scroll.y + step };
+        let mut y = y.max(px(0.));
+        if !self.markdown_live {
+            if let Some(l) = self.layout.as_ref() {
+                let max_y = (l.line_height * l.total_rows as f32 - l.line_height * 3.).max(px(0.));
+                y = y.min(max_y);
+            }
+        }
+        self.drag_select(cx);
+        if y != self.scroll.y {
+            self.scroll.y = y;
+            cx.notify();
+        }
+        true
+    }
+
+    /// Track the pointer window-wide while drag-selecting (called from the elements' paint).
+    pub(crate) fn register_drag(view: &Entity<Self>, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let selecting = view.update(cx, |v, _| {
+            v.drag_viewport = Some(bounds);
+            v.selecting
+        });
+        if !selecting {
+            return;
+        }
+        let view = view.clone();
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+            if phase == gpui::DispatchPhase::Bubble {
+                view.update(cx, |v, cx| v.drag_moved(e.position, e.pressed_button, cx));
+            }
+        });
     }
 
     fn scroll_wheel(&mut self, e: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2024,6 +2122,7 @@ impl Element for EditorElement {
     fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), state: &mut Prepaint, window: &mut Window, cx: &mut App) {
         let focus_handle = self.view.read(cx).focus_handle.clone();
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.view.clone()), cx);
+        EditorView::register_drag(&self.view, bounds, window, cx);
         let lh = state.line_height;
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             for (origin, line) in &state.gutter {
