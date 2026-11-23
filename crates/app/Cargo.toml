@@ -1,0 +1,24 @@
+[package]
+name = "juan-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "juan-terminal"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+core-foundation = "=0.10.0"
+futures.workspace = true
+editor = { path = "../editor" }
+project_search = { path = "../project_search" }
+git_engine = { path = "../git_engine" }
+code_quality = { path = "../code_quality" }
+lsp_client = { path = "../lsp_client" }
+claude_ide = { path = "../claude_ide" }
+terminal_engine = { path = "../terminal_engine" }
+workspace_state = { path = "../workspace_state" }
