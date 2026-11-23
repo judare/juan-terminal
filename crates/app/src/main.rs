@@ -94,6 +94,7 @@ fn main() {
     let started = Instant::now();
     let env_result = if shell_env::needs_import() { shell_env::import_login_env() } else { "skipped (terminal)" };
     startup_log(&format!("env import: {env_result} in {:?}", started.elapsed()));
+    shell_env::ensure_common_paths();
     // If launched from inside a Claude Code session (e.g. `open` run by Claude), don't pass
     // its session markers on to our terminals: they'd make `claude` there act as a child
     // session (no IDE auto-connect, transcript saving off).

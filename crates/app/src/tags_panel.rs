@@ -158,7 +158,7 @@ fn parse_tags(out: &str) -> Vec<Tag> {
 }
 
 fn fetch(dir: &Path) -> Result<Snapshot, String> {
-    let fmt = "--format=%(refname:short)%1f%(objecttype)%1f%(creatordate:iso-strict)%1f%(if)%(*objectname)%(then)%(*objectname:short)%(else)%(objectname:short)%(end)%1f%(contents:subject)%1f%(contents:body)%1e";
+    let fmt = "--format=%(refname:short)%1f%(objecttype)%1f%(creatordate:iso-strict-local)%1f%(if)%(*objectname)%(then)%(*objectname:short)%(else)%(objectname:short)%(end)%1f%(contents:subject)%1f%(contents:body)%1e";
     let tags = parse_tags(&git(dir, &["for-each-ref", "refs/tags", "--sort=-v:refname", fmt])?);
     let head = git(dir, &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
     let web = crate::launcher::web_url(dir);
@@ -187,8 +187,30 @@ fn latest_version(tags: &[Tag]) -> Option<Version> {
     tags.iter().filter_map(|t| Version::parse(&t.name)).max()
 }
 
+/// Local `YYYY-MM-DD` of today.
+fn local_today() -> String {
+    // SAFETY: localtime_r only writes into the struct we pass.
+    let tm = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        tm
+    };
+    format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+}
+
+/// `HH:MM` when the (local) date is today, else `YYYY-MM-DD`.
 fn short_date(iso: &str) -> String {
-    iso.get(..10).unwrap_or(iso).to_string()
+    let day = iso.get(..10).unwrap_or(iso);
+    match iso.get(11..16) {
+        Some(hm) if day == local_today() => hm.to_string(),
+        _ => day.to_string(),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM` for tooltips.
+fn full_date(iso: &str) -> String {
+    iso.get(..16).map(|x| x.replace('T', " ")).unwrap_or_else(|| iso.to_string())
 }
 
 impl TagsPanel {
@@ -464,7 +486,7 @@ impl TagsPanel {
         let on_remote = repo.snap.remote.as_ref().map(|s| s.contains(&name));
         let release = repo.snap.releases.as_ref().map(|r| r.get(&name).cloned());
         let at_head = !repo.snap.head.is_empty() && tag.commit == repo.snap.head;
-        let mut tip = format!("{}  ·  {}  ·  {}", tag.name, short_date(&tag.date), tag.commit);
+        let mut tip = format!("{}  ·  {}  ·  {}", tag.name, full_date(&tag.date), tag.commit);
         if !tag.subject.is_empty() && tag.annotated {
             tip.push_str(&format!("\n\n{}", tag.subject));
             if !tag.body.is_empty() {
