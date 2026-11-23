@@ -544,6 +544,9 @@ impl Workspace {
                 }
             }
             TerminalViewEvent::Exited(code) => {
+                if view.read(cx).dev_dir.is_some() {
+                    this.sync_dev(cx);
+                }
                 if *code == Some(0) {
                     this.close_terminal_view(view, window, cx);
                 } else {
@@ -772,7 +775,21 @@ impl Workspace {
             }
         };
         sp.update(cx, |p, cx| p.set_servers(servers, cx));
+        self.sync_dev(cx);
         cx.notify();
+    }
+
+    /// Push the project's dev scripts and which run now to the Servers panel.
+    fn sync_dev(&mut self, cx: &mut Context<Self>) {
+        let Some(sp) = self.servers_panel.clone() else { return };
+        let roots = self.port_roots();
+        let dev = crate::ports::dev_command_list(&roots);
+        let running: HashSet<PathBuf> = self
+            .terminals
+            .get(&self.active_key())
+            .map(|t| t.tabs.iter().filter_map(|v| v.read(cx).dev_dir.clone().filter(|_| !v.read(cx).has_exited())).collect())
+            .unwrap_or_default();
+        sp.update(cx, |p, cx| p.set_dev(dev, running, cx));
     }
 
     fn on_servers_event(&mut self, event: &crate::servers_panel::ServersPanelEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -794,6 +811,30 @@ impl Workspace {
                         cx.notify();
                     });
                 }
+            }
+            E::RunDev(cmd) => {
+                let already = self.terminals.get(&self.active_key()).is_some_and(|t| t.tabs.iter().any(|v| v.read(cx).dev_dir.as_ref() == Some(&cmd.dir) && !v.read(cx).has_exited()));
+                if !already {
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                    let program = (shell, vec!["-l".to_string(), "-c".to_string(), cmd.command_line()]);
+                    if let Some(view) = self.spawn_terminal_with(Some(cmd.dir.clone()), None, Some(program), window, cx) {
+                        let (label, dir) = (cmd.label.clone(), cmd.dir.clone());
+                        view.update(cx, |t, cx| {
+                            t.label = Some(format!("dev · {label}"));
+                            t.dev_dir = Some(dir);
+                            cx.notify();
+                        });
+                    }
+                }
+                self.sync_dev(cx);
+            }
+            E::StopDev(dir) => {
+                let view = self.terminals.get(&self.active_key()).and_then(|t| t.tabs.iter().find(|v| v.read(cx).dev_dir.as_ref() == Some(dir)).cloned());
+                if let Some(view) = view {
+                    // Dropping the tab hangs up and then kills the whole process group.
+                    self.close_terminal_view(&view, window, cx);
+                }
+                self.sync_dev(cx);
             }
             E::OpenRemoteFile { server, remote, local } => {
                 self.remote_files.insert(local.clone(), (server.clone(), remote.clone()));
@@ -1310,6 +1351,11 @@ impl Workspace {
         self.state.active_project = Some(id.to_string());
         self.collapsed.remove(id);
         self.ensure_project_loaded(window, cx);
+        if let Some(sp) = self.servers_panel.clone() {
+            let servers = self.active_project().map(|p| p.servers.clone()).unwrap_or_default();
+            sp.update(cx, |p, cx| p.set_servers(servers, cx));
+            self.sync_dev(cx);
+        }
         self.persist(cx);
         cx.notify();
     }

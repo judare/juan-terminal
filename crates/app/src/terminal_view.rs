@@ -151,6 +151,8 @@ pub struct TerminalView {
     /// Stable id passed to the shell as `JT_TERMINAL_ID` (hooks report it back).
     pub jt_id: String,
     pub attention: Option<Attention>,
+    /// Set when this tab runs a project dev script (Servers → Dev servers).
+    pub dev_dir: Option<PathBuf>,
     pub claude_status: Option<ClaudeStatus>,
     claude_menu: Option<ClaudeMenu>,
     /// Claude Code is the foreground process (updated each render).
@@ -229,6 +231,7 @@ impl TerminalView {
             selecting: false,
             jt_id,
             attention: None,
+            dev_dir: None,
             claude_status: None,
             claude_menu: None,
             claude_fg: false,
