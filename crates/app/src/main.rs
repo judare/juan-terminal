@@ -48,6 +48,13 @@ fn main() {
     let started = Instant::now();
     let env_result = if shell_env::needs_import() { shell_env::import_login_env() } else { "skipped (terminal)" };
     startup_log(&format!("env import: {env_result} in {:?}", started.elapsed()));
+    // If launched from inside a Claude Code session (e.g. `open` run by Claude), don't pass
+    // its session markers on to our terminals: they'd make `claude` there act as a child
+    // session (no IDE auto-connect, transcript saving off).
+    for (k, _) in std::env::vars_os().filter(|(k, _)| k.to_str().is_some_and(|k| k == "CLAUDECODE" || k.starts_with("CLAUDE_CODE_") || k == "CLAUDE_PID" || k == "CLAUDE_EFFORT")).collect::<Vec<_>>() {
+        // SAFETY: still single-threaded here.
+        unsafe { std::env::remove_var(k) };
+    }
     Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
         bind_keys(cx);
         text_input::bind_keys(cx);
@@ -155,6 +162,7 @@ fn main() {
         );
         if let Err(err) = window {
             eprintln!("juan-terminal: failed to open window: {err:#}");
+            startup_log(&format!("failed to open window: {err:#}"));
             cx.quit();
             return;
         }
@@ -168,9 +176,9 @@ fn main() {
         .detach();
         cx.activate(true);
 
+        startup_log(&format!("window opened in {:?}", started.elapsed()));
         if std::env::var_os("JUAN_TERMINAL_TRACE_STARTUP").is_some() {
             eprintln!("startup: window opened in {:?}", started.elapsed());
-            startup_log(&format!("window opened in {:?}", started.elapsed()));
         }
     });
 }

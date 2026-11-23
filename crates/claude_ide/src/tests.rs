@@ -211,3 +211,15 @@ fn hook_settings_are_valid_claude_settings() {
         assert!(cmd.contains("/hook") && cmd.contains("$JT_HOOK_TOKEN"));
     }
 }
+
+#[test]
+fn stale_own_lockfiles_are_removed_others_kept() {
+    let dir = tmpdir("stale");
+    std::fs::write(dir.join("1111.lock"), json!({"pid": 999_999, "ideName": IDE_NAME}).to_string()).unwrap();
+    std::fs::write(dir.join("2222.lock"), json!({"pid": 999_999, "ideName": "Visual Studio Code"}).to_string()).unwrap();
+    std::fs::write(dir.join("3333.lock"), json!({"pid": std::process::id(), "ideName": IDE_NAME}).to_string()).unwrap();
+    let (_srv, _rx) = IdeServer::start_in(&dir).unwrap();
+    assert!(!dir.join("1111.lock").exists());
+    assert!(dir.join("2222.lock").exists());
+    assert!(dir.join("3333.lock").exists());
+}

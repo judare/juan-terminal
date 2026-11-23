@@ -27,6 +27,9 @@ pub fn highlight(language: Language, source: &str) -> Vec<HighlightSpan> {
     if source.len() > MAX_HIGHLIGHT_BYTES {
         return Vec::new();
     }
+    if language == Language::Sql {
+        return crate::sql::highlight_sql(source);
+    }
     let Some(config) = language.config() else { return Vec::new() };
     HIGHLIGHTER.with(|h| {
         let mut h = h.borrow_mut();
@@ -83,10 +86,30 @@ mod tests {
             Language::Css,
             Language::Html,
             Language::Vue,
+            Language::Xml,
+            Language::Config,
         ] {
             assert!(lang.config().is_some(), "{lang:?} failed to build");
         }
         assert!(injection_config("markdown_inline").is_some());
+    }
+
+    #[test]
+    fn xml_env_conf_and_rust_files() {
+        use std::path::Path;
+        assert_eq!(Language::from_path(Path::new("pom.xml")), Language::Xml);
+        assert_eq!(Language::from_path(Path::new("q.SQL")), Language::Sql);
+        assert_eq!(Language::from_path(Path::new(".env.production")), Language::Config);
+        assert_eq!(Language::from_path(Path::new("nginx.conf")), Language::Config);
+        assert_eq!(Language::from_path(Path::new("Cargo.lock")), Language::Toml);
+        assert_eq!(Language::from_path(Path::new("rust-toolchain")), Language::Toml);
+        assert_eq!(Language::from_path(Path::new("/x/.cargo/config")), Language::Toml);
+        let k = kinds(Language::Xml, "<?xml version=\"1.0\"?>\n<project a=\"b\"><!-- c --><dep>x</dep></project>");
+        assert!(k.iter().any(|(t, n)| t == "project" && *n == "tag"), "{k:?}");
+        assert!(k.iter().any(|(_, n)| *n == "comment"), "{k:?}");
+        let k = kinds(Language::Config, "# db\nDATABASE_URL=\"postgres://x\"\nPORT=3000\n");
+        assert!(k.iter().any(|(_, n)| *n == "comment"), "{k:?}");
+        assert!(k.iter().any(|(t, n)| t.contains("postgres") && *n == "string"), "{k:?}");
     }
 
     #[test]

@@ -176,6 +176,8 @@ pub struct Workspace {
     pub(crate) claude_pending: Option<crate::claude_bridge::PendingDiff>,
     pub(crate) claude_sessions: usize,
     next_terminal_id: u64,
+    /// Repos found by rediscovery, applied to the Git panel when a window is at hand.
+    pending_git_repos: Option<Vec<(String, PathBuf)>>,
     tools_panel: Option<Entity<ToolsPanel>>,
     pub(crate) diff: Option<Entity<DiffView>>,
     pub(crate) diff_active: bool,
@@ -232,6 +234,9 @@ impl Workspace {
                 this.stay_awake.set(active);
                 if active {
                     this.on_window_activated(cx);
+                    if let (Some(repos), Some(gp)) = (this.pending_git_repos.take(), this.git_panel.clone()) {
+                        gp.update(cx, |g, cx| g.set_repos(repos, window, cx));
+                    }
                 } else if this.state.autosave {
                     this.save_all(cx);
                 }
@@ -253,6 +258,7 @@ impl Workspace {
             claude_pending: None,
             claude_sessions: 0,
             next_terminal_id: 1,
+            pending_git_repos: None,
             tools_panel: None,
             diff: None,
             diff_active: false,
@@ -332,6 +338,7 @@ impl Workspace {
     }
 
     fn on_window_activated(&mut self, cx: &mut Context<Self>) {
+        self.rediscover_repositories(cx);
         self.refresh_branches();
         // Re-read expanded folders (no watchers; refresh on focus).
         // Dropping the cache makes the next render re-read only the folders still expanded.
@@ -383,7 +390,37 @@ impl Workspace {
     }
 
     /// Start terminals and reopen files for the active project, lazily, once.
+    /// Pick up repositories created after the project was added (e.g. a later `git init`).
+    fn rediscover_repositories(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.active_project.clone() else { return };
+        let Some(root) = self.state.project(&id).and_then(|p| p.root.clone()).filter(|r| r.is_dir()) else { return };
+        let found = discover_repositories(&root, 2);
+        let Some(project) = self.state.project_mut(&id) else { return };
+        let mut added = false;
+        for repo in found {
+            if !project.repositories.iter().any(|r| r.path == repo) {
+                project.add_repository(&repo);
+                added = true;
+            }
+        }
+        if added {
+            let repos: Vec<(String, PathBuf)> = project.repositories.iter().map(|r| (r.name.clone(), r.path.clone())).collect();
+            self.refresh_branches();
+            if let Some(tp) = self.tools_panel.clone() {
+                let r = repos.clone();
+                tp.update(cx, |t, cx| t.set_repos(r, cx));
+            }
+            self.pending_git_repos = Some(repos);
+            self.persist(cx);
+            cx.notify();
+        }
+    }
+
     fn ensure_project_loaded(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rediscover_repositories(cx);
+        if let (Some(repos), Some(gp)) = (self.pending_git_repos.take(), self.git_panel.clone()) {
+            gp.update(cx, |g, cx| g.set_repos(repos, window, cx));
+        }
         let key = self.active_key();
         self.refresh_branches();
         if !self.terminals.contains_key(&key) {
@@ -1923,15 +1960,28 @@ impl Workspace {
                     }
                 }
             }
-            // Loose files and folders of the project root, as siblings of the repositories.
+            // Everything in the project root that isn't a repository goes into a virtual
+            // "others" folder next to the repositories.
             if let Some(root) = project.root.as_ref().filter(|r| r.is_dir() && !project.repositories.iter().any(|repo| &repo.path == *r)) {
                 let repo_paths: Vec<PathBuf> = project.repositories.iter().map(|r| r.path.clone()).collect();
-                let entries = self.children(root);
-                for entry in entries.iter().filter(|e| !repo_paths.contains(&e.path)) {
-                    let expanded = entry.is_dir && self.expanded.contains(&entry.path);
-                    rows.push(Row::Entry { entry: entry.clone(), depth: 0, expanded, dimmed: is_dimmed(&entry.name) });
-                    if expanded {
-                        self.push_tree(&entry.path, 1, &active_file, &mut rows);
+                let entries: Vec<DirEntry> = self.children(root).iter().filter(|e| !repo_paths.contains(&e.path)).cloned().collect();
+                if !entries.is_empty() {
+                    let key = others_key(root);
+                    let open = self.expanded.contains(&key);
+                    rows.push(Row::Entry {
+                        entry: DirEntry { name: "others".into(), path: key, is_dir: true, virtual_others: true },
+                        depth: 0,
+                        expanded: open,
+                        dimmed: false,
+                    });
+                    if open {
+                        for entry in entries.iter() {
+                            let expanded = entry.is_dir && self.expanded.contains(&entry.path);
+                            rows.push(Row::Entry { entry: entry.clone(), depth: 1, expanded, dimmed: is_dimmed(&entry.name) });
+                            if expanded {
+                                self.push_tree(&entry.path, 2, &active_file, &mut rows);
+                            }
+                        }
                     }
                 }
             }
