@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    ClickEvent, Context, ListHorizontalSizingBehavior, ObjectFit, Render, SharedString, Task,
-    Window, div, img, prelude::*, px, uniform_list,
+    App, ClickEvent, Context, Global, ListHorizontalSizingBehavior, MouseMoveEvent, ObjectFit, Pixels, Point, Render,
+    ScrollHandle, ScrollWheelEvent, SharedString, Task, WeakEntity, Window, div, img, point, prelude::*, px, uniform_list,
 };
 
 use crate::theme;
@@ -44,7 +44,14 @@ pub struct AssetView {
     table: Option<Table>,
     loading: bool,
     error: Option<String>,
-    zoom_fit: bool,
+    /// `None` = fit (natural size, scaled down if needed); `Some(z)` = explicit zoom factor.
+    zoom: Option<f32>,
+    /// Natural pixel size of the image (from its header).
+    natural: Option<(f32, f32)>,
+    scroll: ScrollHandle,
+    hovered: bool,
+    /// Last mouse position in window coordinates (zoom anchor for pinch).
+    mouse: Option<Point<Pixels>>,
     _task: Option<Task<()>>,
 }
 
@@ -57,7 +64,28 @@ struct Table {
 impl AssetView {
     pub fn new(path: PathBuf, kind: AssetKind, cx: &mut Context<Self>) -> Self {
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let mut this = Self { path, kind, bytes, table: None, loading: false, error: None, zoom_fit: false, _task: None };
+        let natural = if kind == AssetKind::Image {
+            imagesize::size(&path).ok().map(|s| (s.width as f32, s.height as f32)).filter(|(w, h)| *w > 0. && *h > 0.)
+        } else {
+            None
+        };
+        let mut this = Self {
+            path,
+            kind,
+            bytes,
+            table: None,
+            loading: false,
+            error: None,
+            zoom: None,
+            natural,
+            scroll: ScrollHandle::new(),
+            hovered: false,
+            mouse: None,
+            _task: None,
+        };
+        if kind == AssetKind::Image {
+            pinch::register(cx.weak_entity(), cx);
+        }
         if kind == AssetKind::Table {
             this.loading = true;
             let p = this.path.clone();
@@ -75,6 +103,129 @@ impl AssetView {
         }
         this
     }
+}
+
+const MIN_ZOOM: f32 = 0.05;
+const MAX_ZOOM: f32 = 32.;
+const PAD: f32 = 16.;
+
+impl AssetView {
+    /// Scale currently on screen: the explicit zoom, or the fit scale.
+    fn current_scale(&self) -> f32 {
+        if let Some(z) = self.zoom {
+            return z;
+        }
+        let Some((w, h)) = self.natural else { return 1. };
+        let b = self.scroll.bounds();
+        let (vw, vh) = (f32::from(b.size.width) - 2. * PAD, f32::from(b.size.height) - 2. * PAD);
+        if vw <= 0. || vh <= 0. {
+            return 1.;
+        }
+        (vw / w).min(vh / h).min(1.)
+    }
+
+    /// Zoom by `factor`, keeping the image point under `anchor` (window coords) fixed.
+    fn zoom_by(&mut self, factor: f32, anchor: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let Some((w, h)) = self.natural else { return };
+        let z0 = self.current_scale();
+        let z1 = (z0 * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        if (z1 - z0).abs() < f32::EPSILON {
+            return;
+        }
+        let b = self.scroll.bounds();
+        let (vw, vh) = (f32::from(b.size.width), f32::from(b.size.height));
+        let anchor = anchor.filter(|p| b.contains(p)).unwrap_or_else(|| b.center());
+        let (ax, ay) = (f32::from(anchor.x - b.origin.x), f32::from(anchor.y - b.origin.y));
+        let off = if self.zoom.is_some() { self.scroll.offset() } else { point(px(0.), px(0.)) };
+        // Image origin inside the scroll content (centered when smaller than the viewport).
+        let origin = |z: f32, view: f32, natural: f32| ((view - natural * z) / 2.).max(PAD);
+        let (ix0, iy0) = (origin(z0, vw, w), origin(z0, vh, h));
+        // Image-pixel coordinate under the anchor.
+        let cx_img = (ax - f32::from(off.x) - ix0) / z0;
+        let cy_img = (ay - f32::from(off.y) - iy0) / z0;
+        let (ix1, iy1) = (origin(z1, vw, w), origin(z1, vh, h));
+        let max_x = (w * z1 + 2. * PAD - vw).max(0.);
+        let max_y = (h * z1 + 2. * PAD - vh).max(0.);
+        let nx = (ax - ix1 - cx_img * z1).clamp(-max_x, 0.);
+        let ny = (ay - iy1 - cy_img * z1).clamp(-max_y, 0.);
+        self.zoom = Some(z1);
+        self.scroll.set_offset(point(px(nx), px(ny)));
+        cx.notify();
+    }
+
+    fn set_zoom(&mut self, zoom: Option<f32>, cx: &mut Context<Self>) {
+        self.zoom = zoom;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+}
+
+/// Trackpad pinch (NSEvent magnify). GPUI doesn't surface it, so we add
+/// `magnifyWithEvent:` to GPUI's NSView class and forward the deltas to the hovered image view.
+mod pinch {
+    use super::*;
+    use futures::{StreamExt, channel::mpsc};
+    use std::sync::OnceLock;
+
+    static TX: OnceLock<mpsc::UnboundedSender<f64>> = OnceLock::new();
+
+    #[derive(Default)]
+    struct Targets(Vec<WeakEntity<AssetView>>);
+    impl Global for Targets {}
+
+    pub fn register(view: WeakEntity<AssetView>, cx: &mut App) {
+        if !cx.has_global::<Targets>() {
+            cx.set_global(Targets::default());
+            let (tx, mut rx) = mpsc::unbounded::<f64>();
+            if TX.set(tx).is_ok() {
+                install_magnify_hook();
+            }
+            cx.spawn(async move |cx| {
+                while let Some(mut m) = rx.next().await {
+                    // Coalesce queued deltas into one zoom step.
+                    while let Ok(more) = rx.try_recv() {
+                        m += more;
+                    }
+                    let _ = cx.update(|cx| {
+                        let targets = cx.global::<Targets>().0.clone();
+                        if let Some(t) = targets.iter().rev().filter_map(|w| w.upgrade()).find(|e| e.read(cx).hovered) {
+                            t.update(cx, |v, cx| {
+                                let anchor = v.mouse;
+                                v.zoom_by((1. + m as f32).max(0.1), anchor, cx);
+                            });
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+        let t = cx.global_mut::<Targets>();
+        t.0.retain(|w| w.upgrade().is_some());
+        t.0.push(view);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(unexpected_cfgs)]
+    fn install_magnify_hook() {
+        use objc::runtime::{Class, Object, Sel, class_addMethod};
+        use objc::{msg_send, sel, sel_impl};
+
+        extern "C" fn magnify(_this: &Object, _sel: Sel, event: *mut Object) {
+            let m: f64 = unsafe { msg_send![event, magnification] };
+            if let Some(tx) = TX.get() {
+                let _ = tx.unbounded_send(m);
+            }
+        }
+
+        let Some(cls) = Class::get("GPUIView") else { return };
+        unsafe {
+            let imp: extern "C" fn(&Object, Sel, *mut Object) = magnify;
+            class_addMethod(cls as *const Class as *mut Class, sel!(magnifyWithEvent:), std::mem::transmute(imp), c"v@:@".as_ptr());
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn install_magnify_hook() {}
 }
 
 fn load_table(path: &Path) -> Result<Table, String> {
@@ -181,34 +332,64 @@ impl Render for AssetView {
             .text_color(theme::rgb(theme::TEXT_MUTED))
             .child(info)
             .child(div().flex_1())
-            .when(self.kind == AssetKind::Image, |d| {
-                d.child(button("asset-zoom", if self.zoom_fit { "Actual size" } else { "Fit to window" }).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.zoom_fit = !this.zoom_fit;
-                    cx.notify();
-                })))
+            .when(self.kind == AssetKind::Image && self.natural.is_some(), |d| {
+                let pct = format!("{:.0}%", self.current_scale() * 100.);
+                d.child(button("asset-zoom-out", "−").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_by(1. / 1.25, None, cx))))
+                    .child(div().w(px(44.)).flex().justify_center().text_color(theme::rgb(theme::TEXT)).child(pct))
+                    .child(button("asset-zoom-in", "+").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_by(1.25, None, cx))))
+                    .child(button("asset-zoom-100", "100%").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.set_zoom(Some(1.), cx))))
+                    .child(button("asset-zoom-fit", "Fit").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.set_zoom(None, cx))))
             })
             .child(button("asset-open", "Open with default app").on_click(cx.listener(|this, _: &ClickEvent, _, cx| cx.open_with_system(&this.path))))
             .child(button("asset-reveal", "Reveal in Finder").on_click(cx.listener(|this, _: &ClickEvent, _, cx| cx.reveal_path(&this.path))));
 
         let body = match self.kind {
-            AssetKind::Image => div()
-                .id("image-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_scroll()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p(px(16.))
-                // Checkerboard-ish neutral background so transparent images are readable.
-                .bg(theme::rgb(0x1d1f23))
-                // Default: natural size, scaled down only if it doesn't fit. "Fit" scales up too.
-                .child(if self.zoom_fit {
-                    img(self.path.clone()).size_full().object_fit(ObjectFit::Contain).into_any_element()
-                } else {
-                    img(self.path.clone()).size_full().object_fit(ObjectFit::ScaleDown).into_any_element()
-                })
-                .into_any_element(),
+            AssetKind::Image => {
+                let base = div()
+                    .id("image-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .track_scroll(&self.scroll)
+                    // Neutral background so transparent images are readable.
+                    .bg(theme::rgb(0x1d1f23))
+                    .on_hover(cx.listener(|this, h: &bool, _, _| this.hovered = *h))
+                    .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
+                        this.mouse = Some(e.position);
+                        this.hovered = true;
+                    }))
+                    // ⌘/Ctrl + wheel zooms (plain wheel scrolls the zoomed image).
+                    .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
+                        if !(e.modifiers.platform || e.modifiers.control) {
+                            return;
+                        }
+                        let dy = f32::from(e.delta.pixel_delta(px(20.)).y);
+                        this.zoom_by((dy * 0.005).exp(), Some(e.position), cx);
+                        cx.stop_propagation();
+                    }));
+                match (self.zoom, self.natural) {
+                    (Some(z), Some((w, h))) => base
+                        .child(
+                            div()
+                                .min_w_full()
+                                .min_h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .p(px(PAD))
+                                .child(img(self.path.clone()).flex_none().w(px(w * z)).h(px(h * z)).object_fit(ObjectFit::Fill)),
+                        )
+                        .into_any_element(),
+                    // Fit: natural size, scaled down only if it doesn't fit.
+                    _ => base
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p(px(PAD))
+                        .child(img(self.path.clone()).size_full().object_fit(ObjectFit::ScaleDown))
+                        .into_any_element(),
+                }
+            }
             AssetKind::Table => {
                 if let Some(e) = &self.error {
                     centered(e.clone()).into_any_element()

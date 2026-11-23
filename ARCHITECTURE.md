@@ -20,7 +20,7 @@ crates/
 ```
 
 Planned crates (see ROADMAP.md): `editor`, `git_engine`, `diff_engine`, `code_quality`,
-`claude_integration`, `obscura_integration`, `settings`. Each one only depends on what it needs;
+`claude_integration`, `moli_integration`, `settings`. Each one only depends on what it needs;
 the `app` crate composes them. No IPC or serialization between in-process modules.
 
 ## Data flow: terminal

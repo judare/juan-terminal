@@ -1,5 +1,5 @@
-//! Sidebar "Tools" mode: Oxlint/Oxfmt per repository with a problems list, and the Obscura
-//! browser integration for Claude Code. Everything runs on demand, off the UI thread.
+//! Sidebar "Tools" mode: Oxlint/Oxfmt per repository with a problems list, and the Moli
+//! headless-browser integration for Claude Code (binary + skills). Everything runs on demand, off the UI thread.
 
 use std::path::PathBuf;
 
@@ -7,7 +7,7 @@ use code_quality::{Diagnostic, Located, Severity, Tool};
 use gpui::{ClickEvent, Context, EventEmitter, PromptLevel, Render, SharedString, Window, div, prelude::*, px};
 
 use crate::git_panel::icon_action;
-use crate::obscura;
+use crate::moli;
 use crate::theme;
 
 pub enum ToolsPanelEvent {
@@ -28,10 +28,12 @@ struct RepoTools {
 }
 
 #[derive(Default)]
-struct ObscuraState {
+struct MoliState {
     bin: Option<PathBuf>,
     version: Option<String>,
-    registered: Option<bool>,
+    /// Ref the installed skills came from; `None` = not (fully) installed.
+    skills: Option<String>,
+    obscura_leftovers: bool,
     busy: Option<&'static str>,
     message: Option<(String, bool)>,
     checked: bool,
@@ -39,7 +41,7 @@ struct ObscuraState {
 
 pub struct ToolsPanel {
     repos: Vec<RepoTools>,
-    obscura: ObscuraState,
+    moli: MoliState,
     /// Running language servers ("tsgo · frontend").
     servers: Vec<String>,
     tsgo: Option<PathBuf>,
@@ -54,7 +56,7 @@ impl ToolsPanel {
     pub fn new() -> Self {
         Self {
             repos: Vec::new(),
-            obscura: ObscuraState::default(),
+            moli: MoliState::default(),
             servers: Vec::new(),
             tsgo: crate::language_servers::locate_tsgo(std::path::Path::new("/nonexistent"), std::path::Path::new("/nonexistent")),
             tsgo_busy: false,
@@ -66,8 +68,8 @@ impl ToolsPanel {
     /// Detect tools for the active project's repositories (cheap: file checks + `--version`).
     pub fn set_repos(&mut self, repos: Vec<(String, PathBuf)>, cx: &mut Context<Self>) {
         if repos.len() == self.repos.len() && repos.iter().zip(&self.repos).all(|((_, p), r)| *p == r.path) {
-            if !self.obscura.checked {
-                self.check_obscura(cx);
+            if !self.moli.checked {
+                self.check_moli(cx);
             }
             return;
         }
@@ -97,7 +99,7 @@ impl ToolsPanel {
             });
         })
         .detach();
-        self.check_obscura(cx);
+        self.check_moli(cx);
         cx.notify();
     }
 
@@ -229,26 +231,26 @@ impl ToolsPanel {
         .detach();
     }
 
-    // ---- obscura ------------------------------------------------------------------------
+    // ---- moli ---------------------------------------------------------------------------
 
-    fn check_obscura(&mut self, cx: &mut Context<Self>) {
-        self.obscura.checked = true;
-        self.obscura.busy = Some("Checking");
+    fn check_moli(&mut self, cx: &mut Context<Self>) {
+        self.moli.checked = true;
+        self.moli.busy = Some("Checking");
         cx.spawn(async move |this, cx| {
-            let (bin, version, registered) = cx
+            let (bin, version, skills, leftovers) = cx
                 .background_executor()
                 .spawn(async move {
-                    let bin = obscura::locate();
-                    let version = bin.as_deref().and_then(obscura::version);
-                    let registered = obscura::registered().ok();
-                    (bin, version, registered)
+                    let bin = moli::locate();
+                    let version = bin.as_deref().and_then(moli::version);
+                    (bin, version, moli::skills_ref(), moli::obscura_leftovers())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.obscura.bin = bin;
-                this.obscura.version = version;
-                this.obscura.registered = registered;
-                this.obscura.busy = None;
+                this.moli.bin = bin;
+                this.moli.version = version;
+                this.moli.skills = skills;
+                this.moli.obscura_leftovers = leftovers;
+                this.moli.busy = None;
                 cx.notify();
             });
         })
@@ -256,76 +258,86 @@ impl ToolsPanel {
         cx.notify();
     }
 
-    fn obscura_op(&mut self, label: &'static str, cx: &mut Context<Self>, op: impl FnOnce() -> anyhow::Result<String> + Send + 'static) {
-        if self.obscura.busy.is_some() {
+    fn moli_op(&mut self, label: &'static str, cx: &mut Context<Self>, op: impl FnOnce() -> anyhow::Result<String> + Send + 'static) {
+        if self.moli.busy.is_some() {
             return;
         }
-        self.obscura.busy = Some(label);
-        self.obscura.message = None;
+        self.moli.busy = Some(label);
+        self.moli.message = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { op() }).await;
             let _ = this.update(cx, |this, cx| {
-                this.obscura.busy = None;
-                this.obscura.message = Some(match result {
+                this.moli.busy = None;
+                this.moli.message = Some(match result {
                     Ok(s) => (s, false),
                     Err(e) => (format!("{e:#}"), true),
                 });
-                this.check_obscura(cx);
+                this.check_moli(cx);
             });
+        })
+        .detach();
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>, level: PromptLevel, title: String, detail: String, ok: &'static str, run: impl FnOnce(&mut Self, &mut Context<Self>) + 'static) {
+        let answer = window.prompt(level, &title, Some(&detail), &[ok, "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| run(this, cx));
         })
         .detach();
     }
 
     fn confirm_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let answer = window.prompt(
-            PromptLevel::Info,
-            &format!("Download Obscura ({})?", obscura::RELEASE_SIZE_HINT),
-            Some(&format!("Downloads the latest macOS Apple Silicon release from GitHub into\n{}", obscura::app_bin_dir().display())),
-            &["Download", "Cancel"],
+        let url = moli::release_url().unwrap_or_default();
+        self.confirm(
+            window,
             cx,
+            PromptLevel::Info,
+            format!("Download Moli ({})?", moli::RELEASE_SIZE_HINT),
+            format!("Downloads the latest macOS release from GitHub\n{url}\ninto {}", moli::install_dir().display()),
+            "Download",
+            |this, cx| this.moli_op("Downloading", cx, || moli::install().map(|p| format!("Installed {}", p.display()))),
         );
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            let _ = this.update(cx, |this, cx| {
-                this.obscura_op("Downloading", cx, || obscura::install().map(|p| format!("Installed {}", p.display())));
-            });
-        })
-        .detach();
     }
 
-    fn confirm_register(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(bin) = self.obscura.bin.clone() else { return };
-        let answer = window.prompt(
-            PromptLevel::Info,
-            "Add Obscura to Claude Code?",
-            Some(&format!(
-                "Runs:\nclaude mcp add -s user -e OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura -- {} mcp\n\nPrivate networks are allowed so Claude can open your local dev servers (localhost). Claude Code starts the Obscura MCP server only when it needs a browser.",
-                bin.display()
-            )),
-            &["Add", "Cancel"],
+    fn confirm_install_skills(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let git_ref = moli::ref_for(self.moli.version.as_deref());
+        self.confirm(
+            window,
             cx,
+            PromptLevel::Info,
+            "Add Moli skills to Claude Code?".into(),
+            format!(
+                "Downloads {} from github.com/{}@{git_ref} into\n{}\n\nClaude Code then uses `moli fetch` / `moli serve` whenever it needs a browser (local dev servers included).",
+                moli::SKILLS.join(", "),
+                moli::REPO,
+                moli::skills_dir().display()
+            ),
+            "Install",
+            move |this, cx| this.moli_op("Installing skills", cx, move || moli::install_skills(&git_ref)),
         );
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            let _ = this.update(cx, |this, cx| this.obscura_op("Registering", cx, move || obscura::register(&bin)));
-        })
-        .detach();
     }
 
-    fn confirm_unregister(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let answer = window.prompt(PromptLevel::Warning, "Remove Obscura from Claude Code?", Some("Runs: claude mcp remove -s user obscura"), &["Remove", "Cancel"], cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            let _ = this.update(cx, |this, cx| this.obscura_op("Removing", cx, obscura::unregister));
-        })
-        .detach();
+    fn confirm_remove_skills(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dirs = moli::SKILLS.iter().map(|s| moli::skills_dir().join(s).display().to_string()).collect::<Vec<_>>().join("\n");
+        self.confirm(window, cx, PromptLevel::Warning, "Remove Moli skills from Claude Code?".into(), format!("Deletes:\n{dirs}"), "Remove", |this, cx| {
+            this.moli_op("Removing", cx, moli::remove_skills)
+        });
+    }
+
+    fn confirm_remove_obscura(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm(
+            window,
+            cx,
+            PromptLevel::Warning,
+            "Remove Obscura?".into(),
+            "Runs: claude mcp remove -s user obscura\nand deletes the Obscura binaries this app downloaded.".into(),
+            "Remove",
+            |this, cx| this.moli_op("Removing Obscura", cx, moli::remove_obscura),
+        );
     }
 }
 
@@ -558,51 +570,62 @@ impl Render for ToolsPanel {
             list = list.child(message("tsgo-msg".into(), m));
         }
 
-        // Obscura.
-        let o = &self.obscura;
+        // Moli.
+        let m = &self.moli;
         list = list.child(
-            header("BROWSER", "Obscura · MCP for Claude", false)
+            header("BROWSER", "Moli · skills for Claude", false)
                 .child(div().flex_1())
-                .child(icon_action("obs-refresh", "icons/fetch.svg", "Re-check").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.check_obscura(cx))))
-                .child(icon_action("obs-docs", "icons/external.svg", "Docs").on_click(|_, _, cx| cx.open_url("https://github.com/h4ckf0r0day/obscura/blob/main/docs/Use-the-MCP-server.md"))),
+                .child(icon_action("moli-refresh", "icons/fetch.svg", "Re-check").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.check_moli(cx))))
+                .child(icon_action("moli-docs", "icons/external.svg", "Docs").on_click(|_, _, cx| cx.open_url("https://github.com/lexmount/moli"))),
         );
+        let want_ref = moli::ref_for(m.version.as_deref());
+        let skills_stale = m.version.is_some() && m.skills.as_deref().is_some_and(|r| !r.is_empty() && r != want_ref);
         list = list
             .child(status_line(
                 "binary",
-                match (&o.bin, &o.version) {
-                    (Some(_), v) => v.clone().unwrap_or_else(|| "installed".into()),
+                match (&m.bin, &m.version) {
+                    (Some(_), Some(v)) => v.clone(),
+                    (Some(_), None) => "installed (does not run)".into(),
                     (None, _) => "not installed".into(),
                 },
-                o.bin.is_some(),
+                m.version.is_some(),
             ))
             .child(status_line(
-                "Claude",
-                match o.registered {
-                    Some(true) => "registered".into(),
-                    Some(false) => "not registered".into(),
-                    None => "claude CLI not found".into(),
+                "skills",
+                match m.skills.as_deref() {
+                    None => "not installed".into(),
+                    Some("") => "installed".into(),
+                    Some(r) if skills_stale => format!("{r} (binary is {want_ref})"),
+                    Some(r) => r.to_string(),
                 },
-                o.registered == Some(true),
+                m.skills.is_some() && !skills_stale,
             ));
         let mut buttons = div().flex().flex_wrap().gap(px(6.)).pl(px(44.)).pr(px(12.)).py(px(6.));
-        if o.bin.is_none() {
-            buttons = buttons.child(tool_button("obs-install", "Download & install", true).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_install(w, cx))));
-        } else if o.registered == Some(true) {
-            buttons = buttons.child(tool_button("obs-unreg", "Remove from Claude", false).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_unregister(w, cx))));
+        if m.bin.is_none() {
+            buttons = buttons.child(tool_button("moli-install", "Download & install", true).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_install(w, cx))));
         } else {
-            buttons = buttons.child(tool_button("obs-reg", "Add to Claude Code", true).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_register(w, cx))));
+            buttons = buttons.child(tool_button("moli-update", "Update binary", false).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_install(w, cx))));
+        }
+        if m.skills.is_none() || skills_stale {
+            let label = if skills_stale { "Update skills" } else { "Add skills to Claude" };
+            buttons = buttons.child(tool_button("moli-skills", label, m.bin.is_some()).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_install_skills(w, cx))));
+        } else {
+            buttons = buttons.child(tool_button("moli-unskills", "Remove skills", false).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_remove_skills(w, cx))));
+        }
+        if m.obscura_leftovers {
+            buttons = buttons.child(tool_button("obscura-remove", "Remove old Obscura", false).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.confirm_remove_obscura(w, cx))));
         }
         list = list.child(buttons);
-        if let Some(b) = o.busy {
+        if let Some(b) = m.busy {
             list = list.child(div().px(px(24.)).text_size(px(11.5)).text_color(theme::rgb(theme::ACCENT)).child(format!("{b}…")));
         }
-        if let Some(m) = &o.message {
-            list = list.child(message("obs-msg".into(), m));
+        if let Some(msg) = &m.message {
+            list = list.child(message("moli-msg".into(), msg));
         }
         let open = self.mcp_tools_open;
         list = list.child(
             div()
-                .id("mcp-tools")
+                .id("moli-skills-list")
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -616,10 +639,10 @@ impl Render for ToolsPanel {
                     this.mcp_tools_open = !this.mcp_tools_open;
                     cx.notify();
                 }))
-                .child(format!("{} tools Claude gets", obscura::TOOLS.len()))
+                .child(format!("{} skills Claude gets", moli::SKILL_INFO.len()))
                 .child(gpui::svg().path(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }).size(px(8.)).text_color(theme::rgb(theme::TEXT_FAINT))),
         );
-        for (name, desc) in obscura::TOOLS.iter().filter(|_| open) {
+        for (name, desc) in moli::SKILL_INFO.iter().filter(|_| open) {
             list = list.child(
                 div()
                     .flex()

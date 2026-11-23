@@ -1,7 +1,7 @@
 # juan-terminal
 
 Native macOS (Apple Silicon) development workspace in Rust + GPUI: terminal, projects with
-multiple Git repositories, and (next) editor, Git UI, Claude Code, Oxlint/Oxfmt, Obscura.
+multiple Git repositories, and (next) editor, Git UI, Claude Code, Oxlint/Oxfmt, Moli.
 
 ## Run
 

@@ -187,6 +187,10 @@ pub struct Workspace {
     /// Claude Code IDE integration server (selection, diagnostics, diffs, hook events).
     pub(crate) ide: Option<claude_ide::IdeServer>,
     servers_panel: Option<Entity<crate::servers_panel::ServersPanel>>,
+    /// GitHub Actions section under the file tree (hidden when no repo has workflows).
+    actions_panel: Option<Entity<crate::actions_panel::ActionsPanel>>,
+    actions_height: f32,
+    resizing_actions: bool,
     /// Local cache file → (server, remote path) for files opened over SFTP.
     remote_files: HashMap<PathBuf, (workspace_state::SshServer, String)>,
     pub(crate) claude_pending: Option<crate::claude_bridge::PendingDiff>,
@@ -278,6 +282,9 @@ impl Workspace {
             ports_panel: None,
             ide: None,
             servers_panel: None,
+            actions_panel: None,
+            actions_height: 300.,
+            resizing_actions: false,
             remote_files: HashMap::new(),
             claude_pending: None,
             claude_sessions: 0,
@@ -458,6 +465,10 @@ impl Workspace {
                 let r = repos.clone();
                 tp.update(cx, |t, cx| t.set_repos(r, cx));
             }
+            if let Some(ap) = self.actions_panel.clone() {
+                let r = repos.clone();
+                ap.update(cx, |a, cx| a.set_repos(r, cx));
+            }
             self.pending_git_repos = Some(repos);
             self.persist(cx);
             cx.notify();
@@ -489,6 +500,7 @@ impl Workspace {
             }
         }
         self.sync_git_panel(window, cx);
+        self.sync_actions_panel(window, cx);
         if !self.editors.contains_key(&key) {
             self.editors.insert(key.clone(), Tabs::default());
             let files: Vec<PathBuf> = self.active_project().map(|p| p.open_files.clone()).unwrap_or_default();
@@ -765,6 +777,31 @@ impl Workspace {
             }
         };
         gp.update(cx, |g, cx| g.set_repos(repos, window, cx));
+    }
+
+    /// Point the Actions section at the project's repos (it hides itself without workflows).
+    fn sync_actions_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repos = self.project_repos();
+        let ap = match &self.actions_panel {
+            Some(ap) => ap.clone(),
+            None => {
+                let ap = cx.new(|_| crate::actions_panel::ActionsPanel::new());
+                let sub = cx.subscribe_in(&ap, window, |this, _, event, window, cx| match event {
+                    crate::actions_panel::ActionsPanelEvent::OpenLog(path) => {
+                        let path = path.clone();
+                        this.open_file(&path, true, window, cx);
+                        if let Some(e) = this.active_editor().cloned() {
+                            e.update(cx, |e, cx| e.check_disk(cx));
+                        }
+                        this.persist(cx);
+                    }
+                });
+                self._subscriptions.push(sub);
+                self.actions_panel = Some(ap.clone());
+                ap
+            }
+        };
+        ap.update(cx, |a, cx| a.set_repos(repos, cx));
     }
 
     fn ensure_tools_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ToolsPanel> {
@@ -2562,6 +2599,14 @@ impl Workspace {
                 pp.update(cx, |p, _| p.active = on);
             }
         }
+        let actions_panel = self.actions_panel.clone().filter(|a| a.read(cx).has_any());
+        if let Some(ap) = self.actions_panel.clone() {
+            let on = self.sidebar_mode == SidebarMode::Files && self.sidebar_visible;
+            ap.update(cx, |a, cx| a.set_visible(on, cx));
+        }
+        let actions_panel = actions_panel.filter(|_| self.sidebar_mode == SidebarMode::Files);
+        let actions_open = actions_panel.as_ref().is_some_and(|a| a.read(cx).expanded);
+        let actions_height = self.actions_height;
         let count = self.rows.len();
         div()
             .flex()
@@ -2628,6 +2673,37 @@ impl Workspace {
                 .w_full()
                 .pb(px(8.)),
             ))
+            .when_some(actions_panel, |d, ap| {
+                d.child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w_full()
+                        .when(actions_open, |d| d.h(px(actions_height)))
+                        .when(!actions_open, |d| d.h(px(28.)))
+                        .child(ap)
+                        .when(actions_open, |d| {
+                            d.child(
+                                div()
+                                    .id("actions-resize")
+                                    .absolute()
+                                    .top(px(-3.))
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(6.))
+                                    .cursor_row_resize()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.resizing_actions = true;
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                        }),
+                )
+            })
             .into_any_element()
     }
 
@@ -2939,7 +3015,7 @@ impl Render for Workspace {
         let name_prompt = self.render_name_prompt(cx);
         let center = self.render_editor_area(cx);
         let right = self.terminal_visible.then(|| self.render_terminal_panel(cx));
-        let resizing = self.resizing_sidebar || self.resizing_terminal;
+        let resizing = self.resizing_sidebar || self.resizing_terminal || self.resizing_actions;
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -3023,10 +3099,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _, cx| this.set_font_size(this.font_size - 1., cx)))
             .on_action(cx.listener(|this, _: &ResetFontSize, _, cx| this.set_font_size(theme::DEFAULT_FONT_SIZE, cx)))
             .when(resizing, |d| {
-                d.cursor_col_resize()
+                let d = if self.resizing_actions { d.cursor_row_resize() } else { d.cursor_col_resize() };
+                d
                     .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
                         if this.resizing_sidebar {
                             this.sidebar_width = f32::from(e.position.x).clamp(MIN_SIDEBAR, MAX_SIDEBAR);
+                        }
+                        if this.resizing_actions {
+                            let h = f32::from(window.bounds().size.height);
+                            this.actions_height = (h - f32::from(e.position.y)).clamp(90., (h - 200.).max(90.));
                         }
                         if this.resizing_terminal {
                             let w = f32::from(window.bounds().size.width);
@@ -3040,6 +3121,7 @@ impl Render for Workspace {
                         cx.listener(|this, _: &MouseUpEvent, _, cx| {
                             this.resizing_sidebar = false;
                             this.resizing_terminal = false;
+                            this.resizing_actions = false;
                             this.persist(cx);
                             cx.notify();
                         }),

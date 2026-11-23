@@ -31,7 +31,7 @@ pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServ
             "protocolVersion": params.get("protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "juan-terminal", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "You are running inside juan-terminal, the user's development workspace. When the user asks to see, screenshot, open or test their app/page (e.g. with a browser tool), first call list_dev_servers and use this project's local dev server URL (http://localhost:PORT) rather than the production site, unless they explicitly ask for production. If none is running, start it yourself in the background (list_dev_servers gives the repo's start command), wait until the URL responds, and then take the screenshot — don't fall back to production. For the project's remote machines use list_servers and ssh_exec.",
+            "instructions": "You are running inside juan-terminal, the user's development workspace. When the user asks to see, screenshot, open or test their app/page (e.g. with Moli: `moli fetch --layout --dump screenshot URL > shot.png`, or any browser tool), first call list_dev_servers and use this project's local dev server URL (http://localhost:PORT) rather than the production site, unless they explicitly ask for production. If none is running, start it yourself in the background (list_dev_servers gives the repo's start command), wait until the URL responds, and then take the screenshot — don't fall back to production. For the project's remote machines use list_servers and ssh_exec.",
         }),
         "ping" => json!({}),
         "tools/list" => json!({"tools": [
