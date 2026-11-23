@@ -1,5 +1,6 @@
 //! juan-terminal: native macOS development workspace.
 
+mod actions_panel;
 mod asset_view;
 mod claude_bridge;
 mod claude_sessions;
@@ -11,7 +12,7 @@ mod git_panel;
 mod hover_preview;
 mod language_servers;
 mod markdown_live;
-mod obscura;
+mod moli;
 mod ports;
 mod power;
 mod quick_open;

@@ -5,6 +5,11 @@ use std::borrow::Cow;
 use gpui::{AssetSource, Result, SharedString};
 
 static ICONS: &[(&str, &[u8])] = &[
+    ("icons/action-running.svg", include_bytes!("../assets/icons/action-running.svg")),
+    ("icons/action-queued.svg", include_bytes!("../assets/icons/action-queued.svg")),
+    ("icons/action-stop.svg", include_bytes!("../assets/icons/action-stop.svg")),
+    ("icons/action-rerun.svg", include_bytes!("../assets/icons/action-rerun.svg")),
+    ("icons/action-workflow.svg", include_bytes!("../assets/icons/action-workflow.svg")),
     ("icons/braces.svg", include_bytes!("../assets/icons/braces.svg")),
     ("icons/ring-1.svg", include_bytes!("../assets/icons/ring-1.svg")),
     ("icons/ring-2.svg", include_bytes!("../assets/icons/ring-2.svg")),

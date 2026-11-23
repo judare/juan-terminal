@@ -44,8 +44,9 @@ Each milestone: compile, test, check regressions, measure (PERFORMANCE.md), then
 - [x] Lint project (⌘⇧L) with problems list; format changed files; format file (⌥⇧F)
 - [x] On ⌘S: oxfmt via stdin applied as an undoable edit, then oxlint on the file; wavy underlines + hover tooltip
 
-## M6 — Obscura ✅ implemented
-- [x] Tools panel: detect binary, download latest arm64 release (confirmed), register/unregister stdio MCP server with Claude Code (`claude mcp add -s user`), docs/OBSCURA.md
+## M6 — Browser for Claude (Moli) ✅ implemented
+- [x] Tools panel: detect `moli`, download latest macOS release into `~/.local/bin` (confirmed), install/update/remove Moli's official Claude Code skills in `~/.claude/skills`, docs/MOLI.md
+- [x] Replaced Obscura (MCP) — too many errors; panel offers to remove the old `obscura` MCP server and binaries
 
 ## M7 — Polish
 - [x] Keep Mac awake while the app is frontmost (IOKit power assertion)
