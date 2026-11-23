@@ -43,6 +43,9 @@ pub struct ClaudeStatus {
     pub session_id: String,
     pub cwd: Option<PathBuf>,
     pub cost_usd: f64,
+    /// Subscription windows: (used %, resets_at unix secs).
+    pub five_hour: Option<(f32, i64)>,
+    pub seven_day: Option<(f32, i64)>,
 }
 
 impl ClaudeStatus {
@@ -56,8 +59,50 @@ impl ClaudeStatus {
             session_id: s("/session_id"),
             cwd: v.pointer("/workspace/current_dir").and_then(|x| x.as_str()).or_else(|| v.get("cwd").and_then(|x| x.as_str())).map(PathBuf::from),
             cost_usd: v.pointer("/cost/total_cost_usd").and_then(|x| x.as_f64()).unwrap_or(0.),
+            five_hour: window(v, "five_hour"),
+            seven_day: window(v, "seven_day"),
         }
     }
+}
+
+fn window(v: &serde_json::Value, name: &str) -> Option<(f32, i64)> {
+    let w = v.pointer(&format!("/rate_limits/{name}"))?;
+    Some((w.get("used_percentage")?.as_f64()? as f32, w.get("resets_at").and_then(|x| x.as_i64()).unwrap_or(0)))
+}
+
+/// "in 2h 10m" / "in 3d 4h" until a unix timestamp.
+fn resets_in(ts: i64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let s = (ts - now).max(0);
+    if s >= 86_400 {
+        format!("{}d {}h", s / 86_400, (s % 86_400) / 3600)
+    } else if s >= 3600 {
+        format!("{}h {}m", s / 3600, (s % 3600) / 60)
+    } else {
+        format!("{}m", s / 60)
+    }
+}
+
+fn usage_meter(id: &'static str, label: &'static str, w: (f32, i64)) -> gpui::Stateful<gpui::Div> {
+    let (pct, reset) = (w.0.clamp(0., 100.), w.1);
+    let color = if pct >= 90. { 0xe06c75 } else if pct >= 70. { 0xe5c07b } else { 0x7aa2f7 };
+    let tip = format!("{label}: {pct:.0}% used · resets in {}", resets_in(reset));
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .tooltip(move |_, cx| cx.new(|_| crate::git_panel::DynTooltip(tip.clone().into())).into())
+        .child(div().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(label))
+        .child(
+            div()
+                .w(px(44.))
+                .h(px(5.))
+                .rounded_full()
+                .bg(theme::rgb(0x2e3138))
+                .child(div().h_full().rounded_full().w(px(44. * pct / 100.)).bg(theme::rgb(color))),
+        )
+        .child(div().text_size(px(11.)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_MUTED)).child(format!("{pct:.0}%")))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +155,10 @@ pub struct TerminalView {
     claude_menu: Option<ClaudeMenu>,
     /// Claude Code is the foreground process (updated each render).
     claude_fg: bool,
+    hover_cell: Option<(usize, usize)>,
+    hover_task: Option<Task<()>>,
+    /// Hover preview and where to draw it (pointer, relative to the grid origin).
+    preview: Option<(Point<Pixels>, crate::hover_preview::Preview)>,
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -117,6 +166,7 @@ pub struct TerminalView {
 #[derive(Clone, Copy)]
 struct GridLayout {
     origin: Point<Pixels>,
+    size: gpui::Size<Pixels>,
     cell_width: Pixels,
     cell_height: Pixels,
 }
@@ -179,6 +229,9 @@ impl TerminalView {
             claude_status: None,
             claude_menu: None,
             claude_fg: false,
+            hover_cell: None,
+            hover_task: None,
+            preview: None,
             _events: events,
             _subscriptions: subscriptions,
         }
@@ -303,7 +356,8 @@ impl TerminalView {
                 this.toggle_menu(ClaudeMenu::Effort, cx)
             })))
             .child(div().flex_1())
-            .when(st.cost_usd > 0., |d| d.child(div().text_size(px(11.)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("${:.2}", st.cost_usd))))
+            .when_some(st.five_hour, |d, w| d.child(usage_meter("rl-5h", "5h", w)))
+            .when_some(st.seven_day, |d, w| d.child(usage_meter("rl-7d", "week", w)))
             .into_any_element()
     }
 
@@ -424,6 +478,7 @@ impl TerminalView {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_preview(cx);
         if self.marked_text.is_some() {
             return; // IME composition in progress: let the input handler process it.
         }
@@ -509,6 +564,7 @@ impl TerminalView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
+        self.clear_preview(cx);
         let Some((row, col, right)) = self.cell_at(event.position) else { return };
         if event.modifiers.platform {
             let rows: Vec<String> = (0..self.snapshot.rows).map(|r| self.snapshot.row_text(r)).collect();
@@ -530,8 +586,67 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn clear_preview(&mut self, cx: &mut Context<Self>) {
+        self.hover_task = None;
+        self.hover_cell = None;
+        if self.preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Hover over a path / `[Image #N]`: after a short pause, show its preview by the pointer.
+    fn hover(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some((row, col, _)) = self.cell_at(event.position) else {
+            self.clear_preview(cx);
+            return;
+        };
+        if self.hover_cell == Some((row, col)) {
+            return;
+        }
+        self.hover_cell = Some((row, col));
+        let Some(layout) = self.layout else { return };
+        let local = event.position - layout.origin;
+        let line = self.snapshot.row_text(row);
+        let image = crate::hover_preview::image_ref_at(&line, col)
+            .and_then(|n| self.claude_status.as_ref().filter(|s| !s.session_id.is_empty()).map(|s| (s.session_id.clone(), s.cwd.clone(), n)));
+        let rows: Vec<String> = (0..self.snapshot.rows).map(|r| self.snapshot.row_text(r)).collect();
+        let wrapped: Vec<bool> = (0..self.snapshot.rows).map(|r| self.snapshot.row(r).last().is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE))).collect();
+        let cwd = self.current_cwd();
+        // Still over the same target: keep the preview where it is.
+        self.hover_task = Some(cx.spawn(async move |this, cx| {
+            gpui::Timer::after(std::time::Duration::from_millis(250)).await;
+            let built = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some((sid, scwd, n)) = image {
+                        let p = crate::hover_preview::session_image(&sid, scwd.as_deref(), n)?;
+                        return crate::hover_preview::for_path(&p, None).map(|pv| match pv {
+                            crate::hover_preview::Preview::Image { path, caption, .. } => crate::hover_preview::Preview::Image { path, title: format!("[Image #{n}]"), caption },
+                            other => other,
+                        });
+                    }
+                    let (path, line, _) = path_at(&rows, &wrapped, row, col, cwd.as_deref())?;
+                    crate::hover_preview::for_path(&path, line)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.hover_cell != Some((row, col)) {
+                    return;
+                }
+                let changed = built.is_some() || this.preview.is_some();
+                this.preview = built.map(|b| (local, b));
+                if changed {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
+            if event.pressed_button.is_none() {
+                self.hover(event, cx);
+            }
             return;
         }
         if let Some((row, col, right)) = self.cell_at(event.position) {
@@ -552,6 +667,7 @@ impl TerminalView {
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_preview(cx);
         let Some(layout) = self.layout else { return };
         let lines = match event.delta {
             ScrollDelta::Lines(p) => p.y,
@@ -600,6 +716,14 @@ impl Render for TerminalView {
         }
         let bar = claude.then(|| self.render_claude_bar(cx));
         let popover = if claude { self.render_claude_popover(cx) } else { None };
+        // Preview by the pointer: right of it, above it in the lower half (where it fits).
+        let preview = self.preview.as_ref().zip(self.layout).map(|((at, pv), l)| {
+            // The grid sits inside the root's padding (px 10, pt 6).
+            let (x, y) = (at.x + px(10.), at.y + px(6.));
+            let lower = at.y > l.size.height / 2.;
+            let el = div().absolute().left((x + px(14.)).min((l.size.width - px(380.)).max(px(0.)))).child(crate::hover_preview::render(pv));
+            if lower { el.bottom(l.size.height - y + px(14.)) } else { el.top(y + px(18.)) }
+        });
         let history_btn = claude.then(|| {
             div()
                 .absolute()
@@ -649,6 +773,12 @@ impl Render for TerminalView {
             .children(bar)
             .children(history_btn)
             .children(popover)
+            .children(preview)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.clear_preview(cx);
+                }
+            }))
             .when_some(exited, |el, code| {
                 let msg = match code {
                     Some(c) => format!("Process exited with code {c}. ⌘W to close."),
@@ -1058,7 +1188,7 @@ impl Element for TerminalElement {
             let dims = TermDims::new(cols, rows, f32::from(cell_width) as u16, f32::from(cell_height) as u16);
             view.session.resize(dims);
             view.session.snapshot(&mut view.snapshot);
-            view.layout = Some(GridLayout { origin: bounds.origin, cell_width, cell_height });
+            view.layout = Some(GridLayout { origin: bounds.origin, size: bounds.size, cell_width, cell_height });
 
             let snap = &view.snapshot;
             let palette = Palette::dark();

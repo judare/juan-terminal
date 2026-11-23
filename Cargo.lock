@@ -2929,6 +2929,7 @@ name = "juan-terminal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "claude_ide",
  "code_quality",
  "core-foundation 0.10.0",
