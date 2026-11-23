@@ -158,6 +158,7 @@ enum SidebarMode {
     Git,
     Tools,
     Ports,
+    Servers,
 }
 
 pub struct Workspace {
@@ -173,6 +174,9 @@ pub struct Workspace {
     ports_panel: Option<Entity<crate::ports::PortsPanel>>,
     /// Claude Code IDE integration server (selection, diagnostics, diffs, hook events).
     pub(crate) ide: Option<claude_ide::IdeServer>,
+    servers_panel: Option<Entity<crate::servers_panel::ServersPanel>>,
+    /// Local cache file → (server, remote path) for files opened over SFTP.
+    remote_files: HashMap<PathBuf, (workspace_state::SshServer, String)>,
     pub(crate) claude_pending: Option<crate::claude_bridge::PendingDiff>,
     pub(crate) claude_sessions: usize,
     next_terminal_id: u64,
@@ -255,6 +259,8 @@ impl Workspace {
             git_panel: None,
             ports_panel: None,
             ide: None,
+            servers_panel: None,
+            remote_files: HashMap::new(),
             claude_pending: None,
             claude_sessions: 0,
             next_terminal_id: 1,
@@ -494,6 +500,11 @@ impl Workspace {
     }
 
     fn spawn_terminal(&mut self, cwd: Option<PathBuf>, repository: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
+        self.spawn_terminal_with(cwd, repository, None, window, cx)
+    }
+
+    /// `program`: run this instead of the login shell (e.g. `ssh user@host`).
+    fn spawn_terminal_with(&mut self, cwd: Option<PathBuf>, repository: Option<String>, program: Option<(String, Vec<String>)>, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
         let key = self.active_key();
         let cwd = cwd.or_else(|| std::env::var_os("HOME").map(PathBuf::from));
         let mut env = crate::shell_integration::env_for_shell();
@@ -501,9 +512,13 @@ impl Workspace {
         self.next_terminal_id += 1;
         env.extend(self.claude_terminal_env(&jt_id));
         if let Some(p) = self.active_project() {
+            env.insert("JT_PROJECT_ID".into(), p.id.clone());
+            if let Some(cfg) = crate::servers_mcp_config(p) {
+                env.insert("JT_MCP_CONFIG".into(), cfg.to_string_lossy().into_owned());
+            }
             env.extend(p.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        let config = SessionConfig { cwd: cwd.clone(), env, ..SessionConfig::default() };
+        let config = SessionConfig { cwd: cwd.clone(), env, program, ..SessionConfig::default() };
         let (session, rx) = match TerminalSession::spawn(config, TermDims::new(80, 24, 8, 16), Palette::dark()) {
             Ok(s) => s,
             Err(err) => {
@@ -728,6 +743,69 @@ impl Workspace {
         let repos = self.project_repos();
         tp.update(cx, |t, cx| t.set_repos(repos, cx));
         tp
+    }
+
+    fn show_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = true;
+        self.sidebar_mode = SidebarMode::Servers;
+        let servers = self.active_project().map(|p| p.servers.clone()).unwrap_or_default();
+        let sp = match self.servers_panel.clone() {
+            Some(sp) => sp,
+            None => {
+                let sp = cx.new(|_| crate::servers_panel::ServersPanel::new());
+                let sub = cx.subscribe_in(&sp, window, |this, _, event, window, cx| this.on_servers_event(event, window, cx));
+                self._subscriptions.push(sub);
+                self.servers_panel = Some(sp.clone());
+                sp
+            }
+        };
+        sp.update(cx, |p, cx| p.set_servers(servers, cx));
+        cx.notify();
+    }
+
+    fn on_servers_event(&mut self, event: &crate::servers_panel::ServersPanelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::servers_panel::ServersPanelEvent as E;
+        match event {
+            E::Changed(list) => {
+                let Some(id) = self.state.active_project.clone() else { return };
+                if let Some(p) = self.state.project_mut(&id) {
+                    p.servers = list.clone();
+                }
+                self.persist(cx);
+            }
+            E::OpenTerminal(server) => {
+                let args = ssh_remote::interactive_args(server);
+                let label = server.name.clone();
+                if let Some(view) = self.spawn_terminal_with(None, None, Some(("ssh".into(), args)), window, cx) {
+                    view.update(cx, |t, cx| {
+                        t.label = Some(format!("ssh · {label}"));
+                        cx.notify();
+                    });
+                }
+            }
+            E::OpenRemoteFile { server, remote, local } => {
+                self.remote_files.insert(local.clone(), (server.clone(), remote.clone()));
+                self.open_file(local, true, window, cx);
+            }
+        }
+    }
+
+    /// An editor saved a file that came from a server: upload it back.
+    fn upload_if_remote(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some((server, remote)) = self.remote_files.get(path).cloned() else { return };
+        let local = path.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let (s2, r2) = (server.clone(), remote.clone());
+            let res = cx.background_executor().spawn(async move { ssh_remote::upload(&s2, &local, &r2) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.error = match res {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("Upload to {}:{remote} failed: {e:#}", server.name).into()),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn show_ports(&mut self, cx: &mut Context<Self>) {
@@ -1014,6 +1092,7 @@ impl Workspace {
                 }
                 EditorEvent::SelectionChanged => this.sync_ide(cx),
                 EditorEvent::Saved(path) => {
+                    this.upload_if_remote(path, cx);
                     if let Some(gp) = &this.git_panel {
                         gp.update(cx, |g, cx| g.refresh_path(path, cx));
                     }
@@ -2219,6 +2298,7 @@ impl Workspace {
         let problems = self.tools_panel.as_ref().map(|t| t.read(cx).total_problems()).unwrap_or(0);
         let tools_panel = (self.sidebar_mode == SidebarMode::Tools).then(|| self.tools_panel.clone()).flatten();
         let ports_panel = (self.sidebar_mode == SidebarMode::Ports).then(|| self.ports_panel.clone()).flatten();
+        let servers_panel = (self.sidebar_mode == SidebarMode::Servers).then(|| self.servers_panel.clone()).flatten();
         // The ports list polls only while it's on screen.
         if let Some(pp) = self.ports_panel.clone() {
             let on = self.sidebar_mode == SidebarMode::Ports && self.sidebar_visible;
@@ -2271,12 +2351,14 @@ impl Workspace {
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
                         this.show_git(w, cx);
                     })))
-                    .child(mode_tab("mode-ports", "icons/ports.svg", "Ports", self.sidebar_mode == SidebarMode::Ports).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_ports(cx)))),
+                    .child(mode_tab("mode-ports", "icons/ports.svg", "Ports", self.sidebar_mode == SidebarMode::Ports).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_ports(cx))))
+                    .child(mode_tab("mode-servers", "icons/server.svg", "Servers", self.sidebar_mode == SidebarMode::Servers).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_servers(w, cx)))),
             )
             .when_some(search_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when_some(git_panel, |d, gp| d.child(div().flex_1().min_h_0().child(gp)))
             .when_some(tools_panel, |d, tp| d.child(div().flex_1().min_h_0().child(tp)))
             .when_some(ports_panel, |d, pp| d.child(div().flex_1().min_h_0().child(pp)))
+            .when_some(servers_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when(self.sidebar_mode == SidebarMode::Files, |d| d.child(
                 uniform_list(
                     "sidebar-rows",
@@ -2316,7 +2398,8 @@ impl Workspace {
             let (title, exited) = (t.title(), t.has_exited());
             let is_claude = t.label.as_deref() == Some("Claude");
             let attention = t.attention;
-            let (tab_icon, tab_color) = if is_claude { ("icons/claude.svg", 0xd97757) } else { ("icons/terminal.svg", 0x98c379) };
+            let is_ssh = t.label.as_deref().is_some_and(|l| l.starts_with("ssh · "));
+            let (tab_icon, tab_color) = if is_claude { ("icons/claude.svg", 0xd97757) } else if is_ssh { ("icons/server.svg", 0x56b6c2) } else { ("icons/terminal.svg", 0x98c379) };
             let tab_ref = tab.clone();
             bar = bar.child(
                 tab_chip(("term-tab", ix), tab_icon, tab_color, title, is_active, exited, false)

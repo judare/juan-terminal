@@ -116,7 +116,12 @@ if [[ -n $JT_CLAUDE_SETTINGS && -f $JT_CLAUDE_SETTINGS ]] && (( ! $+aliases[clau
     case $1 in
       mcp|config|update|doctor|install|setup-token|migrate-installer|plugin|plugins|agents|auth|login|logout|-v|--version|-h|--help)
         command claude "$@" ;;
-      *) command claude --settings "$JT_CLAUDE_SETTINGS" "$@" ;;
+      *)
+        if [[ -n $JT_MCP_CONFIG && -f $JT_MCP_CONFIG ]]; then
+          command claude --settings "$JT_CLAUDE_SETTINGS" --mcp-config "$JT_MCP_CONFIG" "$@"
+        else
+          command claude --settings "$JT_CLAUDE_SETTINGS" "$@"
+        fi ;;
     esac
   }
 fi

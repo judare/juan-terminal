@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/workspace_state", "crates/terminal_engine", "crates/editor", "crates/project_search", "crates/git_engine", "crates/code_quality", "crates/lsp_client", "crates/claude_ide"]
+members = ["crates/app", "crates/workspace_state", "crates/terminal_engine", "crates/editor", "crates/project_search", "crates/git_engine", "crates/code_quality", "crates/lsp_client", "crates/claude_ide", "crates/ssh_remote"]
 
 [workspace.package]
 edition = "2024"

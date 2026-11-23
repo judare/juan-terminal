@@ -54,6 +54,32 @@ pub struct Project {
     pub active_file: Option<usize>,
     /// Expanded folders in the file tree.
     pub expanded: Vec<PathBuf>,
+    /// SSH servers for this project (Servers tab, SFTP, Claude's ssh_exec tool).
+    pub servers: Vec<SshServer>,
+}
+
+/// An SSH destination. Only the key's *path* is stored, never key material or passwords.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SshServer {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    /// 0 = default (22).
+    pub port: u16,
+    pub user: String,
+    pub identity_file: Option<PathBuf>,
+    /// Directory the SFTP browser starts in (empty = remote home).
+    pub start_dir: String,
+}
+
+impl SshServer {
+    pub fn port_or_default(&self) -> u16 {
+        if self.port == 0 { 22 } else { self.port }
+    }
+    pub fn destination(&self) -> String {
+        if self.user.is_empty() { self.host.clone() } else { format!("{}@{}", self.user, self.host) }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

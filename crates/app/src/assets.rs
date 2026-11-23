@@ -6,6 +6,7 @@ use gpui::{AssetSource, Result, SharedString};
 
 static ICONS: &[(&str, &[u8])] = &[
     ("icons/braces.svg", include_bytes!("../assets/icons/braces.svg")),
+    ("icons/server.svg", include_bytes!("../assets/icons/server.svg")),
     ("icons/ports.svg", include_bytes!("../assets/icons/ports.svg")),
     ("icons/minus.svg", include_bytes!("../assets/icons/minus.svg")),
     ("icons/undo.svg", include_bytes!("../assets/icons/undo.svg")),

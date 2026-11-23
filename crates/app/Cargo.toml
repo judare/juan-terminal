@@ -20,5 +20,7 @@ git_engine = { path = "../git_engine" }
 code_quality = { path = "../code_quality" }
 lsp_client = { path = "../lsp_client" }
 claude_ide = { path = "../claude_ide" }
+ssh_remote = { path = "../ssh_remote" }
+serde_json = "=1.0.154"
 terminal_engine = { path = "../terminal_engine" }
 workspace_state = { path = "../workspace_state" }

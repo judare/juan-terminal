@@ -14,6 +14,7 @@ mod ports;
 mod power;
 mod quick_open;
 mod search_panel;
+mod servers_panel;
 mod shell_env;
 mod shell_integration;
 mod slash_menu;
@@ -44,7 +45,36 @@ fn startup_log(line: &str) {
     }
 }
 
+/// Write `<state>/mcp/<project>.json` registering our `--mcp-servers` stdio server for Claude
+/// (only for projects that have SSH servers). Returns its path.
+pub(crate) fn servers_mcp_config(project: &workspace_state::Project) -> Option<std::path::PathBuf> {
+    if project.servers.is_empty() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = workspace_state::state_dir().join("mcp");
+    std::fs::create_dir_all(&dir).ok()?;
+    let safe: String = project.id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let path = dir.join(format!("{safe}.json"));
+    let body = serde_json::json!({"mcpServers": {"juan-servers": {
+        "type": "stdio",
+        "command": exe.display().to_string(),
+        "args": ["--mcp-servers"],
+        "env": {"JT_PROJECT_ID": project.id},
+    }}})
+    .to_string();
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
+        std::fs::write(&path, body).ok()?;
+    }
+    Some(path)
+}
+
 fn main() {
+    // Stdio MCP server for Claude (spawned by `claude`, not a GUI launch).
+    if std::env::args().any(|a| a == "--mcp-servers") {
+        ssh_remote::mcp::serve_stdio();
+        return;
+    }
     let started = Instant::now();
     let env_result = if shell_env::needs_import() { shell_env::import_login_env() } else { "skipped (terminal)" };
     startup_log(&format!("env import: {env_result} in {:?}", started.elapsed()));
