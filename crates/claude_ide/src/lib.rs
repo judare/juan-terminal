@@ -75,6 +75,8 @@ pub enum IdeRequest {
     Hook { terminal: Option<String>, event: String, message: Option<String>, cwd: Option<String> },
     /// A Claude session connected (true) or went away (false).
     Connection { connected: bool },
+    /// Claude Code statusLine payload (model, effort, context window, session id…).
+    Status { terminal: Option<String>, data: Value },
 }
 
 #[derive(Default)]
@@ -308,8 +310,8 @@ fn handle_connection(inner: Arc<Inner>, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let Ok(req) = ws::read_request(&mut stream) else { return };
 
-    // Hook events from `curl` (see the injected Claude settings).
-    if req.method == "POST" && req.path.starts_with("/hook") {
+    // Hook / statusLine events from `curl` (see the injected Claude settings).
+    if req.method == "POST" && (req.path.starts_with("/hook") || req.path.starts_with("/statusline")) {
         if req.header("x-jt-token") != Some(inner.token.as_str()) {
             return http_response(&mut stream, "401 Unauthorized");
         }
@@ -323,9 +325,14 @@ fn handle_connection(inner: Arc<Inner>, mut stream: TcpStream) {
             }
         }
         let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let terminal = req.header("x-jt-terminal").filter(|t| !t.is_empty()).map(str::to_string);
+        if req.path.starts_with("/statusline") {
+            let _ = inner.requests.unbounded_send(IdeRequest::Status { terminal, data: v });
+            return http_response(&mut stream, "204 No Content");
+        }
         let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
         let _ = inner.requests.unbounded_send(IdeRequest::Hook {
-            terminal: req.header("x-jt-terminal").filter(|t| !t.is_empty()).map(str::to_string),
+            terminal,
             event: s("hook_event_name").unwrap_or_default(),
             message: s("message"),
             cwd: s("cwd"),
@@ -546,7 +553,13 @@ fn call_tool(inner: &Inner, name: &str, args: &Value) -> Result<Value, (i64, Str
 pub fn hook_settings_json() -> String {
     let cmd = r#"[ -n "$CLAUDE_CODE_SSE_PORT" ] && [ -n "$JT_HOOK_TOKEN" ] && curl -s -m 2 -X POST -H "X-JT-Token: $JT_HOOK_TOKEN" -H "X-JT-Terminal: $JT_TERMINAL_ID" -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$CLAUDE_CODE_SSE_PORT/hook" >/dev/null 2>&1; exit 0"#;
     let hook = json!([{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}]);
-    json!({"hooks": {"Stop": hook, "Notification": hook}}).to_string()
+    // statusLine: hand the payload to juan-terminal (which draws its own bar) and print nothing.
+    let status = r#"[ -n "$CLAUDE_CODE_SSE_PORT" ] && [ -n "$JT_HOOK_TOKEN" ] && curl -s -m 1 -X POST -H "X-JT-Token: $JT_HOOK_TOKEN" -H "X-JT-Terminal: $JT_TERMINAL_ID" -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$CLAUDE_CODE_SSE_PORT/statusline" >/dev/null 2>&1; exit 0"#;
+    json!({
+        "hooks": {"Stop": hook, "Notification": hook},
+        "statusLine": {"type": "command", "command": status, "padding": 0},
+    })
+    .to_string()
 }
 
 #[cfg(test)]

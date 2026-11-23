@@ -204,12 +204,32 @@ fn hook_endpoint_needs_token_and_forwards_events() {
 }
 
 #[test]
+fn statusline_posts_are_forwarded() {
+    let dir = tmpdir("status");
+    let (srv, mut rx) = IdeServer::start_in(&dir).unwrap();
+    let body = r#"{"session_id":"abc","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"context_window":{"used_percentage":42.5},"effort":{"level":"medium"}}"#;
+    let mut s = TcpStream::connect(("127.0.0.1", srv.port())).unwrap();
+    write!(s, "POST /statusline HTTP/1.1\r\nX-JT-Token: {}\r\nX-JT-Terminal: t9\r\nContent-Length: {}\r\n\r\n{body}", srv.token(), body.len()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 204"));
+    match futures::executor::block_on(rx.next()) {
+        Some(IdeRequest::Status { terminal, data }) => {
+            assert_eq!(terminal.as_deref(), Some("t9"));
+            assert_eq!(data["context_window"]["used_percentage"], 42.5);
+        }
+        _ => panic!("expected Status"),
+    }
+}
+
+#[test]
 fn hook_settings_are_valid_claude_settings() {
     let v: Value = serde_json::from_str(&hook_settings_json()).unwrap();
     for ev in ["Stop", "Notification"] {
         let cmd = v["hooks"][ev][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("/hook") && cmd.contains("$JT_HOOK_TOKEN"));
     }
+    assert!(v["statusLine"]["command"].as_str().unwrap().contains("/statusline"));
 }
 
 #[test]
@@ -222,4 +242,12 @@ fn stale_own_lockfiles_are_removed_others_kept() {
     assert!(!dir.join("1111.lock").exists());
     assert!(dir.join("2222.lock").exists());
     assert!(dir.join("3333.lock").exists());
+}
+
+#[test]
+#[ignore]
+fn dump_hook_settings() {
+    if let Ok(p) = std::env::var("JT_DUMP_SETTINGS") {
+        std::fs::write(p, hook_settings_json()).unwrap();
+    }
 }

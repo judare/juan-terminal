@@ -150,6 +150,12 @@ impl Workspace {
                 let _ = reply.send(ok);
             }
             IdeRequest::Hook { terminal, event, message, cwd } => self.on_claude_hook(terminal, &event, message, cwd, window, cx),
+            IdeRequest::Status { terminal, data } => {
+                if let Some((_, t)) = terminal.as_deref().and_then(|id| self.find_terminal(id, cx)) {
+                    let st = crate::terminal_view::ClaudeStatus::from_json(&data);
+                    t.update(cx, |t, cx| t.set_claude_status(st, cx));
+                }
+            }
             IdeRequest::Connection { connected } => {
                 self.claude_sessions = if connected { self.claude_sessions + 1 } else { self.claude_sessions.saturating_sub(1) };
                 if connected {

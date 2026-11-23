@@ -2,6 +2,7 @@
 
 mod asset_view;
 mod claude_bridge;
+mod claude_sessions;
 mod assets;
 mod command_palette;
 mod diff_view;

@@ -519,6 +519,22 @@ impl TerminalSession {
         }
     }
 
+    /// Executable path of the foreground process (e.g. to know `claude` is running).
+    pub fn foreground_exe(&self) -> Option<PathBuf> {
+        if self.exited {
+            return None;
+        }
+        // SAFETY: see foreground_cwd.
+        let pgrp = unsafe { libc::tcgetpgrp(self.master_fd) };
+        if pgrp <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: buffer sized as the API requires.
+        let n = unsafe { libc::proc_pidpath(pgrp, buf.as_mut_ptr() as *mut _, buf.len() as u32) };
+        (n > 0).then(|| PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).into_owned()))
+    }
+
     /// Working directory of the foreground process in this terminal (macOS `proc_pidinfo`).
     pub fn foreground_cwd(&self) -> Option<PathBuf> {
         if self.exited {
