@@ -55,18 +55,27 @@ pub fn registered() -> Result<bool> {
     Ok(out.status.success())
 }
 
-/// `claude mcp add -s user -e OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura -- <bin> mcp`
+/// JSON config for `claude mcp add-json` (stdio server with its env).
 /// Private networks are allowed so Claude can inspect local dev servers (localhost/LAN).
+pub fn mcp_json(bin: &Path) -> String {
+    serde_json::json!({
+        "type": "stdio",
+        "command": bin.display().to_string(),
+        "args": ["mcp"],
+        "env": {"OBSCURA_ALLOW_PRIVATE_NETWORK": "1"},
+    })
+    .to_string()
+}
+
+/// `claude mcp add-json -s user obscura '<json>'`. (Not `mcp add -e …`: `-e` is variadic
+/// and swallows the server name.)
 pub fn register(bin: &Path) -> Result<String> {
     let claude = claude_bin().context("`claude` CLI not found")?;
-    let out = Command::new(claude)
-        .args(["mcp", "add", "-s", "user", "-e", "OBSCURA_ALLOW_PRIVATE_NETWORK=1", MCP_NAME, "--"])
-        .arg(bin)
-        .arg("mcp")
-        .stdin(Stdio::null())
-        .output()?;
+    let out = Command::new(claude).args(["mcp", "add-json", "-s", "user", MCP_NAME, &mcp_json(bin)]).stdin(Stdio::null()).output()?;
     if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let msg = if err.is_empty() { String::from_utf8_lossy(&out.stdout).trim().to_string() } else { err };
+        bail!("{msg}");
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -127,6 +136,15 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mcp_json_is_a_stdio_server_with_env() {
+        let v: serde_json::Value = serde_json::from_str(&super::mcp_json(std::path::Path::new("/a b/obscura"))).unwrap();
+        assert_eq!(v["command"], "/a b/obscura");
+        assert_eq!(v["args"][0], "mcp");
+        assert_eq!(v["env"]["OBSCURA_ALLOW_PRIVATE_NETWORK"], "1");
+    }
+
     use super::*;
 
     #[test]

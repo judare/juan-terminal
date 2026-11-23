@@ -55,6 +55,8 @@ pub struct Project {
     /// Expanded folders in the file tree.
     pub expanded: Vec<PathBuf>,
     /// SSH servers for this project (Servers tab, SFTP, Claude's ssh_exec tool).
+    /// Omitted when empty so the TOML stays hand-editable (`[[projects.servers]]`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<SshServer>,
 }
 
