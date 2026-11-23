@@ -194,6 +194,8 @@ pub struct Workspace {
     servers_panel: Option<Entity<crate::servers_panel::ServersPanel>>,
     /// GitHub Actions section under the file tree (hidden when no repo has workflows).
     actions_panel: Option<Entity<crate::actions_panel::ActionsPanel>>,
+    /// Release tags section under GitHub Actions.
+    tags_panel: Option<Entity<crate::tags_panel::TagsPanel>>,
     actions_height: f32,
     resizing_actions: bool,
     /// Local cache file → (server, remote path) for files opened over SFTP.
@@ -301,6 +303,7 @@ impl Workspace {
             ide: None,
             servers_panel: None,
             actions_panel: None,
+            tags_panel: None,
             actions_height: 300.,
             resizing_actions: false,
             remote_files: HashMap::new(),
@@ -503,6 +506,10 @@ impl Workspace {
             if let Some(ap) = self.actions_panel.clone() {
                 let r = repos.clone();
                 ap.update(cx, |a, cx| a.set_repos(r, cx));
+            }
+            if let Some(tp) = self.tags_panel.clone() {
+                let r = repos.clone();
+                tp.update(cx, |t, cx| t.set_repos(r, cx));
             }
             self.pending_git_repos = Some(repos);
             self.persist(cx);
@@ -946,7 +953,9 @@ impl Workspace {
                 ap
             }
         };
-        ap.update(cx, |a, cx| a.set_repos(repos, cx));
+        ap.update(cx, |a, cx| a.set_repos(repos.clone(), cx));
+        let tp = self.tags_panel.get_or_insert_with(|| cx.new(|_| crate::tags_panel::TagsPanel::new())).clone();
+        tp.update(cx, |t, cx| t.set_repos(repos, cx));
     }
 
     fn ensure_tools_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ToolsPanel> {
@@ -1374,7 +1383,10 @@ impl Workspace {
                 cx.notify();
                 return;
             }
-            let view = if let Some(kind) = crate::asset_view::asset_kind(path) {
+            let csv_doc = crate::asset_view::is_text_table(path).then(|| editor::Document::open(path).ok()).flatten();
+            let view = if let Some(doc) = csv_doc {
+                cx.new(|cx| EditorView::new_csv(doc, font_size, cx))
+            } else if let Some(kind) = crate::asset_view::asset_kind(path) {
                 let p = path.to_path_buf();
                 cx.new(|cx| EditorView::new_asset(p, kind, font_size, cx))
             } else {
@@ -2978,7 +2990,11 @@ impl Workspace {
             ap.update(cx, |a, cx| a.set_visible(on, cx));
         }
         let actions_panel = actions_panel.filter(|_| self.sidebar_mode == SidebarMode::Files);
-        let actions_open = actions_panel.as_ref().is_some_and(|a| a.read(cx).expanded);
+        let tags_panel = self.tags_panel.clone().filter(|t| self.sidebar_mode == SidebarMode::Files && t.read(cx).has_any());
+        let actions_open = actions_panel.as_ref().is_some_and(|a| a.read(cx).expanded) || tags_panel.as_ref().is_some_and(|t| t.read(cx).expanded);
+        let bottom_panels = actions_panel.is_some() || tags_panel.is_some();
+        let actions_flex = actions_panel.as_ref().is_some_and(|a| a.read(cx).expanded);
+        let tags_flex = tags_panel.as_ref().is_some_and(|t| t.read(cx).expanded);
         let actions_height = self.actions_height;
         let count = self.rows.len();
         div()
@@ -3046,15 +3062,17 @@ impl Workspace {
                 .w_full()
                 .pb(px(8.)),
             ))
-            .when_some(actions_panel, |d, ap| {
+            .when(bottom_panels, |d| {
                 d.child(
                     div()
                         .relative()
+                        .flex()
+                        .flex_col()
                         .flex_none()
                         .w_full()
                         .when(actions_open, |d| d.h(px(actions_height)))
-                        .when(!actions_open, |d| d.h(px(28.)))
-                        .child(ap)
+                        .when_some(actions_panel, |d, ap| d.child(div().w_full().when(actions_flex, |d| d.flex_1().min_h_0()).when(!actions_flex, |d| d.h(px(28.)).flex_none()).child(ap)))
+                        .when_some(tags_panel, |d, tp| d.child(div().w_full().when(tags_flex, |d| d.flex_1().min_h_0()).when(!tags_flex, |d| d.h(px(28.)).flex_none()).child(tp)))
                         .when(actions_open, |d| {
                             d.child(
                                 div()

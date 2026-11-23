@@ -407,7 +407,7 @@ impl ActionsPanel {
             jobs: HashMap::new(),
             expanded_runs: HashSet::new(),
             expanded_repos: HashSet::new(),
-            expanded: true,
+            expanded: false,
             visible: false,
             busy: HashSet::new(),
             message: None,
