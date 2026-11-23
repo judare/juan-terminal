@@ -14,7 +14,6 @@ use crate::git_panel::{DynTooltip, icon_action};
 use crate::theme;
 
 const RUNS_PER_REPO: usize = 40;
-const RUNS_PER_WORKFLOW: usize = 5;
 const ACTIVE_POLL: Duration = Duration::from_secs(6);
 const IDLE_POLL: Duration = Duration::from_secs(60);
 
@@ -625,23 +624,52 @@ impl ActionsPanel {
             .into_any_element()
     }
 
-    fn render_run(&self, run: &Run, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_run(&self, run: &Run, indent: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let id = run.id;
         let (ic, color) = status_look(&run.status, &run.conclusion);
         let open = self.expanded_runs.contains(&id);
         let busy = self.busy.contains(&id);
         let jobs = self.jobs.get(&id);
-        let sub = format!("{} · {} · {}", run.branch, run.event, ago(&run.created));
-        let tip: SharedString = format!("#{} {} — {}", run.number, run.title, status_text(&run.status, &run.conclusion)).into();
+        let meta = match jobs.filter(|j| run.active() && !j.is_empty()) {
+            Some(jobs) => {
+                let (done, ..) = job_counts(jobs);
+                format!("{done}/{} · {}", jobs.len(), ago(&run.created))
+            }
+            None => format!("#{} · {}", run.number, ago(&run.created)),
+        };
+        let tip: SharedString = format!("#{} {}\n{} · {} · {}\n{}", run.number, run.title, run.branch, run.event, ago(&run.created), status_text(&run.status, &run.conclusion)).into();
         let url = run.url.clone();
+        let group = SharedString::from(format!("run-g-{id}"));
         let mut col = div().flex().flex_col();
-        let mut row = div()
+        let mut actions = div().flex().flex_none().items_center().invisible().group_hover(group.clone(), |s| s.visible());
+        actions = actions.child(icon_action(SharedString::from(format!("run-log-{id}")), "icons/doc.svg", "Ver logs / detalle").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            this.open_log(id, None, cx);
+        })));
+        if run.active() {
+            actions = actions.child(icon_action(SharedString::from(format!("run-cancel-{id}")), "icons/action-stop.svg", "Abortar").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.run_command(id, "cancel", cx);
+            })));
+        } else {
+            actions = actions.child(icon_action(SharedString::from(format!("run-rerun-{id}")), "icons/action-rerun.svg", "Re-ejecutar").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.run_command(id, "rerun", cx);
+            })));
+        }
+        actions = actions.child(icon_action(SharedString::from(format!("run-web-{id}")), "icons/external.svg", "Abrir en GitHub").on_click(move |_: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            let _ = Command::new("open").arg(&url).spawn();
+        }));
+        let row = div()
             .id(SharedString::from(format!("run-{id}")))
+            .group(group.clone())
+            .relative()
             .flex()
             .items_center()
             .gap(px(6.))
-            .min_h(px(34.))
-            .pl(px(22.))
+            .h(px(26.))
+            .pl(px(if indent { 22. } else { 12. }))
             .pr(px(4.))
             .mx(px(4.))
             .rounded(px(5.))
@@ -650,61 +678,27 @@ impl ActionsPanel {
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_run(id, cx)))
             .tooltip(move |_, cx| cx.new(|_| DynTooltip(tip.clone())).into())
             .child(gpui::svg().path(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }).size(px(9.)).flex_none().text_color(theme::rgb(theme::TEXT_FAINT)))
+            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.)).child(run.workflow.clone()))
             .child(gpui::svg().path(ic).size(px(13.)).flex_none().text_color(theme::rgb(color)))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.)).child(format!("#{} {}", run.number, run.title)))
-                    .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(sub))
-                    .when_some(jobs.filter(|j| run.active() && !j.is_empty()), |d, jobs| {
-                        let (done, pending, ok, failed) = job_counts(jobs);
-                        d.child(
-                            div()
-                                .flex()
-                                .gap(px(6.))
-                                .text_size(px(10.5))
-                                .child(div().text_color(theme::rgb(theme::TEXT_MUTED)).child(format!("{done}/{} terminados", jobs.len())))
-                                .child(div().text_color(theme::rgb(theme::MODIFIED)).child(format!("{pending} pend.")))
-                                .child(div().text_color(theme::rgb(theme::ADDED)).child(format!("{ok} ✓")))
-                                .when(failed > 0, |d| d.child(div().text_color(theme::rgb(theme::DELETED)).child(format!("{failed} ✗")))),
-                        )
-                    }),
-            );
-        if busy {
-            row = row.child(div().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child("…"));
-        }
-        row = row.child(icon_action(SharedString::from(format!("run-log-{id}")), "icons/doc.svg", "Ver logs / detalle").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            cx.stop_propagation();
-            this.open_log(id, None, cx);
-        })));
-        if run.active() {
-            row = row.child(icon_action(SharedString::from(format!("run-cancel-{id}")), "icons/action-stop.svg", "Abortar").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                cx.stop_propagation();
-                this.run_command(id, "cancel", cx);
-            })));
-        } else {
-            row = row.child(icon_action(SharedString::from(format!("run-rerun-{id}")), "icons/action-rerun.svg", "Re-ejecutar").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                cx.stop_propagation();
-                this.run_command(id, "rerun", cx);
-            })));
-        }
-        row = row.child(icon_action(SharedString::from(format!("run-web-{id}")), "icons/external.svg", "Abrir en GitHub").on_click(move |_: &ClickEvent, _, cx| {
-            cx.stop_propagation();
-            let _ = Command::new("open").arg(&url).spawn();
-        }));
+                    .flex_none()
+                    .text_size(px(10.5))
+                    .text_color(theme::rgb(if run.active() { theme::MODIFIED } else { theme::TEXT_FAINT }))
+                    .group_hover(group.clone(), |s| s.invisible())
+                    .child(if busy { "…".to_string() } else { meta }),
+            )
+            .child(div().absolute().right(px(4.)).top_0().bottom_0().flex().items_center().rounded(px(5.)).bg(theme::rgb(theme::HOVER)).invisible().group_hover(group, |s| s.visible()).child(actions));
         col = col.child(row);
         if open {
             match jobs {
-                None => col = col.child(div().pl(px(52.)).h(px(22.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Cargando jobs…")),
-                Some(jobs) if jobs.is_empty() => col = col.child(div().pl(px(52.)).h(px(22.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Sin jobs")),
+                None => col = col.child(div().pl(px(38.)).h(px(22.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Cargando jobs…")),
+                Some(jobs) if jobs.is_empty() => col = col.child(div().pl(px(38.)).h(px(22.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Sin jobs")),
                 Some(jobs) => {
                     let (done, pending, ok, failed) = job_counts(jobs);
                     col = col.child(
                         div()
-                            .pl(px(52.))
+                            .pl(px(38.))
                             .h(px(20.))
                             .flex()
                             .items_center()
@@ -728,7 +722,7 @@ impl ActionsPanel {
                                 .items_center()
                                 .gap(px(6.))
                                 .h(px(24.))
-                                .pl(px(50.))
+                                .pl(px(36.))
                                 .pr(px(8.))
                                 .mx(px(4.))
                                 .rounded(px(5.))
@@ -802,31 +796,22 @@ impl Render for ActionsPanel {
                 body = body.child(div().px(px(22.)).h(px(24.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Sin ejecuciones"));
                 continue;
             }
-            // Group by workflow, in order of the most recent run.
-            let mut order: Vec<&str> = Vec::new();
-            for r in &repo.runs {
-                if !order.contains(&r.workflow.as_str()) {
-                    order.push(&r.workflow);
-                }
-            }
-            let runs = repo.runs.clone();
-            for wf in order {
-                body = body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(5.))
-                        .h(px(22.))
-                        .pl(px(if multi { 24. } else { 14. }))
-                        .text_size(px(11.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme::rgb(theme::TEXT_MUTED))
-                        .child(gpui::svg().path("icons/action-workflow.svg").size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)))
-                        .child(wf.to_string()),
-                );
-                for run in runs.iter().filter(|r| r.workflow == wf).take(RUNS_PER_WORKFLOW) {
-                    body = body.child(self.render_run(run, cx));
-                }
+            // One row per workflow: its most recent run (runs come newest first).
+            let mut seen: Vec<&str> = Vec::new();
+            let latest: Vec<Run> = repo
+                .runs
+                .iter()
+                .filter(|r| {
+                    let new = !seen.contains(&r.workflow.as_str());
+                    if new {
+                        seen.push(&r.workflow);
+                    }
+                    new
+                })
+                .cloned()
+                .collect();
+            for run in &latest {
+                body = body.child(self.render_run(run, multi, cx));
             }
         }
         root = root.child(body);
