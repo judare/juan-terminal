@@ -1,6 +1,7 @@
 //! Release tags section under the file tree (below GitHub Actions). Lists the tags of each
 //! repo of the project (newest version first), whether they're on `origin` and have a GitHub
-//! release, and creates the next `vMAJOR.FEATURES.FIXES` tag (annotated, pushed).
+//! release, and creates the next `vMAJOR.FEATURES.FIXES` tag (annotated, pushed, with its
+//! GitHub release).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -208,7 +209,7 @@ impl TagsPanel {
         self.repos = with
             .into_iter()
             .map(|(name, path)| {
-                let input = cx.new(|cx| TextInput::new("Descripción del release (Enter crea y sube)", cx));
+                let input = cx.new(|cx| TextInput::new("Descripción del release (Enter publica)", cx));
                 let p = path.clone();
                 let sub = cx.subscribe(&input, move |this, input, e, cx| match e {
                     TextInputEvent::Submit { .. } => {
@@ -316,9 +317,14 @@ impl TagsPanel {
             if !has_origin(d) {
                 return Ok(format!("Tag {t} creado (sin remoto origin)"));
             }
-            match git(d, &["push", "origin", &format!("refs/tags/{t}")]) {
-                Ok(_) => Ok(format!("Tag {t} creado y subido")),
-                Err(e) => Err(format!("Tag {t} creado, pero el push falló: {e}")),
+            git(d, &["push", "origin", &format!("refs/tags/{t}")]).map_err(|e| format!("Tag {t} creado, pero el push falló: {e}"))?;
+            if !crate::launcher::web_url(d).is_some_and(|w| w.contains("github.com")) {
+                return Ok(format!("Tag {t} creado y subido (origin no es GitHub: sin release)"));
+            }
+            let title = format!("{t} — {}", msg.lines().next().unwrap_or_default());
+            match gh(d, &["release", "create", &t, "--verify-tag", "--latest", "--title", &title, "--notes", &msg]) {
+                Ok(_) => Ok(format!("Tag y release {t} publicados")),
+                Err(e) => Err(format!("Tag {t} creado y subido, pero el release falló: {e}")),
             }
         });
     }
@@ -447,7 +453,7 @@ impl TagsPanel {
                         .bg(theme::rgb(theme::EDITOR_BG))
                         .child(repo.input.clone()),
                 )
-                .child(div().text_size(px(10.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("{} ({}) · Enter crea y hace push · Esc cancela", latest.bump(bump).tag(), bump.label())));
+                .child(div().text_size(px(10.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("{} ({}) · Enter crea tag + release · Esc cancela", latest.bump(bump).tag(), bump.label())));
         }
         col.into_any_element()
     }
