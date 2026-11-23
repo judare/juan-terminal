@@ -3037,7 +3037,7 @@ impl Workspace {
                         div().px(px(5.)).rounded_full().bg(theme::rgb(0x3a1f22)).text_size(px(12.)).text_color(theme::rgb(0xf0b3b8)).child(problems.to_string()),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_tools(w, cx))))
                     .child(mode_tab("mode-git", "icons/git.svg", "Git", self.sidebar_mode == SidebarMode::Git).when(git_total > 0, |d| d.child(
-                        div().px(px(5.)).rounded_full().bg(theme::rgb(0x3a3220)).text_size(px(12.)).text_color(theme::rgb(theme::MODIFIED)).child(git_total.to_string()),
+                        div().px(px(6.)).rounded_full().bg(theme::rgb(0x1f2a40)).text_size(px(14.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::ACCENT)).child(git_total.to_string()),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
                         this.show_git(w, cx);
                     })))
@@ -3332,16 +3332,17 @@ fn mode_tab(id: &'static str, icon_path: &'static str, label: &'static str, acti
         .id(id)
         .flex()
         .items_center()
+        .justify_center()
         .gap(px(5.))
         .px(px(8.))
-        .h(px(26.))
-        .rounded(px(5.))
+        .min_w(px(36.))
+        .h(px(34.))
+        .rounded(px(6.))
         .cursor_pointer()
         .text_size(px(14.))
         .when(active, |d| d.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT)))
         .when(!active, |d| d.text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::HOVER))))
-        .child(gpui::svg().path(icon_path).size(px(14.)).text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })))
-        .when(active, |d| d.child(label))
+        .child(gpui::svg().path(icon_path).size(px(20.)).text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })))
         .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(label)).into())
 }
 
