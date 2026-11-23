@@ -531,6 +531,18 @@ impl Workspace {
         let view = cx.new(|cx| TerminalView::new(jt_id, session, rx, cwd, repository, font_size + theme::TERM_FONT_BONUS, window, cx));
         let sub = cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
             TerminalViewEvent::TitleChanged | TerminalViewEvent::AttentionCleared => cx.notify(),
+            TerminalViewEvent::OpenPath { path, line, column } => {
+                let (path, line, column) = (path.clone(), *line, *column);
+                if path.is_dir() {
+                    cx.reveal_path(&path);
+                } else {
+                    this.open_file(&path, true, window, cx);
+                    if let (Some(l), Some(e)) = (line, this.active_editor().cloned()) {
+                        e.update(cx, |e, cx| e.go_to(l.saturating_sub(1), column.unwrap_or(1).saturating_sub(1), cx));
+                    }
+                    this.persist(cx);
+                }
+            }
             TerminalViewEvent::Exited(code) => {
                 if *code == Some(0) {
                     this.close_terminal_view(view, window, cx);

@@ -46,21 +46,18 @@ fn startup_log(line: &str) {
 }
 
 /// Write `<state>/mcp/<project>.json` registering our `--mcp-servers` stdio server for Claude
-/// (only for projects that have SSH servers). Returns its path.
+/// (dev servers of the project, SSH servers, ssh_exec). Returns its path.
 pub(crate) fn servers_mcp_config(project: &workspace_state::Project) -> Option<std::path::PathBuf> {
-    if project.servers.is_empty() {
-        return None;
-    }
     let exe = std::env::current_exe().ok()?;
     let dir = workspace_state::state_dir().join("mcp");
     std::fs::create_dir_all(&dir).ok()?;
     let safe: String = project.id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     let path = dir.join(format!("{safe}.json"));
-    let body = serde_json::json!({"mcpServers": {"juan-servers": {
+    let body = serde_json::json!({"mcpServers": {"juan-terminal": {
         "type": "stdio",
         "command": exe.display().to_string(),
         "args": ["--mcp-servers"],
-        "env": {"JT_PROJECT_ID": project.id},
+        "env": {"JT_PROJECT_ID": project.id, "JT_APP_PID": std::process::id().to_string()},
     }}})
     .to_string();
     if std::fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
@@ -72,7 +69,18 @@ pub(crate) fn servers_mcp_config(project: &workspace_state::Project) -> Option<s
 fn main() {
     // Stdio MCP server for Claude (spawned by `claude`, not a GUI launch).
     if std::env::args().any(|a| a == "--mcp-servers") {
-        ssh_remote::mcp::serve_stdio();
+        let project_id = std::env::var("JT_PROJECT_ID").unwrap_or_default();
+        let app_pid: i32 = std::env::var("JT_APP_PID").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
+        ssh_remote::mcp::serve_stdio_with(&|| {
+            let roots: Vec<(String, std::path::PathBuf)> = workspace_state::StateStore::default_location()
+                .load()
+                .projects
+                .into_iter()
+                .find(|p| p.id == project_id)
+                .map(|p| p.repositories.iter().map(|r| (r.name.clone(), r.path.clone())).chain(p.root.clone().map(|r| (p.name.clone(), r))).collect())
+                .unwrap_or_default();
+            ports::dev_servers_report(app_pid, &roots)
+        });
         return;
     }
     let started = Instant::now();

@@ -117,6 +117,11 @@ fn is_system(command: &str) -> bool {
 }
 
 pub fn scan() -> anyhow::Result<Vec<Listener>> {
+    scan_for(std::process::id() as i32)
+}
+
+/// `app_pid`: the juan-terminal process whose descendants count as "ours".
+pub fn scan_for(app_pid: i32) -> anyhow::Result<Vec<Listener>> {
     let out = Command::new("/usr/sbin/lsof").args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]).output()?;
     // lsof exits 1 when nothing matches.
     let map = parse_lsof(&String::from_utf8_lossy(&out.stdout));
@@ -147,7 +152,7 @@ pub fn scan() -> anyhow::Result<Vec<Listener>> {
         }
     }
     let table = process_table();
-    let me = std::process::id() as i32;
+    let me = app_pid;
     let mut v: Vec<Listener> = map
         .into_iter()
         .map(|(pid, (name, ports))| {
@@ -494,6 +499,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dev_commands_from_package_json() {
+        let d = std::env::temp_dir().join(format!("jt-dev-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("web")).unwrap();
+        std::fs::write(d.join("web/package.json"), r#"{"scripts":{"build":"vite build","dev":"vite --port 5173"}}"#).unwrap();
+        std::fs::write(d.join("web/pnpm-lock.yaml"), "").unwrap();
+        let c = dev_commands(&[("web".into(), d.join("web")), ("none".into(), d.clone())]);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].contains("pnpm run dev") && c[0].contains("vite --port 5173"), "{c:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn parses_lsof_and_dedupes_ipv4_ipv6() {
         let out = "p661\ncControlCenter\nf9\nn*:7000\nTST=LISTEN\nf10\nn*:7000\nf11\nn*:5000\np900\ncnode\nf20\nn127.0.0.1:5173\nf21\nn[::1]:5173\n";
         let m = parse_lsof(out);
@@ -535,4 +552,74 @@ mod tests {
         kill(child.id() as i32).unwrap();
         assert!(child.wait().is_ok());
     }
+}
+
+/// Text for Claude's `list_dev_servers` tool: local listeners, project ones first.
+pub fn dev_servers_report(app_pid: i32, roots: &[(String, PathBuf)]) -> String {
+    let list = match scan_for(app_pid) {
+        Ok(l) => l,
+        Err(e) => return format!("Could not list ports: {e:#}"),
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let project_of = |cwd: &Option<PathBuf>| {
+        let cwd = cwd.as_ref()?;
+        roots.iter().filter(|(_, p)| cwd.starts_with(p)).max_by_key(|(_, p)| p.as_os_str().len()).map(|(n, _)| n.clone())
+    };
+    let line = |l: &Listener| {
+        let urls: Vec<String> = l.ports.iter().map(|(p, _)| format!("http://localhost:{p}")).collect();
+        let cwd = l.cwd.as_ref().map(|c| c.display().to_string()).unwrap_or_default();
+        format!("{} — {} (pid {}, {}) cwd {}", urls.join(", "), l.app, l.pid, short_command(&l.command, &home), cwd)
+    };
+    let mut project = Vec::new();
+    let mut other = Vec::new();
+    for l in list.iter().filter(|l| !l.system) {
+        match project_of(&l.cwd) {
+            Some(name) => project.push(format!("- [{name}] {}", line(l))),
+            None if l.ours => other.push(format!("- [started in juan-terminal] {}", line(l))),
+            None => {}
+        }
+    }
+    let mut out = String::new();
+    if project.is_empty() {
+        out.push_str("No dev server of this project is running. Don't fall back to production: start the right one yourself in the background (Bash with run_in_background), wait until its URL responds (e.g. poll with curl), then look at / screenshot http://localhost:PORT.\n");
+        let cmds = dev_commands(roots);
+        if !cmds.is_empty() {
+            out.push_str("Start commands found in this project:\n");
+            out.push_str(&cmds.join("\n"));
+            out.push('\n');
+        }
+    } else {
+        out.push_str("Dev servers of this project (use these localhost URLs to look at / screenshot / test the app instead of production):\n");
+        out.push_str(&project.join("\n"));
+        out.push('\n');
+    }
+    if !other.is_empty() {
+        out.push_str("\nOther servers started from juan-terminal:\n");
+        out.push_str(&other.join("\n"));
+        out.push('\n');
+    }
+    out
+}
+
+/// `cd <repo> && <pm> run dev` for repos whose package.json has a dev/start script.
+pub fn dev_commands(roots: &[(String, PathBuf)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, dir) in roots {
+        let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let scripts = &v["scripts"];
+        let Some(script) = ["dev", "start", "serve"].into_iter().find(|k| scripts.get(*k).is_some()) else { continue };
+        let pm = if dir.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if dir.join("yarn.lock").exists() {
+            "yarn"
+        } else if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
+            "bun"
+        } else {
+            "npm"
+        };
+        let detail = scripts[script].as_str().unwrap_or_default();
+        out.push(format!("- [{name}] cd {} && {pm} run {script}   ({detail})", dir.display()));
+    }
+    out
 }
