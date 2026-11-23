@@ -520,6 +520,7 @@ impl Element for MarkdownElement {
     fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), state: &mut Prepaint, window: &mut Window, cx: &mut App) {
         let focus = self.view.read(cx).focus_handle_ref().clone();
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
+        crate::editor_view::EditorView::register_drag(&self.view, bounds, window, cx);
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             for (b, c) in state.quads.drain(..) {
                 window.paint_quad(fill(b, c));
