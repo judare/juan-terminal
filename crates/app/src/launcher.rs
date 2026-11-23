@@ -1113,6 +1113,22 @@ pub fn init(workspace: WindowHandle<Workspace>, cx: &mut App) {
     }
 }
 
+/// Remember the workspace window used last (⌘Space acts on it).
+pub fn set_last_workspace(handle: gpui::AnyWindowHandle, cx: &mut App) {
+    if let (Some(ws), true) = (handle.downcast::<Workspace>(), cx.has_global::<LauncherGlobal>()) {
+        cx.global_mut::<LauncherGlobal>().workspace = ws;
+    }
+}
+
+/// Last used workspace window, or any open one if that was closed.
+fn last_workspace(cx: &App) -> Option<WindowHandle<Workspace>> {
+    let ws = cx.global::<LauncherGlobal>().workspace;
+    if ws.read(cx).is_ok() {
+        return Some(ws);
+    }
+    crate::workspace::workspace_windows(cx).into_iter().next()
+}
+
 fn close(cx: &mut App) {
     if let Some(w) = cx.global_mut::<LauncherGlobal>().window.take() {
         let _ = w.update(cx, |_, window, _| window.remove_window());
@@ -1155,8 +1171,13 @@ pub fn toggle(cx: &mut App) {
         close(cx);
         return;
     }
-    let ws = cx.global::<LauncherGlobal>().workspace;
-    let Ok(sources) = ws.read_with(cx, |w, cx| w.launcher_sources(cx)) else { return };
+    let Some(ws) = last_workspace(cx) else { return };
+    let Ok(mut sources) = ws.read_with(cx, |w, cx| w.launcher_sources(cx)) else { return };
+    // Projects open in any window count as open.
+    let open: Vec<String> = crate::workspace::workspace_windows(cx).iter().filter_map(|w| w.read(cx).ok().and_then(|w| w.active_project_id().map(str::to_string))).collect();
+    for p in &mut sources.projects {
+        p.active |= open.contains(&p.id);
+    }
     let (display_id, bounds) = match target_bounds(cx) {
         Some((d, b)) => (Some(d), b),
         None => (None, Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx)),
@@ -1208,7 +1229,8 @@ fn run(pick: Pick, cx: &mut App) {
         Pick::App(p) => open(p.as_os_str()),
         Pick::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
         Pick::Project(id, action) => {
-            let ws = cx.global::<LauncherGlobal>().workspace;
+            // The window that has the project open, else the last used one.
+            let Some(ws) = crate::workspace::window_with_project(&id, None, cx).or_else(|| last_workspace(cx)) else { return };
             cx.activate(true);
             let _ = ws.update(cx, |w, window, cx| {
                 window.activate_window();
@@ -1216,7 +1238,9 @@ fn run(pick: Pick, cx: &mut App) {
             });
         }
         Pick::File(path) => {
-            let ws = cx.global::<LauncherGlobal>().workspace;
+            let windows = crate::workspace::workspace_windows(cx);
+            let owner = windows.iter().copied().find(|w| w.read(cx).is_ok_and(|w| w.owns_path(&path)));
+            let Some(ws) = owner.or_else(|| last_workspace(cx)) else { return };
             cx.activate(true);
             let _ = ws.update(cx, |w, window, cx| {
                 window.activate_window();
