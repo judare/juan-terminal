@@ -1,0 +1,12 @@
+[package]
+name = "claude_ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+serde_json = "=1.0.154"
+base64 = "=0.22.1"
+sha1_smol = "=1.0.1"

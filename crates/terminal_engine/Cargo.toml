@@ -1,0 +1,12 @@
+[package]
+name = "terminal_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+log.workspace = true
+futures.workspace = true
+libc.workspace = true
