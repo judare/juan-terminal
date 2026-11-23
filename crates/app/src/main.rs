@@ -25,6 +25,7 @@ mod text_area;
 mod text_input;
 mod theme;
 mod tools_panel;
+mod website_block;
 mod workspace;
 
 use std::time::Instant;
@@ -109,6 +110,8 @@ fn main() {
             Menu {
                 name: "juan-terminal".into(),
                 items: vec![
+                    MenuItem::action("Settings…", workspace::OpenSettings),
+                    MenuItem::separator(),
                     MenuItem::os_submenu("Services", SystemMenuType::Services),
                     MenuItem::separator(),
                     MenuItem::action("Quit juan-terminal", workspace::Quit),
@@ -120,6 +123,7 @@ fn main() {
                     MenuItem::action("New Terminal", workspace::NewTerminal),
                     MenuItem::action("Open Project…", workspace::OpenProject),
                     MenuItem::action("Add Repository…", workspace::AddRepository),
+                    MenuItem::action("Keep Project Open 1 More Hour", workspace::ExtendProjectHours),
                     MenuItem::separator(),
                     MenuItem::action("Save", editor_view::Save),
                     MenuItem::action("Save All", workspace::SaveAll),
@@ -228,6 +232,7 @@ fn bind_keys(cx: &mut App) {
     use workspace as w;
     cx.bind_keys([
         KeyBinding::new("cmd-q", w::Quit, None),
+        KeyBinding::new("cmd-,", w::OpenSettings, Some("Workspace")),
         KeyBinding::new("cmd-j", w::ToggleTerminalPanel, Some("Workspace")),
         KeyBinding::new("cmd-p", w::ToggleQuickOpen, Some("Workspace")),
         KeyBinding::new("cmd-shift-p", w::ToggleCommandPalette, Some("Workspace")),

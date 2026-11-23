@@ -15,6 +15,7 @@ The app appears in the Dock. State: `~/Library/Application Support/juan-terminal
 
 | | |
 |---|---|
+| ⌘, | Settings (`settings.toml`: project schedules, blocked websites) |
 | ⌘O | Open folder as project (auto-detects Git repos) |
 | ⌘⇧O | Add repository to current project |
 | ⌘T / ⌘W | New / close terminal tab |
@@ -26,6 +27,19 @@ The app appears in the Dock. State: `~/Library/Application Support/juan-terminal
 | ⇧PgUp/PgDn, ⌘Home/End | Scroll |
 
 Click a repository in the sidebar to open (or jump to) a terminal in it.
+
+## Settings
+
+`~/Library/Application Support/juan-terminal/settings.toml` (⌘, opens it; applied on save):
+
+* `[projects.<id>] schedule = [{ days = [...], start = "HH:MM", end = "HH:MM" }]`: hours a project
+  can be opened (Mac local time, or a fixed `utc_offset = "-05:00"`). Outside them it is locked in the sidebar and, if open, closed (files saved,
+  5-minute warning). Folders on disk are never touched.
+* `blocked_websites = [...]`: blocked system-wide via a managed block in `/etc/hosts` (macOS asks
+  for the admin password when the list changes). Additions apply at once; removals only after
+  24 h.
+* Emergencies: opening a locked project offers "Open for 1 hour / 4 hours"; ⌘⇧P → “Keep Project
+  Open 1 More Hour” extends the open one.
 
 ## Tests
 

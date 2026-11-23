@@ -1352,7 +1352,36 @@ impl Render for EditorView {
                         .border_color(theme::rgb(theme::BORDER))
                         .child(f.input.clone()),
                 )
-                .child(div().text_size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(count))
+                .child(div().min_w(px(64.)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(count))
+                .when(!f.go_to_line, |bar| {
+                    let button = |id: &'static str, label: &'static str, tip: &'static str| {
+                        div()
+                            .id(id)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(22.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .text_color(theme::rgb(theme::TEXT_MUTED))
+                            .hover(|s| s.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT)))
+                            .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(tip)).into())
+                            .child(label)
+                    };
+                    bar.child(
+                        button("find-prev", "↑", "Previous match (⇧Enter / ⌘⇧G)")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_step(false, cx))),
+                    )
+                    .child(
+                        button("find-next", "↓", "Next match (Enter / ⌘G)")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.find_step(true, cx))),
+                    )
+                    .child(
+                        button("find-close", "✕", "Close (Esc)")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.close_find(window, cx))),
+                    )
+                })
         });
 
         let conflict = self.disk_conflict.then(|| {
