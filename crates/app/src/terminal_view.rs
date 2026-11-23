@@ -156,6 +156,9 @@ pub struct TerminalView {
     /// Claude Code is the foreground process (updated each render).
     claude_fg: bool,
     hover_cell: Option<(usize, usize)>,
+    /// A mouse press was forwarded to the app (mouse tracking): its drag/release go too.
+    mouse_forwarding: bool,
+    last_reported_cell: Option<(usize, usize)>,
     hover_task: Option<Task<()>>,
     /// Hover preview and where to draw it (pointer, relative to the grid origin).
     preview: Option<(Point<Pixels>, crate::hover_preview::Preview)>,
@@ -230,6 +233,8 @@ impl TerminalView {
             claude_menu: None,
             claude_fg: false,
             hover_cell: None,
+            mouse_forwarding: false,
+            last_reported_cell: None,
             hover_task: None,
             preview: None,
             _events: events,
@@ -577,6 +582,14 @@ impl TerminalView {
                 return;
             }
         }
+        let mode = self.snapshot.mode;
+        if mode.mouse_report() && !event.modifiers.shift {
+            let m = &event.modifiers;
+            self.session.write(terminal_engine::encode_mouse(0, col, row, true, mode.sgr_mouse, false, m.alt, m.control));
+            self.mouse_forwarding = true;
+            self.last_reported_cell = Some((row, col));
+            return;
+        }
         if event.modifiers.shift {
             self.session.update_selection(row, col, right);
         } else {
@@ -643,6 +656,22 @@ impl TerminalView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let mode = self.snapshot.mode;
+        if mode.mouse_report() {
+            let pressed = event.pressed_button == Some(MouseButton::Left);
+            if (self.mouse_forwarding && pressed && (mode.mouse_drag || mode.mouse_motion)) || (!pressed && mode.mouse_motion) {
+                if let Some((row, col, _)) = self.cell_at(event.position) {
+                    if self.last_reported_cell != Some((row, col)) {
+                        self.last_reported_cell = Some((row, col));
+                        let button = if pressed { 32 } else { 35 };
+                        self.session.write(terminal_engine::encode_mouse(button, col, row, true, mode.sgr_mouse, false, event.modifiers.alt, event.modifiers.control));
+                    }
+                }
+            }
+            if self.mouse_forwarding {
+                return;
+            }
+        }
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             if event.pressed_button.is_none() {
                 self.hover(event, cx);
@@ -655,7 +684,14 @@ impl TerminalView {
         }
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mouse_forwarding {
+            self.mouse_forwarding = false;
+            let mode = self.snapshot.mode;
+            let (row, col) = self.cell_at(event.position).map(|(r, c, _)| (r, c)).or(self.last_reported_cell).unwrap_or((0, 0));
+            self.session.write(terminal_engine::encode_mouse(0, col, row, false, mode.sgr_mouse, false, event.modifiers.alt, event.modifiers.control));
+            return;
+        }
         if self.selecting {
             self.selecting = false;
             // A plain click without drag leaves an empty selection; drop it.
@@ -679,7 +715,17 @@ impl TerminalView {
             return;
         }
         let mode = self.snapshot.mode;
-        if mode.alt_screen && mode.alternate_scroll {
+        if mode.mouse_report() {
+            // The app tracks the mouse (Claude Code fullscreen, htop…): send wheel events at
+            // the pointer instead of arrow keys or scrolling our own buffer.
+            let (row, col) = self.cell_at(event.position).map(|(r, c, _)| (r, c)).unwrap_or((0, 0));
+            let button = if whole > 0 { 64 } else { 65 };
+            let mut bytes = Vec::new();
+            for _ in 0..whole.unsigned_abs().min(20) {
+                bytes.extend(terminal_engine::encode_mouse(button, col, row, true, mode.sgr_mouse, false, false, false));
+            }
+            self.session.write(bytes);
+        } else if mode.alt_screen && mode.alternate_scroll {
             // Full-screen apps (less, vim, ...): translate wheel into arrow keys.
             let seq: &[u8] = match (whole > 0, mode.app_cursor) {
                 (true, true) => b"\x1bOA",

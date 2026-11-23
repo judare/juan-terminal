@@ -97,3 +97,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 }
+
+#[cfg(test)]
+mod claude_mouse_probe {
+    use std::time::Duration;
+    use terminal_engine::{Palette, SessionConfig, Snapshot, TermDims, TerminalSession};
+
+    /// Manual check against the real `claude` (no prompt is sent): does its TUI enable mouse
+    /// tracking? Run with `cargo test -- --ignored claude_enables_mouse`.
+    #[test]
+    #[ignore]
+    fn claude_enables_mouse() {
+        let mut cfg = SessionConfig::default();
+        cfg.program = Some(("claude".into(), vec![]));
+        cfg.cwd = Some(std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Desktop/repositories/employees"));
+        for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("CLAUDE")) {
+            cfg.env.insert(k, String::new());
+        }
+        let (s, _rx) = TerminalSession::spawn(cfg, TermDims::new(120, 40, 8, 16), Palette::dark()).unwrap();
+        std::thread::sleep(Duration::from_secs(8));
+        let mut snap = Snapshot::default();
+        s.snapshot(&mut snap);
+        let m = snap.mode;
+        println!("alt={} click={} drag={} motion={} sgr={}", m.alt_screen, m.mouse_click, m.mouse_drag, m.mouse_motion, m.sgr_mouse);
+    }
+}
