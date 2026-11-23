@@ -59,6 +59,12 @@ pub enum Language {
     Css,
     Html,
     Vue,
+    /// Highlighted with the HTML grammar (tags, attributes, strings, comments).
+    Xml,
+    /// Hand-written lexer (no grammar shipped): keywords, strings, numbers, comments.
+    Sql,
+    /// .env / .conf / .ini-like files: Bash grammar (KEY=value, # comments, strings).
+    Config,
     PlainText,
 }
 
@@ -69,8 +75,17 @@ impl Language {
             ".zshrc" | ".bashrc" | ".zprofile" | ".bash_profile" | ".profile" | ".envrc" => {
                 return Language::Bash;
             }
-            "Cargo.lock" => return Language::Toml,
+            "Cargo.lock" | "rust-toolchain" | "Pipfile" => return Language::Toml,
+            ".env" | ".flaskenv" => return Language::Config,
             _ => {}
+        }
+        // .env.local, .env.production…
+        if name.starts_with(".env.") {
+            return Language::Config;
+        }
+        // .cargo/config (no extension) is TOML.
+        if name == "config" && path.parent().and_then(|p| p.file_name()).is_some_and(|d| d == ".cargo") {
+            return Language::Toml;
         }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
         match ext.as_str() {
@@ -86,6 +101,9 @@ impl Language {
             "css" | "scss" | "postcss" => Language::Css,
             "html" | "htm" => Language::Html,
             "vue" => Language::Vue,
+            "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" | "xaml" | "csproj" | "pom" | "rss" | "atom" => Language::Xml,
+            "sql" | "psql" | "pgsql" | "mysql" => Language::Sql,
+            "env" | "conf" | "cfg" | "ini" | "properties" | "service" | "desktop" => Language::Config,
             _ => Language::PlainText,
         }
     }
@@ -104,6 +122,9 @@ impl Language {
             Language::Css => "CSS",
             Language::Html => "HTML",
             Language::Vue => "Vue",
+            Language::Xml => "XML",
+            Language::Sql => "SQL",
+            Language::Config => "Config",
             Language::PlainText => "Plain Text",
         }
     }
@@ -112,7 +133,8 @@ impl Language {
     pub fn line_comment(self) -> Option<&'static str> {
         match self {
             Language::JavaScript | Language::TypeScript | Language::Tsx | Language::Rust | Language::Vue => Some("// "),
-            Language::Toml | Language::Yaml | Language::Bash => Some("# "),
+            Language::Toml | Language::Yaml | Language::Bash | Language::Config => Some("# "),
+            Language::Sql => Some("-- "),
             _ => None,
         }
     }
@@ -131,7 +153,9 @@ impl Language {
             Language::Css => configs::css(),
             Language::Html => configs::html(),
             Language::Vue => configs::vue(),
-            Language::PlainText => None,
+            Language::Xml => configs::html(),
+            Language::Config => configs::bash(),
+            Language::Sql | Language::PlainText => None,
         }
     }
 }

@@ -133,6 +133,7 @@ fn path_from_uri(s: &str) -> PathBuf {
 impl IdeServer {
     /// Bind, write the lockfile, and start accepting. `lock_dir` is injectable for tests.
     pub fn start_in(lock_dir: &Path) -> anyhow::Result<(IdeServer, UnboundedReceiver<IdeRequest>)> {
+        remove_stale_lockfiles(lock_dir);
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let (tx, rx) = unbounded();
@@ -217,6 +218,32 @@ impl Drop for IdeServer {
             let _ = c.writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
         }
     }
+}
+
+/// Lockfiles left by juan-terminal instances that were killed (no Drop ran).
+fn remove_stale_lockfiles(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "lock") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+        if v.get("ideName").and_then(|n| n.as_str()) != Some(IDE_NAME) {
+            continue; // never touch other IDEs' files
+        }
+        let pid = v.get("pid").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+        // kill(pid, 0) fails with ESRCH when the process is gone.
+        let alive = pid > 0 && (unsafe { kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1));
+        if !alive {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 fn write_lockfile(inner: &Inner) -> anyhow::Result<()> {
