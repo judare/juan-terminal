@@ -211,7 +211,7 @@ fn as_url(q: &str) -> Option<String> {
 // ---- project commands -------------------------------------------------------------------
 
 /// Origin remote → browser URL (`git@github.com:o/r.git` → `https://github.com/o/r`).
-fn web_url(repo: &Path) -> Option<String> {
+pub(crate) fn web_url(repo: &Path) -> Option<String> {
     let cfg = std::fs::read_to_string(repo.join(".git").join("config")).ok()?;
     let mut in_origin = false;
     let mut first: Option<String> = None;

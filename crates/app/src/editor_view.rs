@@ -236,6 +236,11 @@ pub struct EditorView {
     pub doc: Document,
     /// Non-text files (images, CSV, media) are shown by an asset viewer instead.
     pub asset: Option<Entity<crate::asset_view::AssetView>>,
+    /// CSV/TSV: `asset` is the table view of `doc` (Table/Edit toggle).
+    csv_source: bool,
+    /// CSV showing the table (vs. the text editor).
+    table_mode: bool,
+    _asset_sub: Option<Subscription>,
     focus_handle: FocusHandle,
     spans: Vec<HighlightSpan>,
     spans_version: u64,
@@ -301,6 +306,9 @@ impl EditorView {
         let mut this = Self {
             doc,
             asset: None,
+            csv_source: false,
+            table_mode: false,
+            _asset_sub: None,
             focus_handle: cx.focus_handle(),
             spans: Vec::new(),
             spans_version: u64::MAX,
@@ -346,10 +354,48 @@ impl EditorView {
     pub fn new_asset(path: PathBuf, kind: crate::asset_view::AssetKind, font_size: f32, cx: &mut Context<Self>) -> Self {
         let mut doc = Document::from_str("", Language::PlainText);
         doc.path = Some(path.clone());
-        let asset = cx.new(|cx| crate::asset_view::AssetView::new(path, kind, cx));
         let mut this = Self::new(doc, font_size, cx);
-        this.asset = Some(asset);
+        let focus = this.focus_handle.clone();
+        this.asset = Some(cx.new(|cx| crate::asset_view::AssetView::new(path, kind, focus, cx)));
         this
+    }
+
+    /// CSV/TSV: a normal text document shown as a selectable table, with "Edit" to switch
+    /// to the text editor and "Table" (or ⌘⇧V) to switch back.
+    pub fn new_csv(doc: Document, font_size: f32, cx: &mut Context<Self>) -> Self {
+        let path = doc.path.clone().unwrap_or_default();
+        let mut this = Self::new(doc, font_size, cx);
+        let focus = this.focus_handle.clone();
+        let asset = cx.new(|cx| {
+            let mut a = crate::asset_view::AssetView::new(path, crate::asset_view::AssetKind::Table, focus, cx);
+            a.csv_source = true;
+            a
+        });
+        this._asset_sub = Some(cx.subscribe(&asset, |this, _, e: &crate::asset_view::AssetEvent, cx| match e {
+            crate::asset_view::AssetEvent::EditSource => {
+                this.table_mode = false;
+                this.autoscroll = true;
+                cx.notify();
+            }
+        }));
+        this.asset = Some(asset);
+        this.csv_source = true;
+        this.table_mode = true;
+        this
+    }
+
+    /// Non-text file with no editable document behind it.
+    fn pure_asset(&self) -> bool {
+        self.asset.is_some() && !self.csv_source
+    }
+
+    fn show_table(&mut self, cx: &mut Context<Self>) {
+        self.table_mode = true;
+        if let Some(a) = self.asset.clone() {
+            let text = self.doc.text();
+            a.update(cx, |a, cx| a.set_csv_text(text, cx));
+        }
+        cx.notify();
     }
 
     // ---- accessors for the markdown renderer -------------------------------------------
@@ -631,6 +677,10 @@ impl EditorView {
     }
 
     fn toggle_markdown_live(&mut self, _: &ToggleMarkdownLive, _: &mut Window, cx: &mut Context<Self>) {
+        if self.csv_source {
+            self.show_table(cx);
+            return;
+        }
         if self.is_svg() {
             self.svg_preview = !self.svg_preview;
             cx.notify();
@@ -674,7 +724,7 @@ impl EditorView {
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.asset.is_some() {
+        if self.pure_asset() {
             return true;
         }
         if let Some(path) = &self.doc.path {
@@ -702,7 +752,7 @@ impl EditorView {
 
     /// Called when the window regains focus: pick up external modifications.
     pub fn check_disk(&mut self, cx: &mut Context<Self>) {
-        if self.asset.is_some() || !self.doc.changed_on_disk() {
+        if self.pure_asset() || !self.doc.changed_on_disk() {
             return;
         }
         if self.doc.is_dirty() {
@@ -711,6 +761,9 @@ impl EditorView {
             cx.emit(EditorEvent::Error(format!("{e:#}")));
         } else {
             self.schedule_highlight(Duration::ZERO, cx);
+            if self.csv_source && self.table_mode {
+                self.show_table(cx);
+            }
         }
         cx.notify();
     }
@@ -931,7 +984,7 @@ impl EditorView {
             }
             return;
         };
-        if self.asset.is_some() {
+        if self.pure_asset() {
             return;
         }
         let text = self.doc.text();
@@ -1318,8 +1371,14 @@ impl Render for EditorView {
         }
         let table_toolbar = self.render_table_toolbar(cx);
         let slash_menu = if self.markdown_live { self.render_slash_menu(cx) } else { None };
-        if let Some(asset) = self.asset.clone() {
-            return div().id("editor").key_context("Editor").track_focus(&self.focus_handle).size_full().child(asset);
+        if let Some(asset) = self.asset.clone().filter(|_| !self.csv_source || self.table_mode) {
+            // The asset view tracks this editor's focus handle itself (keyboard selection).
+            return div()
+                .id("editor")
+                .key_context("Editor")
+                .size_full()
+                .when(self.csv_source, |d| d.on_action(cx.listener(Self::save_action)))
+                .child(asset);
         }
         let focused_editor = cx.entity();
         let find_bar = self.find.as_ref().map(|f| {
@@ -1526,9 +1585,10 @@ impl Render for EditorView {
                 .with_priority(2)
             }))
             .children(conflict)
-            .when(self.doc.language == Language::Markdown || self.is_svg(), |d| {
+            .when(self.doc.language == Language::Markdown || self.is_svg() || self.csv_source, |d| {
                 let svg = self.is_svg();
-                let on = if svg { self.svg_preview } else { self.markdown_live };
+                let csv = self.csv_source;
+                let on = if csv { false } else if svg { self.svg_preview } else { self.markdown_live };
                 d.child(
                     div()
                         .flex()
@@ -1536,12 +1596,12 @@ impl Render for EditorView {
                         .gap(px(2.))
                         .px(px(10.))
                         .pt(px(6.))
-                        .child(md_toggle("md-live", if svg { "Preview" } else { "Live" }, on).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                        .child(md_toggle("md-live", if csv { "Table" } else if svg { "Preview" } else { "Live" }, on).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                             if !on {
                                 this.toggle_markdown_live(&ToggleMarkdownLive, w, cx)
                             }
                         })))
-                        .child(md_toggle("md-source", "Source", !on).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                        .child(md_toggle("md-source", if csv { "Edit" } else { "Source" }, !on).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                             if on {
                                 this.toggle_markdown_live(&ToggleMarkdownLive, w, cx)
                             }
@@ -1653,7 +1713,7 @@ fn shift_spans(spans: &mut Vec<HighlightSpan>, at: usize, delta: isize) {
     spans.retain(|s| s.end > s.start);
 }
 
-fn md_toggle(id: &'static str, label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn md_toggle(id: &'static str, label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px(px(8.))

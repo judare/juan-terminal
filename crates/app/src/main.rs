@@ -23,6 +23,7 @@ mod servers_panel;
 mod shell_env;
 mod shell_integration;
 mod slash_menu;
+mod tags_panel;
 mod terminal_view;
 mod text_area;
 mod text_input;
