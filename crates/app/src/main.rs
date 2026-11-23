@@ -28,6 +28,7 @@ mod text_area;
 mod text_input;
 mod theme;
 mod tools_panel;
+mod totp;
 mod website_block;
 mod workspace;
 
@@ -99,7 +100,23 @@ fn main() {
         // SAFETY: still single-threaded here.
         unsafe { std::env::remove_var(k) };
     }
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+    let app = Application::new().with_assets(assets::Assets);
+    // Files opened from Finder ("Open With", dropped on the Dock icon, `open -a`).
+    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    app.on_open_urls(move |urls| {
+        let _ = open_tx.unbounded_send(urls);
+    });
+    app.run(move |cx: &mut App| {
+        cx.spawn(async move |cx| {
+            use futures::StreamExt;
+            while let Some(urls) = open_rx.next().await {
+                let paths: Vec<std::path::PathBuf> = urls.iter().filter_map(|u| file_url_to_path(u)).collect();
+                if !paths.is_empty() && cx.update(|cx| open_paths_in_front_window(paths, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         bind_keys(cx);
         text_input::bind_keys(cx);
         text_area::bind_keys(cx);
@@ -222,6 +239,43 @@ fn main() {
     });
 }
 
+/// `file:///a/b%20c` → `/a/b c`. Non-file URLs are ignored.
+fn file_url_to_path(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let path = String::from_utf8(out).ok()?;
+    let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(&path);
+    Some(std::path::PathBuf::from(path))
+}
+
+/// Open files in the frontmost workspace window (or the first one) and bring it forward.
+fn open_paths_in_front_window(paths: Vec<std::path::PathBuf>, cx: &mut App) {
+    let target = cx
+        .active_window()
+        .and_then(|w| w.downcast::<Workspace>())
+        .or_else(|| workspace::workspace_windows(cx).into_iter().next());
+    let Some(target) = target else { return };
+    let _ = target.update(cx, |ws, window, cx| {
+        ws.open_dropped(&paths, window, cx);
+        window.activate_window();
+    });
+    cx.activate(true);
+}
+
 /// Open a workspace window. `primary` windows also save the window geometry and the active
 /// project used at the next launch; other windows only save their own project.
 pub(crate) fn open_workspace_window(
@@ -287,9 +341,33 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", t::Copy, Some("Terminal")),
         KeyBinding::new("cmd-v", t::Paste, Some("Terminal")),
         KeyBinding::new("cmd-k", t::Clear, Some("Terminal")),
+        KeyBinding::new("cmd-f", t::Find, Some("Terminal")),
+        KeyBinding::new("cmd-g", t::FindNext, Some("Terminal")),
+        KeyBinding::new("cmd-shift-g", t::FindPrevious, Some("Terminal")),
         KeyBinding::new("shift-pageup", t::ScrollPageUp, Some("Terminal")),
         KeyBinding::new("shift-pagedown", t::ScrollPageDown, Some("Terminal")),
         KeyBinding::new("cmd-home", t::ScrollToTop, Some("Terminal")),
         KeyBinding::new("cmd-end", t::ScrollToBottom, Some("Terminal")),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_urls_decode() {
+        assert_eq!(file_url_to_path("file:///Users/a/b%20c.txt"), Some("/Users/a/b c.txt".into()));
+        assert_eq!(file_url_to_path("file://localhost/tmp/x/"), Some("/tmp/x".into()));
+        assert_eq!(file_url_to_path("file:///%C3%B1.md"), Some("/ñ.md".into()));
+        assert_eq!(file_url_to_path("https://x.com"), None);
+    }
+
+    #[test]
+    fn shell_quoting() {
+        use terminal_view::shell_quote;
+        assert_eq!(shell_quote("/a/b.txt"), "/a/b.txt");
+        assert_eq!(shell_quote("/a/b c.txt"), "'/a/b c.txt'");
+        assert_eq!(shell_quote("/a/it's"), "'/a/it'\\''s'");
+    }
 }

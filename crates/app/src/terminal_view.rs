@@ -17,12 +17,25 @@ use gpui::{
 use std::collections::HashMap;
 use terminal_engine::{
     CellFlags, CursorShape, KeyInput, KeyModes, Mark, Palette, Rgb, SessionEvent, parse_mark_uri,
-    Snapshot, TermDims, TerminalSession, encode_key, encode_paste,
+    SearchHit, Snapshot, TermDims, TerminalSession, encode_key, encode_paste,
 };
 
 use crate::theme;
 
-actions!(terminal, [Copy, Paste, Clear, ScrollPageUp, ScrollPageDown, ScrollToTop, ScrollToBottom]);
+actions!(terminal, [Copy, Paste, Clear, ScrollPageUp, ScrollPageDown, ScrollToTop, ScrollToBottom, Find, FindNext, FindPrevious]);
+
+/// Max matches kept by the scrollback search (a 10k-line history rarely gets close).
+const SEARCH_LIMIT: usize = 5000;
+
+/// ⌘F bar: matches over scrollback + screen.
+struct TermSearch {
+    input: Entity<crate::text_input::TextInput>,
+    hits: Vec<SearchHit>,
+    /// History size when `hits` was computed (grid lines shift as output arrives).
+    base: usize,
+    current: Option<usize>,
+    _sub: Subscription,
+}
 
 pub enum TerminalViewEvent {
     TitleChanged,
@@ -117,6 +130,12 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// Rows of Claude Code's TUI that juan-terminal shows natively (welcome banner, mode and
 /// effort hints): hidden while Claude is in the foreground.
+/// Quote a path for the shell only when it needs it (`'` inside becomes `'\\''`).
+pub fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+,@%:=".contains(c));
+    if safe { s.to_string() } else { format!("'{}'", s.replace('\'', "'\\''")) }
+}
+
 pub fn is_claude_chrome_row(text: &str) -> bool {
     let t = text.trim();
     t.contains("▐▛███▛█") || t.contains("▝▜██████▀") || t.starts_with("▝▝   ▝▝") || (t.contains("auto mode on") && t.contains("shift+tab")) || t.ends_with("· /effort")
@@ -164,6 +183,9 @@ pub struct TerminalView {
     hover_task: Option<Task<()>>,
     /// Hover preview and where to draw it (pointer, relative to the grid origin).
     preview: Option<(Point<Pixels>, crate::hover_preview::Preview)>,
+    search: Option<TermSearch>,
+    /// Debounced re-search while output arrives with the find bar open.
+    search_refresh: Option<Task<()>>,
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -240,6 +262,8 @@ impl TerminalView {
             last_reported_cell: None,
             hover_task: None,
             preview: None,
+            search: None,
+            search_refresh: None,
             _events: events,
             _subscriptions: subscriptions,
         }
@@ -457,7 +481,18 @@ impl TerminalView {
     fn handle_session_event(&mut self, event: terminal_engine::RawEvent, cx: &mut Context<Self>) {
         let Some(event) = self.session.process_event(event) else { return };
         match event {
-            SessionEvent::Redraw => cx.notify(),
+            SessionEvent::Redraw => {
+                if self.search.is_some() && self.search_refresh.is_none() {
+                    self.search_refresh = Some(cx.spawn(async move |this, cx| {
+                        gpui::Timer::after(std::time::Duration::from_millis(250)).await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.search_refresh = None;
+                            this.run_search(false, cx);
+                        });
+                    }));
+                }
+                cx.notify()
+            }
             SessionEvent::Title(t) => {
                 self.title = Some(t);
                 cx.emit(TerminalViewEvent::TitleChanged);
@@ -485,7 +520,11 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed in the find bar bubble up here: they're not for the shell.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         self.clear_preview(cx);
         if self.marked_text.is_some() {
             return; // IME composition in progress: let the input handler process it.
@@ -503,6 +542,140 @@ impl TerminalView {
             self.write_user_input(bytes.into_owned(), cx);
             cx.stop_propagation();
         }
+    }
+
+    // ---- find (⌘F) ------------------------------------------------------------------------
+
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            let input = cx.new(|cx| crate::text_input::TextInput::new("Find in terminal", cx));
+            let sub = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+                crate::text_input::TextInputEvent::Changed => this.run_search(true, cx),
+                crate::text_input::TextInputEvent::Submit { shift } => this.search_step(!*shift, cx),
+                crate::text_input::TextInputEvent::Cancel => this.close_search(window, cx),
+            });
+            self.search = Some(TermSearch { input, hits: Vec::new(), base: 0, current: None, _sub: sub });
+        }
+        let input = self.search.as_ref().unwrap().input.clone();
+        match self.session.selection_text().filter(|t| !t.contains('\n')) {
+            Some(sel) => input.update(cx, |i, cx| i.set_text(&sel, cx)),
+            None => input.update(cx, |i, cx| i.select_all_text(cx)),
+        }
+        window.focus(&input.focus_handle(cx));
+        self.run_search(true, cx);
+    }
+
+    fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.search_step(true, cx);
+    }
+
+    fn find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.search_step(false, cx);
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search = None;
+        self.search_refresh = None;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Recompute matches. `jump`: the query changed, go to the newest match (bottom);
+    /// otherwise keep the current one (new output arrived).
+    fn run_search(&mut self, jump: bool, cx: &mut Context<Self>) {
+        let Some(s) = self.search.as_mut() else { return };
+        let query = s.input.read(cx).content.clone();
+        let prev = s.current.and_then(|i| s.hits.get(i)).map(|h| (h.start.0 as i64 + s.base as i64, h.start.1));
+        let (hits, base) = self.session.search(&query, SEARCH_LIMIT);
+        s.current = if hits.is_empty() {
+            None
+        } else if jump {
+            Some(hits.len() - 1)
+        } else {
+            prev.and_then(|p| hits.iter().position(|h| (h.start.0 as i64 + base as i64, h.start.1) == p)).or(s.current.map(|c| c.min(hits.len() - 1)))
+        };
+        s.hits = hits;
+        s.base = base;
+        if jump {
+            self.reveal_current();
+        }
+        cx.notify();
+    }
+
+    /// `older`: towards the top of the scrollback (Enter), like iTerm/Terminal.app.
+    fn search_step(&mut self, older: bool, cx: &mut Context<Self>) {
+        let Some(s) = self.search.as_mut() else { return };
+        let n = s.hits.len();
+        if n == 0 {
+            return;
+        }
+        s.current = Some(match s.current {
+            None => n - 1,
+            Some(c) if older => (c + n - 1) % n,
+            Some(c) => (c + 1) % n,
+        });
+        self.reveal_current();
+        cx.notify();
+    }
+
+    fn reveal_current(&mut self) {
+        if let Some(s) = &self.search {
+            if let Some(h) = s.current.and_then(|i| s.hits.get(i)) {
+                self.session.reveal_line(h.start.0, s.base);
+            }
+        }
+    }
+
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let s = self.search.as_ref()?;
+        let count = if s.hits.is_empty() {
+            if s.input.read(cx).content.is_empty() { String::new() } else { "No results".into() }
+        } else {
+            let more = if s.hits.len() >= SEARCH_LIMIT { "+" } else { "" };
+            format!("{} of {}{more}", s.current.map(|c| c + 1).unwrap_or(0), s.hits.len())
+        };
+        let button = |id: &'static str, icon: &'static str, tip: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(22.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+                .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(tip)).into())
+                .child(gpui::svg().path(icon).size(px(11.)).text_color(theme::rgb(theme::TEXT_MUTED)))
+        };
+        Some(
+            div()
+                .id("term-find")
+                .absolute()
+                .top(px(6.))
+                .right(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .pl(px(8.))
+                .pr(px(4.))
+                .h(px(32.))
+                .w(px(340.))
+                .rounded(px(6.))
+                .bg(theme::rgb(theme::SIDEBAR_BG))
+                .border_1()
+                .border_color(theme::rgb(theme::BORDER))
+                .shadow_md()
+                .cursor(CursorStyle::Arrow)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(div().flex_1().min_w_0().px(px(6.)).py(px(3.)).rounded(px(4.)).bg(theme::rgb(theme::EDITOR_BG)).cursor(CursorStyle::IBeam).child(s.input.clone()))
+                .child(div().flex_none().min_w(px(62.)).text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_MUTED)).child(count))
+                .child(button("term-find-prev", "icons/chevron-up.svg", "Older match (Enter / ⌘G)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.search_step(true, cx))))
+                .child(button("term-find-next", "icons/chevron-down.svg", "Newer match (⇧Enter / ⌘⇧G)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.search_step(false, cx))))
+                .child(button("term-find-close", "icons/close.svg", "Close (Esc)").on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.close_search(w, cx))))
+                .into_any_element(),
+        )
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -773,7 +946,8 @@ impl Render for TerminalView {
             let el = div().absolute().left((x + px(14.)).min((l.size.width - px(380.)).max(px(0.)))).child(crate::hover_preview::render(pv));
             if lower { el.bottom(l.size.height - y + px(14.)) } else { el.top(y + px(18.)) }
         });
-        let history_btn = claude.then(|| {
+        let search_bar = self.render_search_bar(cx);
+        let history_btn = (claude && search_bar.is_none()).then(|| {
             div()
                 .absolute()
                 .top(px(6.))
@@ -805,12 +979,28 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::scroll_page_down))
             .on_action(cx.listener(Self::scroll_to_top))
             .on_action(cx.listener(Self::scroll_to_bottom))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+            .drag_over::<gpui::ExternalPaths>(|s, _, _, _| s.opacity(0.8))
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                // Like Terminal.app/iTerm: dropping files types their shell-quoted paths.
+                if this.exit_code.is_some() || paths.paths().is_empty() {
+                    return;
+                }
+                let mut text = paths.paths().iter().map(|p| shell_quote(&p.to_string_lossy())).collect::<Vec<_>>().join(" ");
+                text.push(' ');
+                let bytes = encode_paste(&text, this.snapshot.mode.bracketed_paste);
+                this.write_user_input(bytes, cx);
+                window.focus(&this.focus_handle);
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .flex_1()
@@ -821,6 +1011,7 @@ impl Render for TerminalView {
             )
             .children(bar)
             .children(history_btn)
+            .children(search_bar)
             .children(popover)
             .children(preview)
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
@@ -1443,6 +1634,29 @@ impl Element for TerminalElement {
                     };
                     let line = text_system.shape_line(SharedString::from(run_text.clone()), font_size, &[run], None);
                     text.push(TextFragment { origin: cell_origin(row, start), line });
+                }
+            }
+
+            // Find-bar matches (over cell backgrounds, under the text).
+            if let Some(s) = &view.search {
+                let shift = snap.history_size as i32 - s.base as i32;
+                let off = snap.display_offset as i32;
+                let (rows, cols) = (snap.rows as i32, snap.cols);
+                let hit_bg = Hsla { a: 0.28, ..hsla(Rgb { r: 0xe5, g: 0xc0, b: 0x7b }) };
+                let cur_bg = Hsla { a: 0.75, ..hsla(Rgb { r: 0xd1, g: 0x9a, b: 0x66 }) };
+                for (i, h) in s.hits.iter().enumerate() {
+                    let (r0, r1) = (h.start.0 - shift + off, h.end.0 - shift + off);
+                    if r1 < 0 || r0 >= rows {
+                        continue;
+                    }
+                    let color = if s.current == Some(i) { cur_bg } else { hit_bg };
+                    for r in r0.max(0)..=r1.min(rows - 1) {
+                        let c0 = if r == r0 { h.start.1 } else { 0 };
+                        let c1 = if r == r1 { h.end.1 } else { cols.saturating_sub(1) };
+                        if c1 >= c0 {
+                            backgrounds.push((Bounds::new(cell_origin(r as usize, c0), size(cell_width * (c1 - c0 + 1) as f32, cell_height)), color));
+                        }
+                    }
                 }
             }
 

@@ -62,6 +62,37 @@ fn diag_to_ide(d: &code_quality::Diagnostic) -> claude_ide::Diagnostic {
     }
 }
 
+/// Terminals waiting on the user, per workspace window (keyed by entity id): summed into the
+/// Dock icon badge.
+static DOCK_COUNTS: std::sync::Mutex<Vec<(u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Report this window's count; repaints the Dock badge only when the total changes.
+pub fn set_dock_count(owner: u64, n: usize) {
+    let Ok(mut counts) = DOCK_COUNTS.lock() else { return };
+    let before: usize = counts.iter().map(|c| c.1).sum();
+    counts.retain(|c| c.0 != owner);
+    if n > 0 {
+        counts.push((owner, n));
+    }
+    let after: usize = counts.iter().map(|c| c.1).sum();
+    if before != after {
+        set_dock_badge(if after == 0 { String::new() } else { after.to_string() });
+    }
+}
+
+#[allow(unexpected_cfgs)] // objc 0.2 macros
+fn set_dock_badge(label: String) {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    let Ok(c) = std::ffi::CString::new(label) else { return };
+    unsafe {
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let tile: *mut Object = msg_send![app, dockTile];
+        let s: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
+        let _: () = msg_send![tile, setBadgeLabel: s];
+    }
+}
+
 fn osascript_notify(title: &str, subtitle: &str, message: &str) {
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("display notification \"{}\" with title \"{}\" subtitle \"{}\" sound name \"Glass\"", esc(message), esc(title), esc(subtitle));
