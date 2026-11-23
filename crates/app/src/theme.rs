@@ -6,7 +6,9 @@ pub const MONO_FONT: &str = "Menlo";
 pub const UI_FONT: &str = ".SystemUIFont";
 pub const TERM_LINE_HEIGHT: f32 = 1.3;
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
-/// Terminals render 1px larger than the editor.
+/// Code editor text renders this much larger than the base font size.
+pub const EDITOR_FONT_BONUS: f32 = 2.0;
+/// Terminals render 1px larger than the base font size.
 pub const TERM_FONT_BONUS: f32 = 1.0;
 
 pub const TERM_BG: u32 = 0x141518;
