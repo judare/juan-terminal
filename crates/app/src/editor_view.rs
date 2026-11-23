@@ -312,7 +312,7 @@ impl EditorView {
             find: None,
             disk_conflict: false,
             font: gpui::font(theme::MONO_FONT),
-            font_size: px(font_size),
+            font_size: px(font_size + theme::EDITOR_FONT_BONUS),
             autoscroll: false,
             markdown_live: false,
             md_blocks: Vec::new(),
@@ -361,7 +361,7 @@ impl EditorView {
         &self.focus_handle
     }
     pub(crate) fn font_scale(&self) -> f32 {
-        f32::from(self.font_size) / theme::DEFAULT_FONT_SIZE
+        (f32::from(self.font_size) - theme::EDITOR_FONT_BONUS) / theme::DEFAULT_FONT_SIZE
     }
     pub(crate) fn refresh_md_blocks(&mut self) {
         if self.md_blocks_version != self.doc.version() || self.md_blocks.len() != self.doc.line_count() {
@@ -662,7 +662,7 @@ impl EditorView {
     }
 
     pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
-        self.font_size = px(size);
+        self.font_size = px(size + theme::EDITOR_FONT_BONUS);
         cx.notify();
     }
 

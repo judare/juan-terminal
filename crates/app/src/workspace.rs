@@ -75,7 +75,7 @@ fn clock_now() -> (i64, i64) {
 
 const SCRATCH: &str = "";
 const TOP_BAR_HEIGHT: f32 = 38.;
-const ROW_HEIGHT: f32 = 26.;
+const ROW_HEIGHT: f32 = 28.;
 const MIN_SIDEBAR: f32 = 160.;
 const MAX_SIDEBAR: f32 = 520.;
 
@@ -489,17 +489,26 @@ impl Workspace {
             self.terminals.insert(key.clone(), Tabs::default());
             let saved: Vec<TerminalState> = self.active_project().map(|p| p.terminals.clone()).unwrap_or_default();
             let active = self.active_project().and_then(|p| p.active_terminal).unwrap_or(0);
-            if saved.is_empty() {
-                let cwd = self.active_project().and_then(|p| p.default_cwd());
-                self.open_terminal(cwd, None, window, cx);
-            } else {
-                for t in saved {
-                    let cwd = t.cwd.filter(|p| p.is_dir()).or_else(|| self.active_project().and_then(|p| p.default_cwd()));
-                    self.open_terminal(cwd, t.repository, window, cx);
+            // Default layout: a shell and a Claude tab. Restored Claude tabs relaunch `claude`.
+            let default_cwd = self.active_project().and_then(|p| p.default_cwd());
+            let has_shell = saved.iter().any(|t| t.title.as_deref() != Some("Claude"));
+            let has_claude = saved.iter().any(|t| t.title.as_deref() == Some("Claude"));
+            for t in &saved {
+                let cwd = t.cwd.clone().filter(|p| p.is_dir()).or_else(|| default_cwd.clone());
+                if t.title.as_deref() == Some("Claude") {
+                    self.open_claude(cwd, t.repository.clone(), window, cx);
+                } else {
+                    self.open_terminal(cwd, t.repository.clone(), window, cx);
                 }
-                if let Some(tabs) = self.terminals.get_mut(&key) {
-                    tabs.active = active.min(tabs.tabs.len().saturating_sub(1));
-                }
+            }
+            if !has_shell {
+                self.open_terminal(default_cwd.clone(), None, window, cx);
+            }
+            if !has_claude {
+                self.open_claude(default_cwd, None, window, cx);
+            }
+            if let Some(tabs) = self.terminals.get_mut(&key) {
+                tabs.active = if saved.is_empty() { tabs.tabs.len().saturating_sub(1) } else { active.min(tabs.tabs.len().saturating_sub(1)) };
             }
         }
         self.sync_git_panel(window, cx);
@@ -2161,7 +2170,7 @@ impl Workspace {
                 .filter(|t| !t.read(cx).has_exited())
                 .map(|t| {
                     let t = t.read(cx);
-                    TerminalState { title: None, cwd: t.current_cwd(), repository: t.repository.clone() }
+                    TerminalState { title: t.label.clone().filter(|l| l == "Claude"), cwd: t.current_cwd(), repository: t.repository.clone() }
                 })
                 .collect();
             project.active_terminal = Some(tabs.active);
@@ -2481,7 +2490,7 @@ impl Workspace {
 
     fn render_row(&mut self, ix: usize, active_path: Option<&PathBuf>, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else { return div().into_any_element() };
-        let inner = div().flex().items_center().gap(px(6.)).w_full().h(px(ROW_HEIGHT)).rounded(px(5.)).cursor_pointer().text_size(px(12.5));
+        let inner = div().flex().items_center().gap(px(6.)).w_full().h(px(ROW_HEIGHT)).rounded(px(5.)).cursor_pointer().text_size(px(14.5));
         let el: AnyElement = match row {
             Row::Hint => div()
                 .id(ix)
@@ -2509,7 +2518,7 @@ impl Workspace {
                     })
                     .child(chevron(expanded))
                     .child(match project_icon {
-                        Some(path) => gpui::img(path).size(px(14.)).flex_none().rounded(px(3.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                        Some(path) => gpui::img(path).size(px(16.)).flex_none().rounded(px(3.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
                         None => icon("icons/project-empty.svg", theme::TEXT_FAINT),
                     })
                     .child(
@@ -2518,7 +2527,7 @@ impl Workspace {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_size(px(13.))
+                            .text_size(px(15.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme::rgb(if active { theme::TEXT } else if locked { theme::TEXT_FAINT } else { theme::TEXT_MUTED }))
                             .child(name),
@@ -2580,7 +2589,7 @@ impl Workspace {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .font_family(theme::MONO_FONT)
                             .text_color(theme::rgb(theme::TEXT_FAINT))
                             .child(if missing { "missing".to_string() } else { branch.unwrap_or_default() }),
@@ -2722,7 +2731,7 @@ impl Workspace {
                     .px(px(16.))
                     .h(px(26.))
                     .flex_none()
-                    .child(div().text_size(px(11.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_FAINT)).child("PROJECTS"))
+                    .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_FAINT)).child("PROJECTS"))
                     .child(
                         icon_button("add-project", "icons/plus.svg")
                             .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.open_project(&OpenProject, w, cx))),
@@ -2743,10 +2752,10 @@ impl Workspace {
                         this.search_in_project(&SearchInProject, w, cx);
                     })))
                     .child(mode_tab("mode-tools", "icons/gear.svg", "Tools", self.sidebar_mode == SidebarMode::Tools).when(problems > 0, |d| d.child(
-                        div().px(px(5.)).rounded_full().bg(theme::rgb(0x3a1f22)).text_size(px(10.5)).text_color(theme::rgb(0xf0b3b8)).child(problems.to_string()),
+                        div().px(px(5.)).rounded_full().bg(theme::rgb(0x3a1f22)).text_size(px(12.)).text_color(theme::rgb(0xf0b3b8)).child(problems.to_string()),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_tools(w, cx))))
                     .child(mode_tab("mode-git", "icons/git.svg", "Git", self.sidebar_mode == SidebarMode::Git).when(git_total > 0, |d| d.child(
-                        div().px(px(5.)).rounded_full().bg(theme::rgb(0x3a3220)).text_size(px(10.5)).text_color(theme::rgb(theme::MODIFIED)).child(git_total.to_string()),
+                        div().px(px(5.)).rounded_full().bg(theme::rgb(0x3a3220)).text_size(px(12.)).text_color(theme::rgb(theme::MODIFIED)).child(git_total.to_string()),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
                         this.show_git(w, cx);
                     })))
@@ -2981,9 +2990,9 @@ fn is_dimmed(name: &str) -> bool {
 
 fn icon(path: &'static str, color: u32) -> gpui::AnyElement {
     if path == "icons/claude.svg" {
-        return crate::assets::claude_logo(14.).into_any_element();
+        return crate::assets::claude_logo(16.).into_any_element();
     }
-    gpui::svg().path(path).size(px(14.)).flex_none().text_color(theme::rgb(color)).into_any_element()
+    gpui::svg().path(path).size(px(16.)).flex_none().text_color(theme::rgb(color)).into_any_element()
 }
 
 fn empty_state(title: &'static str, hint: &'static str) -> gpui::Div {
@@ -3006,13 +3015,13 @@ fn mode_tab(id: &'static str, icon_path: &'static str, label: &'static str, acti
         .items_center()
         .gap(px(5.))
         .px(px(8.))
-        .h(px(24.))
+        .h(px(26.))
         .rounded(px(5.))
         .cursor_pointer()
-        .text_size(px(12.))
+        .text_size(px(14.))
         .when(active, |d| d.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT)))
         .when(!active, |d| d.text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::HOVER))))
-        .child(gpui::svg().path(icon_path).size(px(12.)).text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })))
+        .child(gpui::svg().path(icon_path).size(px(14.)).text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })))
         .when(active, |d| d.child(label))
         .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(label)).into())
 }
@@ -3030,9 +3039,9 @@ fn claude_button(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
 
 fn chevron(expanded: bool) -> gpui::Div {
     div()
-        .w(px(12.))
+        .w(px(13.))
         .flex_none()
-        .child(gpui::svg().path(if expanded { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }).size(px(10.)).text_color(theme::rgb(theme::TEXT_FAINT)))
+        .child(gpui::svg().path(if expanded { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }).size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)))
 }
 
 fn icon_button(id: impl Into<gpui::ElementId>, icon_path: &'static str) -> gpui::Stateful<gpui::Div> {
