@@ -9,8 +9,10 @@ mod command_palette;
 mod diff_view;
 mod editor_view;
 mod git_panel;
+mod hotkey;
 mod hover_preview;
 mod language_servers;
+mod launcher;
 mod markdown_live;
 mod moli;
 mod ports;
@@ -39,7 +41,7 @@ use workspace::Workspace;
 use workspace_state::StateStore;
 
 /// Append to `<state>/logs/startup.log` (diagnosing launches that never show a window).
-fn startup_log(line: &str) {
+pub(crate) fn startup_log(line: &str) {
     use std::io::Write;
     let dir = workspace_state::state_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
@@ -191,7 +193,7 @@ fn main() {
             .map(|w| Bounds::new(point(px(w.x), px(w.y)), size(px(w.width), px(w.height))))
             .unwrap_or_else(|| Bounds::centered(None, size(px(1200.), px(780.)), cx));
 
-        let window = cx.open_window(
+        let window: anyhow::Result<gpui::WindowHandle<Workspace>> = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -205,12 +207,17 @@ fn main() {
             },
             |window, cx| cx.new(|cx| Workspace::new(store, state, window, cx)),
         );
-        if let Err(err) = window {
-            eprintln!("juan-terminal: failed to open window: {err:#}");
-            startup_log(&format!("failed to open window: {err:#}"));
-            cx.quit();
-            return;
-        }
+        let window = match window {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("juan-terminal: failed to open window: {err:#}");
+                startup_log(&format!("failed to open window: {err:#}"));
+                cx.quit();
+                return;
+            }
+        };
+        // ⌘Space anywhere: apps, URLs, projects, files (replaces Raycast/Spotlight).
+        launcher::init(window, cx);
 
         // Single-window app for now: closing it quits (state is saved on quit).
         cx.on_window_closed(|cx| {
