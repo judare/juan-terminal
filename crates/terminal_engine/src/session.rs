@@ -221,6 +221,17 @@ impl Snapshot {
     }
 }
 
+/// A search match in grid coordinates: (line, column), inclusive; line < 0 is history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub start: (i32, usize),
+    pub end: (i32, usize),
+}
+
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
 pub struct TerminalSession {
     term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
@@ -463,6 +474,73 @@ impl TerminalSession {
         out.marks.sort_by_key(|m| m.0);
     }
 
+    /// Case-insensitive search over scrollback + screen. Soft-wrapped rows are joined, so a
+    /// match can span them. Returns hits (top to bottom) and the history size at search time:
+    /// `line + history_size` stays stable while new output pushes lines into the history.
+    pub fn search(&self, query: &str, limit: usize) -> (Vec<SearchHit>, usize) {
+        let q: Vec<char> = query.chars().map(fold).collect();
+        let term = self.term.lock();
+        let hs = term.history_size();
+        if q.is_empty() {
+            return (Vec::new(), hs);
+        }
+        let grid = term.grid();
+        let (rows, cols) = (term.screen_lines() as i32, term.columns());
+        let mut hits = Vec::new();
+        let mut line = -(hs as i32);
+        let mut chars: Vec<char> = Vec::new();
+        let mut pos: Vec<(i32, usize)> = Vec::new();
+        while line < rows && hits.len() < limit {
+            chars.clear();
+            pos.clear();
+            loop {
+                let row = &grid[Line(line)];
+                for col in 0..cols {
+                    let cell = &row[Column(col)];
+                    if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    chars.push(fold(cell.c));
+                    pos.push((line, col));
+                }
+                let wrapped = cols > 0 && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+                line += 1;
+                if !wrapped || line >= rows {
+                    break;
+                }
+            }
+            if chars.len() < q.len() {
+                continue;
+            }
+            let mut i = 0;
+            while i + q.len() <= chars.len() && hits.len() < limit {
+                if chars[i..i + q.len()] == q[..] {
+                    let (sl, sc) = pos[i];
+                    let (el, ec) = pos[i + q.len() - 1];
+                    hits.push(SearchHit { start: (sl, sc), end: (el, ec) });
+                    i += q.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        (hits, hs)
+    }
+
+    /// Scroll so grid `line` (negative = history) of a search made when the history had
+    /// `base` lines is visible, centered when it wasn't.
+    pub fn reveal_line(&self, line: i32, base: usize) {
+        let mut term = self.term.lock();
+        let line = line - (term.history_size() as i32 - base as i32);
+        let rows = term.screen_lines() as i32;
+        let off = term.grid().display_offset() as i32;
+        let (top, bottom) = (-off, -off + rows - 1);
+        if line < top || line > bottom {
+            let target = (rows / 2 - line).clamp(0, term.history_size() as i32);
+            term.scroll_display(Scroll::Delta(target - off));
+        }
+    }
+
     pub fn scroll(&self, lines: i32) {
         if lines != 0 {
             self.term.lock().scroll_display(Scroll::Delta(lines));
@@ -682,6 +760,31 @@ mod tests {
         assert!(parse_mark_uri("https://x").is_none());
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%e2%9c%93"), "✓");
+    }
+
+    #[test]
+    fn search_finds_history_and_wrapped_matches() {
+        // 30 lines on an 8-row screen (most go to history), plus one wrapped across rows.
+        let (mut s, mut rx) = TerminalSession::spawn(
+            sh("i=0; while [ $i -lt 30 ]; do echo line$i; i=$((i+1)); done; printf 'xxxxxxxxxxxxxxxxNeedle\\n'"),
+            TermDims::new(20, 8, 8, 16),
+            Palette::dark(),
+        )
+        .unwrap();
+        run_until_exit(&mut s, &mut rx);
+        let (hits, base) = s.search("LINE1", 100);
+        // line1, line10..line19
+        assert_eq!(hits.len(), 11, "{hits:?}");
+        assert!(base > 0 && hits[0].start.0 < 0, "first hit is in the history: {hits:?}");
+        let (wrapped, _) = s.search("needle", 10);
+        assert_eq!(wrapped.len(), 1);
+        let w = wrapped[0];
+        assert_eq!((w.start.1, w.end.0 - w.start.0, w.end.1), (16, 1, 1), "{w:?}");
+        s.reveal_line(hits[0].start.0, base);
+        let mut snap = Snapshot::default();
+        s.snapshot(&mut snap);
+        let row = (hits[0].start.0 + snap.display_offset as i32) as usize;
+        assert_eq!(snap.row_text(row), "line1");
     }
 
     #[test]

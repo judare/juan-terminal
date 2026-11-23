@@ -175,7 +175,11 @@ enum SidebarMode {
 }
 
 pub struct Workspace {
+    /// Last title pushed to the native window (shown in Mission Control / Window menu).
+    window_title: String,
     context_menu: Option<ContextMenu>,
+    /// "+" on the terminal tab bar: Terminal / Claude Code / the project's SSH servers.
+    new_tab_menu: Option<gpui::Point<gpui::Pixels>>,
     name_prompt: Option<NamePrompt>,
     sidebar_mode: SidebarMode,
     quick_open: Option<(Entity<QuickOpen>, Subscription)>,
@@ -284,7 +288,9 @@ impl Workspace {
         let terminal_width = state.terminal_panel_width.unwrap_or(520.).max(240.);
         let font_size = state.font_size.unwrap_or(theme::DEFAULT_FONT_SIZE);
         let mut this = Self {
+            window_title: String::new(),
             context_menu: None,
+            new_tab_menu: None,
             name_prompt: None,
             sidebar_mode: SidebarMode::Files,
             quick_open: None,
@@ -386,6 +392,13 @@ impl Workspace {
                     if window.is_window_active() {
                         if let Some(gp) = &this.git_panel {
                             gp.update(cx, |g, cx| g.refresh_all(cx));
+                        }
+                        // Files edited by Claude/terminals/other apps while we're in front:
+                        // clean buffers reload, dirty ones show the conflict bar (one stat each).
+                        for tabs in this.editors.values() {
+                            for e in &tabs.tabs {
+                                e.update(cx, |e, cx| e.check_disk(cx));
+                            }
                         }
                     }
                 });
@@ -585,6 +598,17 @@ impl Workspace {
                 cx.notify();
             });
             self.persist(cx);
+        }
+    }
+
+    fn open_ssh(&mut self, server: &workspace_state::SshServer, window: &mut Window, cx: &mut Context<Self>) {
+        let args = ssh_remote::interactive_args(server);
+        let label = server.name.clone();
+        if let Some(view) = self.spawn_terminal_with(None, None, Some(("ssh".into(), args)), window, cx) {
+            view.update(cx, |t, cx| {
+                t.label = Some(format!("ssh · {label}"));
+                cx.notify();
+            });
         }
     }
 
@@ -1002,16 +1026,7 @@ impl Workspace {
                 }
                 self.persist(cx);
             }
-            E::OpenTerminal(server) => {
-                let args = ssh_remote::interactive_args(server);
-                let label = server.name.clone();
-                if let Some(view) = self.spawn_terminal_with(None, None, Some(("ssh".into(), args)), window, cx) {
-                    view.update(cx, |t, cx| {
-                        t.label = Some(format!("ssh · {label}"));
-                        cx.notify();
-                    });
-                }
-            }
+            E::OpenTerminal(server) => self.open_ssh(server, window, cx),
             E::RunDev(cmd) => {
                 let already = self.terminals.get(&self.active_key()).is_some_and(|t| t.tabs.iter().any(|v| v.read(cx).dev_dir.as_ref() == Some(&cmd.dir) && !v.read(cx).has_exited()));
                 if !already {
@@ -1271,6 +1286,51 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Most urgent Claude badge among a project's terminals (optionally only one repo's):
+    /// "needs you" beats "finished".
+    fn attention_in(&self, pid: &str, repo: Option<&str>, cx: &App) -> Option<crate::terminal_view::Attention> {
+        use crate::terminal_view::Attention;
+        let tabs = self.terminals.get(pid)?;
+        let mut best = None;
+        for t in &tabs.tabs {
+            let t = t.read(cx);
+            if repo.is_some() && t.repository.as_deref() != repo {
+                continue;
+            }
+            match t.attention {
+                Some(Attention::NeedsInput) => return Some(Attention::NeedsInput),
+                Some(a) => best = Some(a),
+                None => {}
+            }
+        }
+        best
+    }
+
+    /// Switch to the project and focus its terminal that has a Claude badge (repo first).
+    fn jump_to_attention(&mut self, pid: &str, repo: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::terminal_view::Attention;
+        if self.state.active_project.as_deref() != Some(pid) {
+            self.switch_project(pid, window, cx);
+        }
+        let Some(tabs) = self.terminals.get(pid) else { return };
+        let rank = |a: Option<Attention>| match a {
+            Some(Attention::NeedsInput) => 2,
+            Some(Attention::Done) => 1,
+            None => 0,
+        };
+        let ix = tabs
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| repo.is_none() || t.read(cx).repository.as_deref() == repo)
+            .max_by_key(|(_, t)| rank(t.read(cx).attention))
+            .filter(|(_, t)| t.read(cx).attention.is_some())
+            .map(|(i, _)| i);
+        if let Some(ix) = ix {
+            self.select_terminal(ix, window, cx);
+        }
+    }
+
     fn select_terminal(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tabs) = self.terminals.get_mut(&self.active_key()) {
             if ix < tabs.tabs.len() {
@@ -1370,6 +1430,39 @@ impl Workspace {
             if let Some(e) = self.active_editor() {
                 window.focus(&e.focus_handle(cx));
             }
+        }
+        cx.notify();
+    }
+
+    /// Open files dropped on the window or handed over by Finder/Dock ("Open With").
+    /// Folders and files that can't be opened are reported instead of silently ignored.
+    pub fn open_dropped(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let (files, skipped): (Vec<&PathBuf>, Vec<&PathBuf>) = paths.iter().partition(|p| p.is_file());
+        let mut problems: Vec<String> = Vec::new();
+        let dirs = skipped.iter().filter(|p| p.is_dir()).count();
+        if dirs > 0 {
+            problems.push(if dirs == 1 { "1 folder skipped (use Add Repository… for folders)".into() } else { format!("{dirs} folders skipped (use Add Repository… for folders)") });
+        }
+        let missing = skipped.len() - dirs;
+        if missing > 0 {
+            problems.push(format!("{missing} item(s) not found"));
+        }
+        let last = files.len().saturating_sub(1);
+        for (ix, path) in files.iter().enumerate() {
+            let before = self.error.clone();
+            self.error = None;
+            self.open_file(path, ix == last, window, cx);
+            if let Some(err) = self.error.take() {
+                problems.push(err.to_string());
+            } else {
+                self.error = before;
+            }
+        }
+        if !problems.is_empty() {
+            self.error = Some(format!("Couldn't open everything dropped: {}", problems.join(" · ")).into());
+        }
+        if !files.is_empty() {
+            self.persist(cx);
         }
         cx.notify();
     }
@@ -2149,6 +2242,71 @@ impl Workspace {
         Some(gpui::deferred(gpui::anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
     }
 
+    fn render_new_tab_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let position = self.new_tab_menu?;
+        let servers = self.active_project().map(|p| p.servers.clone()).unwrap_or_default();
+        let item = |id: gpui::ElementId, icon_el: AnyElement, label: SharedString, detail: Option<SharedString>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(26.))
+                .px(px(10.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .text_color(theme::rgb(theme::TEXT))
+                .hover(|s| s.bg(theme::rgb(0x2b4a7a)))
+                .child(icon_el)
+                .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(label))
+                .when_some(detail, |d, t| d.child(div().flex_none().max_w(px(120.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(t)))
+        };
+        let svg_icon = |path: &'static str, color: u32| gpui::svg().path(path).size(px(13.)).text_color(theme::rgb(color)).into_any_element();
+        let mut list = div()
+            .w(px(250.))
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(theme::rgb(0x202227))
+            .border_1()
+            .border_color(theme::rgb(0x33363d))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.new_tab_menu = None;
+                cx.notify();
+            }))
+            .child(item("nt-terminal".into(), svg_icon("icons/terminal.svg", 0x98c379), "Terminal".into(), Some("⌘T".into())).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                this.new_tab_menu = None;
+                this.new_terminal(&NewTerminal, w, cx);
+            })))
+            .child(item("nt-claude".into(), crate::assets::claude_logo(14.).into_any_element(), "Claude Code".into(), None).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                this.new_tab_menu = None;
+                let cwd = this.active_terminal().and_then(|t| t.read(cx).current_cwd()).or_else(|| this.active_project().and_then(|p| p.default_cwd()));
+                this.open_claude(cwd, None, w, cx);
+            })));
+        list = list.child(div().h(px(1.)).my(px(4.)).bg(theme::rgb(theme::BORDER))).child(
+            div().px(px(10.)).py(px(3.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("SSH"),
+        );
+        if servers.is_empty() {
+            list = list.child(item("nt-ssh-none".into(), svg_icon("icons/server.svg", theme::TEXT_FAINT), "No servers — add one in Servers".into(), None).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                this.new_tab_menu = None;
+                this.show_servers(w, cx);
+            })));
+        }
+        for (ix, server) in servers.into_iter().enumerate() {
+            let detail: SharedString = if server.user.is_empty() { server.host.clone().into() } else { format!("{}@{}", server.user, server.host).into() };
+            let label: SharedString = if server.name.is_empty() { detail.clone() } else { server.name.clone().into() };
+            list = list.child(item(("nt-ssh", ix).into(), svg_icon("icons/server.svg", 0x56b6c2), label, Some(detail)).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                this.new_tab_menu = None;
+                this.open_ssh(&server, w, cx);
+                cx.notify();
+            })));
+        }
+        Some(gpui::deferred(gpui::anchored().position(position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
+    }
+
     fn render_name_prompt(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let p = self.name_prompt.as_ref()?;
         let (title, target) = match &p.action {
@@ -2642,12 +2800,11 @@ impl Workspace {
                     )
                     // Outside its hours (settings.toml): can't be opened.
                     .when(locked, |d| d.child(icon("icons/lock.svg", theme::TEXT_FAINT)))
-                    // Claude only on the selected project, on hover.
-                    .when(active, |d| {
-                        d.child(claude_button(SharedString::from(format!("claude-{id}"))).invisible().group_hover(group.clone(), |s| s.visible()).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                    .when_some(self.attention_in(&id, None, cx), |d, a| {
+                        let pid = id.clone();
+                        d.child(attention_dot(SharedString::from(format!("att-{id}")), a).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                             cx.stop_propagation();
-                            let cwd = this.active_project().and_then(|p| p.default_cwd());
-                            this.open_claude(cwd, None, w, cx);
+                            this.jump_to_attention(&pid, None, w, cx)
                         })))
                     })
                     .child(
@@ -2664,8 +2821,8 @@ impl Workspace {
             Row::Repo { pid, name, path, branch, missing, expanded } => {
                 let group: SharedString = format!("r-{}", path.display()).into();
                 let (pid_t, name_t, pid_rm, name_rm) = (pid.clone(), name.to_string(), pid.clone(), name.to_string());
-                let name_t2 = name.to_string();
                 let path_click = path.clone();
+                let repo_attention = self.attention_in(&pid, Some(&name), cx);
                 inner
                     .id(ix)
                     .group(group.clone())
@@ -2702,10 +2859,16 @@ impl Workspace {
                             .text_color(theme::rgb(theme::TEXT_FAINT))
                             .child(if missing { "missing".to_string() } else { branch.unwrap_or_default() }),
                     )
+                    .when_some(repo_attention, |d, a| {
+                        let (pid_a, name_a) = (pid.clone(), name_t.clone());
+                        d.child(attention_dot(SharedString::from(format!("att-{}", path.display())), a).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                            cx.stop_propagation();
+                            this.jump_to_attention(&pid_a, Some(&name_a), w, cx)
+                        })))
+                    })
                     // Actions float over the right edge (over the branch) on hover, so the
                     // branch label can sit flush right without reserving space for them.
                     .child({
-                        let (pid_c, name_c, path_c) = (pid.clone(), name_t2.clone(), path.clone());
                         div()
                             .absolute()
                             .right(px(4.))
@@ -2719,11 +2882,6 @@ impl Workspace {
                             .bg(theme::rgb(theme::HOVER))
                             .invisible()
                             .group_hover(group.clone(), |s| s.visible())
-                            .child(claude_button(SharedString::from(format!("claude-{}", path.display()))).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
-                                cx.stop_propagation();
-                                this.switch_project(&pid_c, w, cx);
-                                this.open_claude(Some(path_c.clone()), Some(name_c.clone()), w, cx);
-                            })))
                             .child(icon_button(SharedString::from(format!("term-{}", path.display())), "icons/terminal.svg").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                                 cx.stop_propagation();
                                 this.open_repo_terminal(&pid_t, &name_t, w, cx)
@@ -2970,9 +3128,10 @@ impl Workspace {
         }
         bar = bar.child(
             div().h_full().flex().items_center().px(px(4.)).child(
-                icon_button("new-terminal", "icons/plus.svg").on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                icon_button("new-terminal", "icons/plus.svg").on_click(cx.listener(|this, e: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    this.new_terminal(&NewTerminal, w, cx)
+                    this.new_tab_menu = if this.new_tab_menu.is_some() { None } else { Some(e.position()) };
+                    cx.notify();
                 })),
             ),
         );
@@ -3063,13 +3222,47 @@ impl Workspace {
             (None, None) => empty_state("No file open", "Pick a file in the sidebar  ·  ⌘P to search files").into_any_element(),
         };
         div()
+            .id("editor-area")
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .h_full()
+            .relative()
+            .group("editor-drop")
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                this.open_dropped(paths.paths(), window, cx);
+            }))
             .child(bar)
             .child(div().flex_1().min_h_0().child(content))
+            // Shown only while files are dragged over the editor area.
+            .child(
+                div()
+                    .group("editor-drop-overlay") // gives it a hitbox so the drag style applies
+                    .invisible()
+                    .group_drag_over::<gpui::ExternalPaths>("editor-drop", |s| s.visible())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .p(px(12.))
+                    .child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(4.))
+                            .rounded(px(8.))
+                            .border_2()
+                            .border_dashed()
+                            .border_color(theme::rgb(theme::ACCENT))
+                            .bg(gpui::rgba(0x7aa2f71a))
+                            .child(div().text_size(px(15.)).text_color(theme::rgb(theme::TEXT)).child("Drop to open"))
+                            .child(div().text_size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)).child("Files open as tabs, from any folder")),
+                    ),
+            )
             .when_some(self.error.clone(), |d, err| {
                 d.child(
                     div()
@@ -3134,15 +3327,24 @@ fn mode_tab(id: &'static str, icon_path: &'static str, label: &'static str, acti
         .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(label)).into())
 }
 
-fn claude_button(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
+/// Claude badge in the sidebar: yellow = waiting for you, green = finished. Click to jump.
+fn attention_dot(id: SharedString, a: crate::terminal_view::Attention) -> gpui::Stateful<gpui::Div> {
+    let (color, tip) = match a {
+        crate::terminal_view::Attention::Done => (0x98c379, "Claude terminó · click para ir"),
+        crate::terminal_view::Attention::NeedsInput => (0xe5c07b, "Claude te necesita · click para ir"),
+    };
     div()
         .id(id)
         .flex_none()
-        .p(px(3.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
         .rounded(px(4.))
         .cursor_pointer()
         .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
-        .child(crate::assets::claude_logo(15.))
+        .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(tip)).into())
+        .child(div().size(px(8.)).rounded_full().bg(theme::rgb(color)))
 }
 
 fn chevron(expanded: bool) -> gpui::Div {
@@ -3224,9 +3426,17 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let waiting = self.terminals.values().flat_map(|t| t.tabs.iter()).filter(|t| t.read(cx).attention.is_some()).count();
+        crate::claude_bridge::set_dock_count(cx.entity_id().as_u64(), waiting);
+        let title = self.active_project().map(|p| p.name.clone()).unwrap_or_else(|| "juan-terminal".into());
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
         let sidebar = self.sidebar_visible.then(|| self.render_sidebar(cx));
         let context_menu = self.render_context_menu(cx);
+        let new_tab_menu = self.render_new_tab_menu(cx);
         let name_prompt = self.render_name_prompt(cx);
         let center = self.render_editor_area(cx);
         let right = self.terminal_visible.then(|| self.render_terminal_panel(cx));
@@ -3421,6 +3631,7 @@ impl Render for Workspace {
                 )
             })
             .children(context_menu)
+            .children(new_tab_menu)
             .children(name_prompt)
             .when_some(self.quick_open.as_ref().map(|(q, _)| q.clone()), |d, qo| {
                 d.child(

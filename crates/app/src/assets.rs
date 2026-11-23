@@ -34,6 +34,7 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/format.svg", include_bytes!("../assets/icons/format.svg")),
     ("icons/external.svg", include_bytes!("../assets/icons/external.svg")),
     ("icons/chevron-down.svg", include_bytes!("../assets/icons/chevron-down.svg")),
+    ("icons/chevron-up.svg", include_bytes!("../assets/icons/chevron-up.svg")),
     ("icons/chevron-right.svg", include_bytes!("../assets/icons/chevron-right.svg")),
     ("icons/claude.svg", include_bytes!("../assets/icons/claude.svg")),
     ("icons/claude-spark.svg", include_bytes!("../assets/icons/claude-spark.svg")),

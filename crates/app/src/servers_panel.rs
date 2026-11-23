@@ -2,6 +2,7 @@
 //! (name, host, port, user, key), open an SSH terminal, and browse the server over SFTP:
 //! open/edit remote files (uploaded back on save), upload, download, new folder, rename,
 //! delete. All remote work runs in the background through `ssh_remote`.
+//! Also "2FA CODES": TOTP accounts with live codes and countdowns (see `totp`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -69,6 +70,29 @@ pub struct ServersPanel {
     browsers: HashMap<String, Browser>,
     form: Option<Form>,
     prompt: Option<NamePrompt>,
+    totp: Totp,
+}
+
+/// "2FA CODES" section: TOTP accounts with live codes (secrets in the Keychain).
+#[derive(Default)]
+struct Totp {
+    loaded: bool,
+    accounts: Vec<crate::totp::Account>,
+    secrets: HashMap<String, Vec<u8>>,
+    /// Accounts whose secret couldn't be read from the Keychain.
+    missing: HashSet<String>,
+    form: Option<TotpForm>,
+    /// Account id whose code was just copied, and when.
+    copied: Option<(String, std::time::Instant)>,
+    tick: Option<gpui::Task<()>>,
+}
+
+struct TotpForm {
+    secret: Entity<TextInput>,
+    name: Entity<TextInput>,
+    error: Option<String>,
+    busy: Option<String>,
+    _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<ServersPanelEvent> for ServersPanel {}
@@ -90,7 +114,7 @@ fn human_size(n: u64) -> String {
 
 impl ServersPanel {
     pub fn new() -> Self {
-        Self { dev: Vec::new(), dev_running: HashSet::new(), dev_ports: HashMap::new(), dev_poll: None, servers: Vec::new(), open: HashSet::new(), browsers: HashMap::new(), form: None, prompt: None }
+        Self { dev: Vec::new(), dev_running: HashSet::new(), dev_ports: HashMap::new(), dev_poll: None, servers: Vec::new(), open: HashSet::new(), browsers: HashMap::new(), form: None, prompt: None, totp: Totp::default() }
     }
 
     /// Dev scripts of the project and which of them run now (their terminal tabs).
@@ -599,6 +623,388 @@ impl ServersPanel {
         .detach();
     }
 
+    // ---- 2FA (TOTP) --------------------------------------------------------------------
+
+    /// Load accounts + Keychain secrets once, in the background.
+    fn ensure_totp(&mut self, cx: &mut Context<Self>) {
+        if self.totp.loaded {
+            return;
+        }
+        self.totp.loaded = true;
+        cx.spawn(async move |this, cx| {
+            let (accounts, secrets) = cx
+                .background_executor()
+                .spawn(async move {
+                    let accounts = crate::totp::load_accounts();
+                    let secrets: Vec<(String, anyhow::Result<Vec<u8>>)> = accounts.iter().map(|a| (a.id.clone(), crate::totp::load_secret(&a.id))).collect();
+                    (accounts, secrets)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.totp.accounts = accounts;
+                for (id, r) in secrets {
+                    match r {
+                        Ok(s) => {
+                            this.totp.secrets.insert(id, s);
+                        }
+                        Err(_) => {
+                            this.totp.missing.insert(id);
+                        }
+                    }
+                }
+                this.ensure_tick(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-render every second while there are codes to show.
+    fn ensure_tick(&mut self, cx: &mut Context<Self>) {
+        if self.totp.accounts.is_empty() {
+            self.totp.tick = None;
+            return;
+        }
+        if self.totp.tick.is_some() {
+            return;
+        }
+        self.totp.tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                // Wake right after the next second boundary so countdowns stay in step.
+                let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis()).unwrap_or(0);
+                gpui::Timer::after(std::time::Duration::from_millis(1000 - ms as u64 + 15)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn open_totp_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let secret = cx.new(|cx| TextInput::new("Secret key or otpauth:// link", cx));
+        let name = cx.new(|cx| TextInput::new("Name (optional, e.g. AWS root)", cx));
+        let subs = [&secret, &name]
+            .into_iter()
+            .map(|i| {
+                cx.subscribe_in(i, window, |this, _, e, _, cx| match e {
+                    TextInputEvent::Submit { .. } => this.save_totp_form(cx),
+                    TextInputEvent::Cancel => {
+                        this.totp.form = None;
+                        cx.notify();
+                    }
+                    TextInputEvent::Changed => {}
+                })
+            })
+            .collect();
+        window.focus(&secret.read(cx).focus_handle(cx));
+        self.totp.form = Some(TotpForm { secret, name, error: None, busy: None, _subs: subs });
+        cx.notify();
+    }
+
+    fn totp_form_error(&mut self, e: String, cx: &mut Context<Self>) {
+        if let Some(f) = &mut self.totp.form {
+            f.busy = None;
+            f.error = Some(e);
+        }
+        cx.notify();
+    }
+
+    fn save_totp_form(&mut self, cx: &mut Context<Self>) {
+        let Some(f) = &self.totp.form else { return };
+        let input = f.secret.read(cx).content.trim().to_string();
+        if input.is_empty() {
+            return self.totp_form_error("Paste a secret key or an otpauth:// link, or scan a QR code".into(), cx);
+        }
+        self.add_totp(input, cx);
+    }
+
+    /// Parse `input`, store its secret in the Keychain and add the account.
+    fn add_totp(&mut self, input: String, cx: &mut Context<Self>) {
+        let parsed = match crate::totp::parse_input(&input) {
+            Ok(p) => p,
+            Err(e) => return self.totp_form_error(format!("{e:#}"), cx),
+        };
+        let name = self.totp.form.as_ref().map(|f| f.name.read(cx).content.trim().to_string()).unwrap_or_default();
+        let id = format!("totp-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let account = crate::totp::Account {
+            id: id.clone(),
+            label: if name.is_empty() { parsed.label.clone() } else { name },
+            issuer: parsed.issuer.clone(),
+            digits: parsed.digits,
+            period: parsed.period,
+            algorithm: parsed.algorithm,
+        };
+        if let Some(f) = &mut self.totp.form {
+            f.busy = Some("Saving to Keychain…".into());
+            f.error = None;
+        }
+        cx.notify();
+        let mut accounts = self.totp.accounts.clone();
+        accounts.push(account);
+        let secret = parsed.secret;
+        cx.spawn(async move |this, cx| {
+            let (acc2, id2, sec2) = (accounts.clone(), id.clone(), secret.clone());
+            let r = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::totp::store_secret(&id2, &sec2)?;
+                    if let Err(e) = crate::totp::save_accounts(&acc2) {
+                        crate::totp::delete_secret(&id2);
+                        return Err(e);
+                    }
+                    anyhow::Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| match r {
+                Ok(()) => {
+                    this.totp.accounts = accounts;
+                    this.totp.secrets.insert(id, secret);
+                    this.totp.form = None;
+                    this.ensure_tick(cx);
+                    cx.notify();
+                }
+                Err(e) => this.totp_form_error(format!("{e:#}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Decode a QR code in the background (screen selection, image file or clipboard), then add it.
+    fn totp_from_qr(&mut self, label: &str, cx: &mut Context<Self>, decode: impl FnOnce() -> anyhow::Result<Option<String>> + Send + 'static) {
+        if let Some(f) = &mut self.totp.form {
+            f.busy = Some(label.to_string());
+            f.error = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { decode() }).await;
+            let _ = this.update(cx, |this, cx| match r {
+                Ok(Some(text)) => this.add_totp(text, cx),
+                Ok(None) => {
+                    if let Some(f) = &mut this.totp.form {
+                        f.busy = None;
+                    }
+                    cx.notify();
+                }
+                Err(e) => this.totp_form_error(format!("{e:#}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    fn totp_qr_file(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Choose QR code image".into()) });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else { return };
+            let Some(p) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| this.totp_from_qr("Reading QR code…", cx, move || crate::totp::decode_qr_file(&p).map(Some)));
+        })
+        .detach();
+    }
+
+    fn totp_qr_clipboard(&mut self, cx: &mut Context<Self>) {
+        let item = cx.read_from_clipboard();
+        let image = item.as_ref().and_then(|i| i.entries().iter().find_map(|e| if let gpui::ClipboardEntry::Image(img) = e { Some(img.bytes.clone()) } else { None }));
+        if let Some(bytes) = image {
+            return self.totp_from_qr("Reading QR code…", cx, move || crate::totp::decode_qr_bytes(&bytes).map(Some));
+        }
+        // Text on the clipboard: a secret or otpauth:// link.
+        if let Some(text) = item.and_then(|i| i.text()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+            return self.add_totp(text, cx);
+        }
+        self.totp_form_error("The clipboard has no image or text. Copy a QR screenshot (⌃⇧⌘4) first".into(), cx);
+    }
+
+    fn copy_totp(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(a) = self.totp.accounts.iter().find(|a| a.id == id) else { return };
+        let Some(secret) = self.totp.secrets.get(id) else { return };
+        let code = crate::totp::code(secret, a.algorithm, a.digits, a.period, crate::totp::now_secs());
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(code));
+        self.totp.copied = Some((id.to_string(), std::time::Instant::now()));
+        cx.notify();
+    }
+
+    fn confirm_remove_totp(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(a) = self.totp.accounts.iter().find(|a| a.id == id) else { return };
+        let title = totp_title(a);
+        let answer = window.prompt(PromptLevel::Warning, &format!("Remove 2FA “{title}”?"), Some("Deletes the secret from the Keychain. Make sure you can still sign in (another authenticator or recovery codes)."), &["Remove", "Cancel"], cx);
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.totp.accounts.retain(|a| a.id != id);
+                this.totp.secrets.remove(&id);
+                this.totp.missing.remove(&id);
+                let accounts = this.totp.accounts.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        crate::totp::delete_secret(&id);
+                        let _ = crate::totp::save_accounts(&accounts);
+                    })
+                    .detach();
+                this.ensure_tick(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_totp(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut col = div().flex().flex_col().mt(px(6.)).pt(px(2.)).border_t_1().border_color(theme::rgb(theme::BORDER)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .pl(px(14.))
+                .pr(px(8.))
+                .h(px(30.))
+                .child(div().text_size(px(10.5)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_MUTED)).child("2FA CODES"))
+                .child(div().flex_1())
+                .child(icon_action("totp-add", "icons/plus.svg", "Add 2FA account (secret key or QR code)").on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.open_totp_form(w, cx)))),
+        );
+        if let Some(f) = &self.totp.form {
+            let field = |label: &'static str, input: &Entity<TextInput>| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(div().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(label))
+                    .child(div().px(px(8.)).h(px(26.)).flex().items_center().rounded(px(5.)).bg(theme::rgb(theme::EDITOR_BG)).border_1().border_color(theme::rgb(theme::BORDER)).child(input.clone()))
+            };
+            let qr_btn = |id: &'static str, text: &'static str, tip: &'static str| {
+                div()
+                    .id(id)
+                    .flex_1()
+                    .px(px(6.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .bg(theme::rgb(0x1e2a3d))
+                    .hover(|s| s.bg(theme::rgb(0x2b4a7a)))
+                    .text_size(px(11.))
+                    .text_color(theme::rgb(theme::ACCENT))
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip(tip)).into())
+                    .child(text)
+            };
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .mx(px(10.))
+                    .my(px(6.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::rgb(0x202227))
+                    .border_1()
+                    .border_color(theme::rgb(0x33363d))
+                    .child(div().text_size(px(12.)).font_weight(gpui::FontWeight::SEMIBOLD).child("New 2FA account"))
+                    .child(field("SECRET KEY", &f.secret))
+                    .child(field("NAME", &f.name))
+                    .child(div().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child("…or read the QR code:"))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .child(qr_btn("totp-scan", "Scan screen", "Drag a box around the QR code on screen").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.totp_from_qr("Select the QR code on screen…", cx, crate::totp::scan_screen))))
+                            .child(qr_btn("totp-file", "Image…", "Open a QR code image file").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.totp_qr_file(cx))))
+                            .child(qr_btn("totp-paste", "Paste", "Use the QR image (or secret / link) on the clipboard").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.totp_qr_clipboard(cx)))),
+                    )
+                    .when_some(f.busy.clone(), |d, b| d.child(div().text_size(px(11.)).text_color(theme::rgb(theme::ACCENT)).child(b)))
+                    .when_some(f.error.clone(), |d, e| d.child(div().text_size(px(11.)).text_color(theme::rgb(0xf0b3b8)).child(e)))
+                    .child(div().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Secrets are stored in the macOS Keychain, never in plain files."))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(6.))
+                            .child(div().id("totp-cancel").px(px(10.)).h(px(24.)).flex().items_center().rounded(px(5.)).cursor_pointer().bg(theme::rgb(theme::HOVER)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)).child("Cancel").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.totp.form = None;
+                                cx.notify();
+                            })))
+                            .child(div().id("totp-save").px(px(12.)).h(px(24.)).flex().items_center().rounded(px(5.)).cursor_pointer().bg(theme::rgb(0x2b4a7a)).hover(|s| s.bg(theme::rgb(0x355a92))).text_size(px(12.)).child("Add").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_totp_form(cx)))),
+                    ),
+            );
+        }
+        if self.totp.loaded && self.totp.accounts.is_empty() && self.totp.form.is_none() {
+            col = col.child(div().px(px(16.)).py(px(6.)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("No 2FA accounts. Add one with + (secret key or QR code); click a code to copy it."));
+        }
+        let now = crate::totp::now_secs();
+        for a in &self.totp.accounts {
+            let id = a.id.clone();
+            let group: SharedString = format!("totp-{id}").into();
+            let (i1, i2) = (id.clone(), id.clone());
+            let left = crate::totp::remaining(a.period, now);
+            let urgent = left <= 5;
+            let copied = self.totp.copied.as_ref().is_some_and(|(c, t)| *c == id && t.elapsed().as_millis() < 1500);
+            let code = self.totp.secrets.get(&id).map(|s| crate::totp::code(s, a.algorithm, a.digits, a.period, now));
+            let pretty = code.as_deref().map(|c| {
+                let mid = c.len() / 2;
+                format!("{} {}", &c[..mid], &c[mid..])
+            });
+            let subtitle = if !a.issuer.is_empty() && !a.label.is_empty() && a.label != a.issuer { Some(a.label.clone()) } else { None };
+            let frac = left as f32 / a.period.max(1) as f32;
+            let bar_color = if urgent { 0xe06c75 } else { 0x56b6c2 };
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!("totp-row-{id}")))
+                    .group(group.clone())
+                    .flex()
+                    .flex_col()
+                    .mx(px(4.))
+                    .px(px(10.))
+                    .pt(px(5.))
+                    .pb(px(4.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|st| st.bg(theme::rgb(theme::HOVER)))
+                    .tooltip(|_, cx| cx.new(|_| Tooltip("Click to copy the code")).into())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.copy_totp(&i1, cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.5)).font_weight(gpui::FontWeight::MEDIUM).text_color(theme::rgb(theme::TEXT_MUTED)).child(totp_title(a)))
+                                    .when_some(subtitle, |d, s| d.child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(s)))
+                                    .child(match pretty {
+                                        Some(c) => div().text_size(px(19.)).font_family(theme::MONO_FONT).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(if urgent { 0xe06c75 } else { theme::TEXT })).child(c),
+                                        None => div().text_size(px(11.)).text_color(theme::rgb(0xf0b3b8)).child(if self.totp.missing.contains(&id) { "Secret missing from the Keychain" } else { "Loading…" }),
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .invisible()
+                                    .group_hover(group.clone(), |st| st.visible())
+                                    .child(icon_action(SharedString::from(format!("totp-rm-{id}")), "icons/trash.svg", "Remove").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                                        cx.stop_propagation();
+                                        this.confirm_remove_totp(i2.clone(), w, cx)
+                                    }))),
+                            )
+                            .child(if copied {
+                                div().flex_none().text_size(px(11.)).text_color(theme::rgb(theme::ADDED)).child("Copied ✓")
+                            } else {
+                                div().flex_none().min_w(px(26.)).flex().justify_end().text_size(px(12.)).font_family(theme::MONO_FONT).text_color(theme::rgb(if urgent { 0xe06c75 } else { theme::TEXT_MUTED })).child(format!("{left}s"))
+                            }),
+                    )
+                    .child(div().mt(px(3.)).h(px(2.)).w_full().rounded_full().bg(theme::rgb(0x2a2d33)).child(div().h_full().rounded_full().bg(theme::rgb(bar_color)).w(gpui::relative(frac)))),
+            );
+        }
+        col.into_any_element()
+    }
+
     // ---- rendering ---------------------------------------------------------------------
 
     fn render_form(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -755,6 +1161,16 @@ fn prompt_row(input: &Entity<TextInput>, depth: usize) -> gpui::AnyElement {
         .border_color(theme::rgb(theme::ACCENT))
         .child(input.clone())
         .into_any_element()
+}
+
+fn totp_title(a: &crate::totp::Account) -> String {
+    if !a.issuer.is_empty() {
+        a.issuer.clone()
+    } else if !a.label.is_empty() {
+        a.label.clone()
+    } else {
+        "2FA account".into()
+    }
 }
 
 /// Recursive download (sftp `get -r`).
@@ -921,7 +1337,8 @@ impl Render for ServersPanel {
                 list = list.children(rows);
             }
         }
-        list
+        self.ensure_totp(cx);
+        list.child(self.render_totp(cx))
     }
 }
 
