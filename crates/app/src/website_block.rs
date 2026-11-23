@@ -3,8 +3,8 @@
 //! Only the block between our markers is ever changed; the rest of the file is kept byte for
 //! byte. Writing needs root, so the new file is staged in a temp file and copied over
 //! `/etc/hosts` with `osascript … with administrator privileges` (macOS password dialog).
-//! Nothing runs in the background: it's applied at launch and when settings.toml is saved,
-//! and only when the block actually differs.
+//! Applied at launch, when settings.toml is saved and when a website schedule opens or
+//! closes (checked every 20 s), and only when the block actually differs.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -62,13 +62,14 @@ fn managed_hosts(text: &str) -> Vec<String> {
 
 /// What to block: everything wanted, plus hosts removed from the list less than
 /// `UNBLOCK_DELAY_SECS` ago (`pending`: host → when its removal was first seen; updated).
+/// `release`: hosts unblocked right away (scheduled sites inside their allowed hours).
 /// Returns (hosts, earliest Unix time a pending host gets unblocked).
-pub fn effective_hosts(wanted: &[String], current: &[String], pending: &mut BTreeMap<String, i64>, now: i64) -> (Vec<String>, Option<i64>) {
+pub fn effective_hosts(wanted: &[String], release: &[String], current: &[String], pending: &mut BTreeMap<String, i64>, now: i64) -> (Vec<String>, Option<i64>) {
     let mut hosts: std::collections::BTreeSet<String> = wanted.iter().cloned().collect();
-    pending.retain(|h, _| !hosts.contains(h) && current.contains(h));
+    pending.retain(|h, _| !hosts.contains(h) && !release.contains(h) && current.contains(h));
     let mut next = None;
     for h in current {
-        if hosts.contains(h) {
+        if hosts.contains(h) || release.contains(h) {
             continue;
         }
         let since = *pending.entry(h.clone()).or_insert(now);
@@ -119,11 +120,11 @@ pub struct Applied {
 
 /// Make `/etc/hosts` block `wanted` (plus recently removed sites, see `effective_hosts`).
 /// Blocking (waits for the password dialog): call from a background thread.
-pub fn apply(wanted: &[String]) -> Result<Applied, String> {
+pub fn apply(wanted: &[String], release: &[String]) -> Result<Applied, String> {
     let current = std::fs::read_to_string(HOSTS).map_err(|e| format!("reading {HOSTS}: {e}"))?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let mut pending: BTreeMap<String, i64> = std::fs::read_to_string(pending_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let (hosts, pending_until) = effective_hosts(wanted, &managed_hosts(&current), &mut pending, now);
+    let (hosts, pending_until) = effective_hosts(wanted, release, &managed_hosts(&current), &mut pending, now);
     let _ = std::fs::write(pending_path(), serde_json::to_string_pretty(&pending).unwrap_or_default());
     let held = hosts.len().saturating_sub(wanted.len());
     let wanted_text = render(&current, &hosts);
@@ -166,20 +167,24 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let mut pending = BTreeMap::new();
         // Adding: immediate.
-        let (h, next) = effective_hosts(&s(&["a.com", "b.com"]), &s(&["a.com"]), &mut pending, 1000);
+        let (h, next) = effective_hosts(&s(&["a.com", "b.com"]), &[], &s(&["a.com"]), &mut pending, 1000);
         assert_eq!((h, next), (s(&["a.com", "b.com"]), None));
         // Removing b.com: still blocked for 24 h.
-        let (h, next) = effective_hosts(&s(&["a.com"]), &s(&["a.com", "b.com"]), &mut pending, 1000);
+        let (h, next) = effective_hosts(&s(&["a.com"]), &[], &s(&["a.com", "b.com"]), &mut pending, 1000);
         assert_eq!((h, next), (s(&["a.com", "b.com"]), Some(1000 + UNBLOCK_DELAY_SECS)));
-        let (h, _) = effective_hosts(&s(&["a.com"]), &s(&["a.com", "b.com"]), &mut pending, 1000 + UNBLOCK_DELAY_SECS - 1);
+        let (h, _) = effective_hosts(&s(&["a.com"]), &[], &s(&["a.com", "b.com"]), &mut pending, 1000 + UNBLOCK_DELAY_SECS - 1);
         assert_eq!(h, s(&["a.com", "b.com"]));
         // After the delay it's released.
-        let (h, next) = effective_hosts(&s(&["a.com"]), &s(&["a.com", "b.com"]), &mut pending, 1000 + UNBLOCK_DELAY_SECS);
+        let (h, next) = effective_hosts(&s(&["a.com"]), &[], &s(&["a.com", "b.com"]), &mut pending, 1000 + UNBLOCK_DELAY_SECS);
         assert_eq!((h, next), (s(&["a.com"]), None));
         // Re-adding clears the pending removal.
         let mut pending = BTreeMap::from([("b.com".to_string(), 5)]);
-        effective_hosts(&s(&["b.com"]), &s(&["b.com"]), &mut pending, 10);
+        effective_hosts(&s(&["b.com"]), &[], &s(&["b.com"]), &mut pending, 10);
         assert!(pending.is_empty());
+        // Scheduled sites in their allowed hours are released at once.
+        let mut pending = BTreeMap::new();
+        let (h, next) = effective_hosts(&s(&["a.com"]), &s(&["b.com"]), &s(&["a.com", "b.com"]), &mut pending, 1000);
+        assert_eq!((h, next), (s(&["a.com"]), None));
         assert_eq!(managed_hosts(&render("x\n", &s(&["a.com"]))), s(&["a.com"]));
     }
 

@@ -4,6 +4,7 @@
 //! (a commented template) and then edited by the user, in the app (⌘,) or any editor.
 //!
 //! * `blocked_websites`: domains blocked system-wide through a managed block in `/etc/hosts`.
+//! * `[[website_schedules]]`: domains blocked except during their `allowed` hours.
 //! * `[projects.<id>] schedule`: hours a project may be opened. Outside them the project is
 //!   locked in the sidebar and closed if it is open.
 
@@ -19,6 +20,8 @@ pub const DEFAULT_SETTINGS: &str = include_str!("../default-settings.toml");
 #[serde(default)]
 pub struct Settings {
     pub blocked_websites: Vec<String>,
+    /// Sites blocked outside their allowed hours (e.g. social networks only on Sundays).
+    pub website_schedules: Vec<WebsiteSchedule>,
     /// Keyed by project id (`id` in state.toml; the folder name for most projects).
     pub projects: BTreeMap<String, ProjectSettings>,
 }
@@ -30,6 +33,17 @@ pub struct ProjectSettings {
     pub schedule: Vec<ScheduleWindow>,
     /// Fixed UTC offset the schedule is written in, e.g. "-05:00" (Colombia, no DST).
     /// Absent = the Mac's local time.
+    pub utc_offset: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WebsiteSchedule {
+    pub name: String,
+    pub websites: Vec<String>,
+    /// Windows when the sites are reachable. Empty = never blocked.
+    pub allowed: Vec<ScheduleWindow>,
+    /// Same as a project's `utc_offset`.
     pub utc_offset: Option<String>,
 }
 
@@ -73,6 +87,15 @@ pub fn load_settings() -> Result<Settings, String> {
         }
         for w in &p.schedule {
             w.validate().map_err(|e| format!("settings.toml [projects.{id}]: {e}"))?;
+        }
+    }
+    for (i, g) in settings.website_schedules.iter().enumerate() {
+        let id = if g.name.is_empty() { format!("#{}", i + 1) } else { g.name.clone() };
+        if let Some(o) = &g.utc_offset {
+            parse_offset(o).ok_or_else(|| format!("settings.toml [[website_schedules]] {id}: invalid utc_offset {o:?} (use \"-05:00\")"))?;
+        }
+        for w in &g.allowed {
+            w.validate().map_err(|e| format!("settings.toml [[website_schedules]] {id}: {e}"))?;
         }
     }
     Ok(settings)
@@ -180,25 +203,46 @@ impl Settings {
         (!p.is_open(day, minute)).then(|| p.describe())
     }
 
+    /// Hosts to block at Unix time `epoch`: `blocked_websites` plus every website schedule
+    /// outside its allowed hours. Second list: scheduled hosts allowed right now (released
+    /// at once, without the 24 h removal delay).
+    pub fn blocked_hosts_at(&self, epoch: i64, local_offset: i64) -> (Vec<String>, Vec<String>) {
+        let mut blocked: std::collections::BTreeSet<String> = self.blocked_hosts().into_iter().collect();
+        let mut allowed = std::collections::BTreeSet::new();
+        for g in &self.website_schedules {
+            let offset = g.utc_offset.as_deref().and_then(parse_offset).unwrap_or(local_offset);
+            let (day, minute) = weekday_minute(epoch, offset);
+            let open = g.allowed.is_empty() || g.allowed.iter().any(|w| w.contains(day, minute));
+            let hosts = normalize_hosts(&g.websites);
+            if open { allowed.extend(hosts) } else { blocked.extend(hosts) }
+        }
+        let allowed = allowed.into_iter().filter(|h| !blocked.contains(h)).collect();
+        (blocked.into_iter().collect(), allowed)
+    }
+
     /// Normalized hosts entries: lowercase, no scheme/path/port, each with its `www.` twin.
     pub fn blocked_hosts(&self) -> Vec<String> {
-        let mut out = std::collections::BTreeSet::new();
-        for raw in &self.blocked_websites {
-            let mut d = raw.trim().to_ascii_lowercase();
-            if let Some((_, rest)) = d.split_once("://") {
-                d = rest.to_string();
-            }
-            let d = d.split(['/', ':', '?', '#']).next().unwrap_or("").trim_matches('.').to_string();
-            if d.is_empty() || !d.contains('.') || !d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
-                continue;
-            }
-            if !d.starts_with("www.") {
-                out.insert(format!("www.{d}"));
-            }
-            out.insert(d);
-        }
-        out.into_iter().collect()
+        normalize_hosts(&self.blocked_websites)
     }
+}
+
+fn normalize_hosts(list: &[String]) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for raw in list {
+        let mut d = raw.trim().to_ascii_lowercase();
+        if let Some((_, rest)) = d.split_once("://") {
+            d = rest.to_string();
+        }
+        let d = d.split(['/', ':', '?', '#']).next().unwrap_or("").trim_matches('.').to_string();
+        if d.is_empty() || !d.contains('.') || !d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+            continue;
+        }
+        if !d.starts_with("www.") {
+            out.insert(format!("www.{d}"));
+        }
+        out.insert(d);
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -239,6 +283,23 @@ mod tests {
         assert!(hosts.contains(&"bet365.com".to_string()));
         let s = Settings { blocked_websites: vec!["https://Example.com/x".into(), "www.a.io".into(), "bad host".into(), "nodot".into()], ..Default::default() };
         assert_eq!(s.blocked_hosts(), vec!["example.com", "www.a.io", "www.example.com"]);
+    }
+
+    #[test]
+    fn website_schedules_block_outside_allowed_hours() {
+        let s: Settings = toml::from_str(
+            "blocked_websites = [\"a.com\"]\n[[website_schedules]]\nname = \"social\"\nutc_offset = \"-05:00\"\nwebsites = [\"instagram.com\"]\nallowed = [{ days = [\"sun\"], start = \"00:00\", end = \"00:00\" }]\n",
+        )
+        .unwrap();
+        // 2026-11-23 (Monday) 08:00 in Colombia: blocked.
+        let mon = 1_795_438_800;
+        let (b, a) = s.blocked_hosts_at(mon, 0);
+        assert_eq!(b, ["a.com", "instagram.com", "www.a.com", "www.instagram.com"]);
+        assert!(a.is_empty());
+        // Sunday 08:00 Colombia: allowed.
+        let (b, a) = s.blocked_hosts_at(mon - 86_400, 0);
+        assert_eq!(b, ["a.com", "www.a.com"]);
+        assert_eq!(a, ["instagram.com", "www.instagram.com"]);
     }
 
     #[test]
