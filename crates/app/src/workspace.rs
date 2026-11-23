@@ -198,6 +198,8 @@ pub struct Workspace {
     next_terminal_id: u64,
     /// Repos found by rediscovery, applied to the Git panel when a window is at hand.
     pending_git_repos: Option<Vec<(String, PathBuf)>>,
+    /// Launcher action waiting for its project to become active.
+    pending_launch: Option<(String, crate::launcher::ProjectAction)>,
     tools_panel: Option<Entity<ToolsPanel>>,
     pub(crate) diff: Option<Entity<DiffView>>,
     pub(crate) diff_active: bool,
@@ -290,6 +292,7 @@ impl Workspace {
             claude_sessions: 0,
             next_terminal_id: 1,
             pending_git_repos: None,
+            pending_launch: None,
             tools_panel: None,
             diff: None,
             diff_active: false,
@@ -617,6 +620,92 @@ impl Workspace {
         self.focus_terminal(window, cx);
         cx.notify();
         Some(view)
+    }
+
+    // ---- global launcher (⌘Space) -------------------------------------------------------
+
+    pub(crate) fn launcher_sources(&self, _cx: &App) -> crate::launcher::Sources {
+        use crate::launcher::{ProjectEntry, RepoEntry, ServerEntry};
+        let active = self.state.active_project.clone();
+        crate::launcher::Sources {
+            projects: self
+                .state
+                .projects
+                .iter()
+                .map(|p| ProjectEntry {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    active: active.as_deref() == Some(p.id.as_str()),
+                    icon: p.icon_path(),
+                    root: p.root.clone().filter(|r| r.is_dir()),
+                    repos: p.repositories.iter().filter(|r| r.path.is_dir()).map(|r| RepoEntry::new(r.name.clone(), r.path.clone())).collect(),
+                    servers: p
+                        .servers
+                        .iter()
+                        .map(|s| ServerEntry {
+                            id: s.id.clone(),
+                            name: s.name.clone(),
+                            target: if s.user.is_empty() { s.host.clone() } else { format!("{}@{}", s.user, s.host) },
+                        })
+                        .collect(),
+                    dev: Vec::new(),
+                })
+                .collect(),
+            project_name: self.active_project().map(|p| p.name.clone()),
+            files: self.current_index(),
+            roots: self.index_roots(),
+        }
+    }
+
+    /// Run a launcher action in project `id`, switching to it first if needed (the switch may
+    /// ask for confirmation; the action then runs once the project is active).
+    pub(crate) fn launcher_run(&mut self, id: String, action: crate::launcher::ProjectAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.active_project.as_deref() == Some(id.as_str()) {
+            self.pending_launch = None;
+            self.run_launch_action(action, window, cx);
+        } else {
+            self.pending_launch = Some((id.clone(), action));
+            self.request_switch_project(id, window, cx);
+        }
+    }
+
+    fn run_launch_action(&mut self, action: crate::launcher::ProjectAction, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::launcher::ProjectAction as A;
+        match action {
+            A::Open => self.focus_main(window, cx),
+            A::Claude(cwd, repo) => self.open_claude(cwd, repo, window, cx),
+            A::Terminal(cwd, repo) => {
+                self.open_terminal(cwd, repo, window, cx);
+                self.persist(cx);
+            }
+            A::Ssh(server_id) => {
+                let server = self.active_project().and_then(|p| p.servers.iter().find(|s| s.id == server_id).cloned());
+                if let Some(server) = server {
+                    self.on_servers_event(&crate::servers_panel::ServersPanelEvent::OpenTerminal(server), window, cx);
+                }
+            }
+            A::Actions => {
+                self.sidebar_visible = true;
+                self.sidebar_mode = SidebarMode::Files;
+                self.sync_actions_panel(window, cx);
+                if let Some(ap) = self.actions_panel.clone() {
+                    ap.update(cx, |a, cx| {
+                        a.expanded = true;
+                        a.refresh(cx);
+                    });
+                }
+                cx.notify();
+            }
+            A::Git => self.show_git(window, cx),
+            A::Servers => self.show_servers(window, cx),
+            A::Dev(dir) => {
+                let cmd = crate::ports::dev_command_list(&self.port_roots()).into_iter().find(|c| c.dir == dir);
+                if let Some(cmd) = cmd {
+                    self.show_servers(window, cx);
+                    self.on_servers_event(&crate::servers_panel::ServersPanelEvent::RunDev(cmd), window, cx);
+                }
+            }
+        }
     }
 
     // ---- index, quick open, search ------------------------------------------------------
@@ -1451,6 +1540,11 @@ impl Workspace {
             self.sync_dev(cx);
         }
         self.persist(cx);
+        if let Some((pid, action)) = self.pending_launch.take() {
+            if new.as_deref() == Some(pid.as_str()) {
+                self.run_launch_action(action, window, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -1496,6 +1590,7 @@ impl Workspace {
         );
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
+                let _ = this.update(cx, |this, _| this.pending_launch = None);
                 return;
             }
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1544,7 +1639,10 @@ impl Workspace {
             let hours = match answer.await {
                 Ok(0) => 1,
                 Ok(1) => 4,
-                _ => return,
+                _ => {
+                    let _ = this.update(cx, |this, _| this.pending_launch = None);
+                    return;
+                }
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.unlock_for(&id, hours * 3600, cx);
