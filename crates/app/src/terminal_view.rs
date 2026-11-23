@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use gpui::{
+    ClickEvent,
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight,
     GlobalElementId, Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton,
@@ -30,6 +31,50 @@ pub enum TerminalViewEvent {
     AttentionCleared,
     /// ⌘-click on a file path in the output.
     OpenPath { path: PathBuf, line: Option<usize>, column: Option<usize> },
+}
+
+/// What Claude Code's statusLine reports for the session in this terminal.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClaudeStatus {
+    pub model: String,
+    pub model_id: String,
+    pub effort: Option<String>,
+    pub ctx_pct: f32,
+    pub session_id: String,
+    pub cwd: Option<PathBuf>,
+    pub cost_usd: f64,
+}
+
+impl ClaudeStatus {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        ClaudeStatus {
+            model: s("/model/display_name"),
+            model_id: s("/model/id"),
+            effort: v.pointer("/effort/level").and_then(|x| x.as_str()).map(str::to_string),
+            ctx_pct: v.pointer("/context_window/used_percentage").and_then(|x| x.as_f64()).unwrap_or(0.) as f32,
+            session_id: s("/session_id"),
+            cwd: v.pointer("/workspace/current_dir").and_then(|x| x.as_str()).or_else(|| v.get("cwd").and_then(|x| x.as_str())).map(PathBuf::from),
+            cost_usd: v.pointer("/cost/total_cost_usd").and_then(|x| x.as_f64()).unwrap_or(0.),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ClaudeMenu {
+    Model,
+    Effort,
+    History(Vec<crate::claude_sessions::SessionInfo>),
+}
+
+const MODELS: &[(&str, &str)] = &[("Opus 5.5", "claude-opus-5-5"), ("Sonnet 5.5", "claude-sonnet-5-5"), ("Haiku 5.5", "claude-haiku-5-5"), ("Fable 5.2", "claude-fable-5-2")];
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Rows of Claude Code's TUI that juan-terminal shows natively (welcome banner, mode and
+/// effort hints): hidden while Claude is in the foreground.
+pub fn is_claude_chrome_row(text: &str) -> bool {
+    let t = text.trim();
+    t.contains("▐▛███▛█") || t.contains("▝▜██████▀") || t.starts_with("▝▝   ▝▝") || (t.contains("auto mode on") && t.contains("shift+tab")) || t.ends_with("· /effort")
 }
 
 /// Claude (via hooks) says this terminal needs a look.
@@ -61,6 +106,10 @@ pub struct TerminalView {
     /// Stable id passed to the shell as `JT_TERMINAL_ID` (hooks report it back).
     pub jt_id: String,
     pub attention: Option<Attention>,
+    pub claude_status: Option<ClaudeStatus>,
+    claude_menu: Option<ClaudeMenu>,
+    /// Claude Code is the foreground process (updated each render).
+    claude_fg: bool,
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -127,6 +176,9 @@ impl TerminalView {
             selecting: false,
             jt_id,
             attention: None,
+            claude_status: None,
+            claude_menu: None,
+            claude_fg: false,
             _events: events,
             _subscriptions: subscriptions,
         }
@@ -150,6 +202,179 @@ impl TerminalView {
     }
 
     /// Type text into the terminal as if the user did (used to auto-start commands).
+    pub fn is_claude_running(&self) -> bool {
+        self.session.foreground_exe().is_some_and(|p| p.to_string_lossy().contains("claude"))
+    }
+
+    pub fn set_claude_status(&mut self, st: ClaudeStatus, cx: &mut Context<Self>) {
+        if self.claude_status.as_ref() != Some(&st) {
+            self.claude_status = Some(st);
+            cx.notify();
+        }
+    }
+
+    fn claude_command(&mut self, cmd: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.claude_menu = None;
+        self.send_input(&format!("{cmd}\r"));
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn toggle_menu(&mut self, menu: ClaudeMenu, cx: &mut Context<Self>) {
+        let same = std::mem::discriminant(&menu) == self.claude_menu.as_ref().map(std::mem::discriminant).unwrap_or(std::mem::discriminant(&ClaudeMenu::Model)) && self.claude_menu.is_some();
+        self.claude_menu = if same { None } else { Some(menu) };
+        cx.notify();
+    }
+
+    fn open_history(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.claude_menu, Some(ClaudeMenu::History(_))) {
+            self.claude_menu = None;
+            cx.notify();
+            return;
+        }
+        let cwd = self.claude_status.as_ref().and_then(|s| s.cwd.clone()).or_else(|| self.current_cwd());
+        let Some(cwd) = cwd else { return };
+        cx.spawn(async move |this, cx| {
+            let list = cx.background_executor().spawn(async move { crate::claude_sessions::list_sessions(&cwd, 40) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.claude_menu = Some(ClaudeMenu::History(list));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_claude_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let st = self.claude_status.clone().unwrap_or_default();
+        let pct = st.ctx_pct.clamp(0., 100.);
+        let steps = ((pct / 100. * 12.).round() as usize).min(12);
+        let ring_color = if pct >= 85. { 0xe06c75 } else if pct >= 60. { 0xe5c07b } else { 0x7aa2f7 };
+        let chip = |id: &'static str, label: String, active: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(7.))
+                .h(px(20.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(theme::rgb(theme::TEXT_MUTED))
+                .when(active, |d| d.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT)))
+                .hover(|s| s.bg(theme::rgb(theme::HOVER)).text_color(theme::rgb(theme::TEXT)))
+                .child(label)
+                .child(gpui::svg().path("icons/chevron-down.svg").size(px(8.)).text_color(theme::rgb(theme::TEXT_FAINT)))
+        };
+        let menu = self.claude_menu.clone();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .h(px(28.))
+            .px(px(10.))
+            .border_t_1()
+            .border_color(theme::rgb(theme::BORDER))
+            .bg(theme::rgb(0x17181c))
+            .child(
+                div()
+                    .id("ctx-ring")
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip("Context window used")).into())
+                    .child(
+                        div()
+                            .relative()
+                            .size(px(14.))
+                            .child(gpui::svg().absolute().path("icons/ring-track.svg").size(px(14.)).text_color(theme::rgb(0x2e3138)))
+                            .when(steps > 0, |d| d.child(gpui::svg().absolute().path(SharedString::from(format!("icons/ring-{steps}.svg"))).size(px(14.)).text_color(theme::rgb(ring_color)))),
+                    )
+                    .child(div().text_size(px(11.5)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_MUTED)).child(format!("{:.0}%", pct))),
+            )
+            .child(div().w(px(1.)).h(px(14.)).bg(theme::rgb(theme::BORDER)))
+            .child(chip("claude-model", if st.model.is_empty() { "model".into() } else { st.model.clone() }, matches!(menu, Some(ClaudeMenu::Model))).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_menu(ClaudeMenu::Model, cx)
+            })))
+            .child(chip("claude-effort", st.effort.clone().unwrap_or_else(|| "effort".into()), matches!(menu, Some(ClaudeMenu::Effort))).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_menu(ClaudeMenu::Effort, cx)
+            })))
+            .child(div().flex_1())
+            .when(st.cost_usd > 0., |d| d.child(div().text_size(px(11.)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("${:.2}", st.cost_usd))))
+            .into_any_element()
+    }
+
+    fn render_claude_popover(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let menu = self.claude_menu.clone()?;
+        let st = self.claude_status.clone().unwrap_or_default();
+        let panel = || {
+            div()
+                .absolute()
+                .flex()
+                .flex_col()
+                .p(px(4.))
+                .rounded(px(8.))
+                .bg(theme::rgb(0x202227))
+                .border_1()
+                .border_color(theme::rgb(0x33363d))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
+        let item = |id: SharedString, label: String, hint: String, active: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .min_h(px(28.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                .child(div().w(px(10.)).text_size(px(11.)).text_color(theme::rgb(theme::ACCENT)).child(if active { "●" } else { "" }))
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.5)).text_color(theme::rgb(theme::TEXT)).child(label))
+                .child(div().flex_none().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(hint))
+        };
+        Some(match menu {
+            ClaudeMenu::Model => {
+                let mut p = panel().bottom(px(32.)).left(px(40.)).w(px(220.));
+                for (label, id) in MODELS {
+                    let cmd = format!("/model {id}");
+                    let active = st.model_id.starts_with(id);
+                    p = p.child(item(SharedString::from(format!("m-{id}")), label.to_string(), String::new(), active).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.claude_command(cmd.clone(), w, cx))));
+                }
+                p.into_any_element()
+            }
+            ClaudeMenu::Effort => {
+                let mut p = panel().bottom(px(32.)).left(px(120.)).w(px(160.));
+                for lvl in EFFORTS {
+                    let cmd = format!("/effort {lvl}");
+                    let active = st.effort.as_deref() == Some(*lvl);
+                    p = p.child(item(SharedString::from(format!("e-{lvl}")), lvl.to_string(), String::new(), active).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.claude_command(cmd.clone(), w, cx))));
+                }
+                p.into_any_element()
+            }
+            ClaudeMenu::History(list) => {
+                let mut p = panel().id("claude-history").top(px(34.)).right(px(10.)).w(px(420.)).max_h(px(380.)).overflow_y_scroll();
+                p = p.child(div().px(px(8.)).pt(px(4.)).pb(px(2.)).text_size(px(10.5)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_FAINT)).child("SESSIONS IN THIS FOLDER"));
+                if list.is_empty() {
+                    p = p.child(div().px(px(8.)).py(px(6.)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("No saved sessions here yet."));
+                }
+                for sess in list {
+                    let cmd = format!("/resume {}", sess.id);
+                    let active = sess.id == st.session_id;
+                    let hint = format!("{} · {} msg", crate::claude_sessions::ago(sess.modified), sess.user_messages);
+                    p = p.child(item(SharedString::from(format!("s-{}", sess.id)), sess.title.clone(), hint, active).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.claude_command(cmd.clone(), w, cx))));
+                }
+                p.into_any_element()
+            }
+        })
+    }
+
     pub fn send_input(&self, text: &str) {
         self.session.write(text.as_bytes().to_vec());
     }
@@ -355,8 +580,34 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
         let exited = self.exit_code;
+        let claude = self.exit_code.is_none() && self.is_claude_running();
+        if claude != self.claude_fg {
+            self.claude_fg = claude;
+            if !claude {
+                self.claude_menu = None;
+                self.claude_status = None;
+            }
+        }
+        let bar = claude.then(|| self.render_claude_bar(cx));
+        let popover = if claude { self.render_claude_popover(cx) } else { None };
+        let history_btn = claude.then(|| {
+            div()
+                .absolute()
+                .top(px(6.))
+                .right(px(10.))
+                .child(
+                    crate::git_panel::icon_action("claude-history-btn", "icons/history.svg", "Sessions (resume)")
+                        .bg(theme::rgb(0x1c1e23))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_history(cx)
+                        })),
+                )
+        });
         div()
             .id("terminal")
+            .relative()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
             .size_full()
@@ -385,6 +636,9 @@ impl Render for TerminalView {
                     .pt(px(6.))
                     .child(TerminalElement { view: cx.entity(), focused }),
             )
+            .children(bar)
+            .children(history_btn)
+            .children(popover)
             .when_some(exited, |el, code| {
                 let msg = match code {
                     Some(c) => format!("Process exited with code {c}. ⌘W to close."),
@@ -824,6 +1078,9 @@ impl Element for TerminalElement {
             for row in 0..snap.rows {
                 let cells = snap.row(row);
                 // Full-screen apps (vim, htop) are left alone.
+                if view.claude_fg && is_claude_chrome_row(&snap.row_text(row)) {
+                    continue;
+                }
                 let kind = &kinds[row];
                 let row_y = cell_origin(row, 0).y;
                 let row_w = cell_width * snap.cols as f32;
@@ -1112,6 +1369,19 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tone_tests {
     use super::*;
+
+    #[test]
+    fn claude_chrome_rows_and_status_parsing() {
+        assert!(is_claude_chrome_row(" ▐▛███▛█   Claude Code v2.1.330"));
+        assert!(is_claude_chrome_row("▝▜██████▀  Opus 5.5 with medium effort · Claude Team"));
+        assert!(is_claude_chrome_row("  ⏵⏵ auto mode on (shift+tab to cycle)"));
+        assert!(is_claude_chrome_row("                         ◐ medium · /effort"));
+        assert!(!is_claude_chrome_row("auto mode is great"));
+        let v: serde_json::Value = serde_json::from_str(r#"{"session_id":"s1","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"workspace":{"current_dir":"/x"},"context_window":{"used_percentage":37.5},"effort":{"level":"high"},"cost":{"total_cost_usd":0.42}}"#).unwrap();
+        let st = ClaudeStatus::from_json(&v);
+        assert_eq!((st.model.as_str(), st.effort.as_deref(), st.ctx_pct, st.session_id.as_str()), ("Opus 5.5", Some("high"), 37.5, "s1"));
+        assert_eq!(st.cwd, Some(PathBuf::from("/x")));
+    }
 
     #[test]
     fn finds_paths_including_hard_wrapped_ones() {
