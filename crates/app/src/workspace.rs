@@ -2163,8 +2163,9 @@ impl Workspace {
                 inner
                     .id(ix)
                     .group(group.clone())
+                    .relative()
                     .pl(px(14.))
-                    .pr(px(4.))
+                    .pr(px(10.))
                     .hover(|s| s.bg(theme::rgb(theme::HOVER)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_dir(&path_click, cx)))
                     .on_mouse_down(MouseButton::Right, {
@@ -2185,7 +2186,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .group_hover(group.clone(), |s| s.invisible())
+                            .flex_none()
                             .max_w(px(100.))
                             .overflow_hidden()
                             .whitespace_nowrap()
@@ -2195,37 +2196,37 @@ impl Workspace {
                             .text_color(theme::rgb(theme::TEXT_FAINT))
                             .child(if missing { "missing".to_string() } else { branch.unwrap_or_default() }),
                     )
+                    // Actions float over the right edge (over the branch) on hover, so the
+                    // branch label can sit flush right without reserving space for them.
                     .child({
                         let (pid_c, name_c, path_c) = (pid.clone(), name_t2.clone(), path.clone());
-                        claude_button(SharedString::from(format!("claude-{}", path.display())))
+                        div()
+                            .absolute()
+                            .right(px(4.))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(1.))
+                            .pl(px(6.))
+                            .rounded(px(5.))
+                            .bg(theme::rgb(theme::HOVER))
                             .invisible()
                             .group_hover(group.clone(), |s| s.visible())
-                            .invisible()
-                            .group_hover(group.clone(), |s| s.visible())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                            .child(claude_button(SharedString::from(format!("claude-{}", path.display()))).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                                 cx.stop_propagation();
                                 this.switch_project(&pid_c, w, cx);
                                 this.open_claude(Some(path_c.clone()), Some(name_c.clone()), w, cx);
-                            }))
-                    })
-                    .child(
-                        icon_button(SharedString::from(format!("term-{}", path.display())), "icons/terminal.svg")
-                            .invisible()
-                            .group_hover(group.clone(), |s| s.visible())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                            })))
+                            .child(icon_button(SharedString::from(format!("term-{}", path.display())), "icons/terminal.svg").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                                 cx.stop_propagation();
                                 this.open_repo_terminal(&pid_t, &name_t, w, cx)
-                            })),
-                    )
-                    .child(
-                        icon_button(SharedString::from(format!("rmr-{}", path.display())), "icons/close.svg")
-                            .invisible()
-                            .group_hover(group, |s| s.visible())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                            })))
+                            .child(icon_button(SharedString::from(format!("rmr-{}", path.display())), "icons/close.svg").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                                 cx.stop_propagation();
                                 this.confirm_remove_repository(pid_rm.clone(), name_rm.clone(), w, cx)
-                            })),
-                    )
+                            })))
+                    })
                     .into_any_element()
             }
             Row::Entry { entry, depth, expanded, dimmed, .. } => {
