@@ -5651,6 +5651,7 @@ dependencies = [
  "futures",
  "libc",
  "log",
+ "polling",
 ]
 
 [[package]]

@@ -46,6 +46,39 @@ impl Palette {
         }
     }
 
+    /// Default light palette (One Light–style ANSI colors tuned for a white background).
+    pub fn light() -> Self {
+        Self {
+            ansi: [
+                rgb(0x24292f), // black
+                rgb(0xcf2f3d), // red
+                rgb(0x2f8a3c), // green
+                rgb(0x9a6700), // yellow
+                rgb(0x2f6fdf), // blue
+                rgb(0xa626a4), // magenta
+                rgb(0x0b7f8f), // cyan
+                rgb(0xb8bcc4), // white
+                rgb(0x6e7781), // bright black
+                rgb(0xe5484d), // bright red
+                rgb(0x3aa04a), // bright green
+                rgb(0xb88300), // bright yellow
+                rgb(0x4d8af0), // bright blue
+                rgb(0xbc4cba), // bright magenta
+                rgb(0x1797a8), // bright cyan
+                rgb(0xe6e8ec), // bright white
+            ],
+            foreground: rgb(0x24292f),
+            background: rgb(0xfcfcfd),
+            cursor: rgb(0x24292f),
+            selection: rgb(0xc8daf6),
+        }
+    }
+
+    pub fn is_light(&self) -> bool {
+        let b = self.background;
+        (b.r as u32 + b.g as u32 + b.b as u32) > 3 * 128
+    }
+
     /// Color for one of the 256 indexed colors.
     pub fn indexed(&self, idx: u8) -> Rgb {
         match idx {

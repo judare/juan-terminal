@@ -54,7 +54,7 @@ pub struct MdLine {
 
 /// Line layout reused across frames while only the scroll offset changes.
 pub struct MdCache {
-    key: (u64, u64, u32, u32, usize, usize, usize),
+    key: (u64, u64, u32, u32, usize, usize, usize, u32),
     lines: std::rc::Rc<Vec<MdLine>>,
     total_height: Pixels,
 }
@@ -304,7 +304,7 @@ impl Element for MarkdownElement {
             let (cur_line, cur_col) = view.doc.line_col(view.doc.selection.head);
             let (sel_l0, _) = view.doc.line_col(sel.start);
             let (sel_l1, _) = view.doc.line_col(sel.end);
-            let key = (view.doc.version(), view.spans_gen, f32::from(width).to_bits(), scale.to_bits(), cur_line, sel_l0, sel_l1);
+            let key = (view.doc.version(), view.spans_gen, f32::from(width).to_bits(), scale.to_bits(), cur_line, sel_l0, sel_l1, theme::generation());
             let cached = view.md_cache.as_ref().filter(|c| c.key == key).map(|c| (c.lines.clone(), c.total_height));
             let (lines, total_height) = match cached {
                 Some(hit) => hit,

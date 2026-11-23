@@ -12,7 +12,7 @@ use gpui::{
     Subscription, Task, Window, WindowBounds, WindowHandle, actions, div, point, prelude::*, px, uniform_list,
 };
 use project_search::{IndexedFile, Root, list_files};
-use terminal_engine::{Palette, SessionConfig, TermDims, TerminalSession};
+use terminal_engine::{SessionConfig, TermDims, TerminalSession};
 use workspace_state::{
     Project, Settings, StateStore, TerminalState, WindowGeometry, WorkspaceState,
     discover_repositories, head_branch, is_git_repo,
@@ -46,6 +46,7 @@ actions!(
         NextEditor,
         PreviousEditor,
         ToggleAutosave,
+        ToggleTheme,
         SaveAll,
         Quit,
         ToggleQuickOpen,
@@ -639,7 +640,7 @@ impl Workspace {
             env.extend(p.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         let config = SessionConfig { cwd: cwd.clone(), env, program, ..SessionConfig::default() };
-        let (session, rx) = match TerminalSession::spawn(config, TermDims::new(80, 24, 8, 16), Palette::dark()) {
+        let (session, rx) = match TerminalSession::spawn(config, TermDims::new(80, 24, 8, 16), theme::terminal_palette()) {
             Ok(s) => s,
             Err(err) => {
                 self.error = Some(format!("Could not start shell: {err:#}").into());
@@ -2456,6 +2457,7 @@ impl Workspace {
         self.state.sidebar_width = Some(self.sidebar_width);
         self.state.terminal_panel_width = Some(self.terminal_width);
         self.state.font_size = Some(self.font_size);
+        self.state.light_theme = theme::is_light();
         // Merge with what other windows saved since our last sync.
         let disk = self.store.load();
         let merged = merge_projects(&self.synced, &self.state.projects, disk.projects);
@@ -3276,7 +3278,7 @@ impl Workspace {
                             .border_2()
                             .border_dashed()
                             .border_color(theme::rgb(theme::ACCENT))
-                            .bg(gpui::rgba(0x7aa2f71a))
+                            .bg(theme::rgb(theme::ACCENT).opacity(0.1))
                             .child(div().text_size(px(15.)).text_color(theme::rgb(theme::TEXT)).child("Drop to open"))
                             .child(div().text_size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)).child("Files open as tabs, from any folder")),
                     ),
@@ -3519,6 +3521,7 @@ impl Render for Workspace {
                 this.persist(cx);
                 cx.notify();
             }))
+            .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| toggle_theme(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_visible = !this.sidebar_visible;
                 cx.notify();
@@ -3635,6 +3638,7 @@ impl Render for Workspace {
                 d.child(
                     div()
                         .id("palette-backdrop")
+                        .occlude()
                         .absolute()
                         .top_0()
                         .left_0()
@@ -3656,6 +3660,7 @@ impl Render for Workspace {
                 d.child(
                     div()
                         .id("quick-open-backdrop")
+                        .occlude()
                         .absolute()
                         .top_0()
                         .left_0()
@@ -3768,4 +3773,19 @@ mod merge_tests {
         let names: Vec<String> = merge_projects(&base, &ours, disk).into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["A", "B", "e", "d"]);
     }
+}
+
+/// Flip light/dark for the whole app: every window repaints and saves the choice.
+pub fn toggle_theme(cx: &mut App) {
+    theme::set_light(!theme::is_light());
+    for w in workspace_windows(cx) {
+        let _ = w.update(cx, |ws, _, cx| {
+            for t in ws.terminals.values().flat_map(|tabs| tabs.tabs.clone()) {
+                t.update(cx, |t, cx| t.apply_theme(cx));
+            }
+            ws.persist(cx);
+            cx.notify();
+        });
+    }
+    cx.refresh_windows();
 }
