@@ -24,7 +24,7 @@ pub fn needs_import() -> bool {
     std::env::var_os("TERM").is_none()
 }
 
-/// Run `$SHELL -l -i -c 'env -0'` and adopt its variables. Hard 3 s budget: a slow or
+/// Run `$SHELL -l -i -c 'env -0'` and adopt its variables. Hard 6 s budget: a slow or
 /// interactive `.zshrc`, or a background job that keeps stdout open, must never stall startup.
 pub fn import_login_env() -> &'static str {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
@@ -48,7 +48,7 @@ pub fn import_login_env() -> &'static str {
         let _ = stdout.read_to_end(&mut out);
         let _ = tx.send(out);
     });
-    let deadline = Duration::from_secs(3);
+    let deadline = Duration::from_secs(6);
     let out = match rx.recv_timeout(deadline) {
         Ok(out) => out,
         Err(_) => {
@@ -75,6 +75,34 @@ pub fn import_login_env() -> &'static str {
         }
     }
     "ok"
+}
+
+/// Safety net when the login-shell import fails (e.g. a cold `.zshrc` right after a reboot
+/// exceeds the time budget): append the usual user tool dirs that exist but are missing
+/// from PATH, so gh/git/node from Homebrew etc. are still found.
+pub fn ensure_common_paths() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        "/opt/homebrew/bin".to_string(),
+        "/opt/homebrew/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+        format!("{home}/.local/bin"),
+        format!("{home}/.cargo/bin"),
+        format!("{home}/.bun/bin"),
+    ];
+    let current = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    let mut parts: Vec<String> = current.split(':').filter(|s| !s.is_empty()).map(String::from).collect();
+    let mut changed = false;
+    for dir in candidates {
+        if !parts.contains(&dir) && std::path::Path::new(&dir).is_dir() {
+            parts.push(dir);
+            changed = true;
+        }
+    }
+    if changed {
+        // SAFETY: called from main() before other threads are started.
+        unsafe { std::env::set_var("PATH", parts.join(":")) };
+    }
 }
 
 #[cfg(test)]

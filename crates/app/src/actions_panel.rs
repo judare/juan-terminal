@@ -267,7 +267,17 @@ fn latest_per_workflow(runs: &[Run]) -> Vec<Run> {
 }
 
 /// (succeeded, total, failed) over finished runs: skipped/cancelled count only in the total.
-fn run_summary(runs: &[Run]) -> (usize, usize, usize) {
+/// Counts jobs (GitHub's checks: a workflow that fans out into N jobs counts N) once every
+/// run's jobs are loaded; until then, counts runs.
+fn run_summary(runs: &[Run], jobs: &HashMap<u64, Vec<Job>>) -> (usize, usize, usize) {
+    if runs.iter().all(|r| jobs.contains_key(&r.id)) {
+        let all: Vec<&Job> = runs.iter().flat_map(|r| &jobs[&r.id]).collect();
+        if !all.is_empty() {
+            let ok = all.iter().filter(|j| j.conclusion == "success").count();
+            let failed = all.iter().filter(|j| matches!(j.conclusion.as_str(), "failure" | "timed_out" | "startup_failure")).count();
+            return (ok, all.len(), failed);
+        }
+    }
     let ok = runs.iter().filter(|r| r.conclusion == "success").count();
     let failed = runs.iter().filter(|r| matches!(r.conclusion.as_str(), "failure" | "timed_out" | "startup_failure")).count();
     (ok, runs.len(), failed)
@@ -504,7 +514,14 @@ impl ActionsPanel {
                     }
                     Err(e) => repo.error = Some(e),
                 }
-                let want: Vec<u64> = repo.runs.iter().filter(|r| r.active() || this.expanded_runs.contains(&r.id)).map(|r| r.id).collect();
+                // Latest run per workflow also needs its jobs: the summary badge counts jobs (like GitHub's checks).
+                let latest: HashSet<u64> = latest_per_workflow(&repo.runs).iter().map(|r| r.id).collect();
+                let want: Vec<u64> = repo
+                    .runs
+                    .iter()
+                    .filter(|r| r.active() || this.expanded_runs.contains(&r.id) || (latest.contains(&r.id) && !this.jobs.contains_key(&r.id)))
+                    .map(|r| r.id)
+                    .collect();
                 for id in want {
                     this.load_jobs(dir.clone(), id, cx);
                 }
@@ -670,6 +687,95 @@ impl ActionsPanel {
             .into_any_element()
     }
 
+    /// One job as a top-level row, labelled `Workflow / job`. Click opens its log.
+    fn render_flat_job(&self, run: &Run, job: &Job, indent: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (id, jid) = (run.id, job.id);
+        let (ic, color) = status_look(&job.status, &job.conclusion);
+        let running_step = job.steps.iter().find(|s| s.status == "in_progress").map(|s| s.name.clone());
+        let meta = if self.busy.contains(&jid) || self.busy.contains(&id) {
+            "…".to_string()
+        } else if is_active(&job.status) {
+            match running_step {
+                Some(st) => format!("{} · {st}", duration(&job.started, &job.completed)),
+                None => duration(&job.started, &job.completed),
+            }
+        } else {
+            ago(if job.completed.is_empty() { &run.created } else { &job.completed })
+        };
+        let tip: SharedString = format!(
+            "{} / {}\n#{} {}\n{} · {} · {}\n{}",
+            run.workflow,
+            job.name,
+            run.number,
+            run.title,
+            run.branch,
+            run.event,
+            duration(&job.started, &job.completed),
+            status_text(&job.status, &job.conclusion)
+        )
+        .into();
+        let url = if job.url.is_empty() { run.url.clone() } else { job.url.clone() };
+        let group = SharedString::from(format!("fjob-g-{jid}"));
+        let mut actions = div().flex().flex_none().items_center();
+        actions = actions.child(icon_action(SharedString::from(format!("fjob-log-{jid}")), "icons/doc.svg", "Ver logs / detalle").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            this.open_log(id, Some(jid), cx);
+        })));
+        actions = if run.active() {
+            actions.child(icon_action(SharedString::from(format!("fjob-cancel-{jid}")), "icons/action-stop.svg", "Abortar workflow").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.run_command(id, "cancel", cx);
+            })))
+        } else {
+            actions.child(icon_action(SharedString::from(format!("fjob-rerun-{jid}")), "icons/action-rerun.svg", "Re-ejecutar workflow").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.run_command(id, "rerun", cx);
+            })))
+        };
+        actions = actions.child(icon_action(SharedString::from(format!("fjob-web-{jid}")), "icons/external.svg", "Abrir en GitHub").on_click(move |_: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            let _ = Command::new("open").arg(&url).spawn();
+        }));
+        div()
+            .id(SharedString::from(format!("fjob-{jid}")))
+            .group(group.clone())
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(px(26.))
+            .pl(px(if indent { 22. } else { 12. }))
+            .pr(px(4.))
+            .mx(px(4.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|st| st.bg(theme::rgb(theme::HOVER)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_log(id, Some(jid), cx)))
+            .tooltip(move |_, cx| cx.new(|_| DynTooltip(tip.clone())).into())
+            .child(gpui::svg().path(ic).size(px(13.)).flex_none().text_color(theme::rgb(color)))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(12.))
+                    .child(div().flex_shrink_0().max_w(px(130.)).overflow_hidden().text_ellipsis().text_color(theme::rgb(theme::TEXT_MUTED)).child(format!("{} /\u{a0}", run.workflow)))
+                    .child(div().min_w_0().overflow_hidden().text_ellipsis().child(job.name.clone())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.5))
+                    .text_color(theme::rgb(if is_active(&job.status) { theme::MODIFIED } else { theme::TEXT_FAINT }))
+                    .group_hover(group.clone(), |s| s.invisible())
+                    .child(meta),
+            )
+            .child(div().absolute().right(px(4.)).top_0().bottom_0().flex().items_center().rounded(px(5.)).bg(theme::rgb(theme::HOVER)).invisible().group_hover(group, |s| s.visible()).child(actions))
+            .into_any_element()
+    }
+
     fn render_run(&self, run: &Run, indent: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let id = run.id;
         let (ic, color) = status_look(&run.status, &run.conclusion);
@@ -806,7 +912,7 @@ impl Render for ActionsPanel {
             let latest = latest_per_workflow(&repo.runs);
             if multi {
                 let active = latest.iter().filter(|r| r.active()).count();
-                let summary = (active == 0 && !latest.is_empty()).then(|| run_summary(&latest));
+                let summary = (active == 0 && !latest.is_empty()).then(|| run_summary(&latest, &self.jobs));
                 body = body.child(
                     div()
                         .id(("actions-repo", ix))
@@ -867,8 +973,17 @@ impl Render for ActionsPanel {
                 body = body.child(div().px(px(22.)).h(px(24.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(msg));
                 continue;
             }
+            // Flat like GitHub's checks: one row per job ("Workflow / job"); a run whose jobs
+            // aren't loaded yet shows as its collapsible run row.
             for run in &latest {
-                body = body.child(self.render_run(run, multi, cx));
+                match self.jobs.get(&run.id).filter(|j| !j.is_empty()) {
+                    Some(jobs) => {
+                        for job in jobs {
+                            body = body.child(self.render_flat_job(run, job, multi, cx));
+                        }
+                    }
+                    None => body = body.child(self.render_run(run, multi, cx)),
+                }
             }
         }
         root = root.child(body);
