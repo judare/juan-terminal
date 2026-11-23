@@ -224,6 +224,9 @@ pub struct Workspace {
     locked: HashSet<String>,
     /// Project already warned that it closes soon.
     close_warned: Option<String>,
+    /// Hosts last sent to /etc/hosts (so the 20 s tick only re-applies when a website
+    /// schedule opens or closes, and a cancelled password prompt isn't repeated).
+    applied_hosts: Option<Vec<String>>,
     pub(crate) terminals: HashMap<String, Tabs<TerminalView>>,
     pub(crate) editors: HashMap<String, Tabs<EditorView>>,
     branches: HashMap<PathBuf, Option<String>>,
@@ -315,6 +318,7 @@ impl Workspace {
             settings: Settings::default(),
             locked: HashSet::new(),
             close_warned: None,
+            applied_hosts: None,
             terminals: HashMap::new(),
             editors: HashMap::new(),
             branches: HashMap::new(),
@@ -1761,6 +1765,11 @@ impl Workspace {
     }
 
     fn schedule_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Website schedules: only the primary window touches /etc/hosts on the tick.
+        let (now, offset) = clock_now();
+        if self.primary && self.applied_hosts.as_ref() != Some(&self.settings.blocked_hosts_at(now, offset).0) {
+            self.apply_blocked_websites(cx);
+        }
         let changed = self.refresh_locks();
         let Some(active) = self.state.active_project.clone() else {
             if changed {
@@ -1829,9 +1838,11 @@ impl Workspace {
     }
 
     fn apply_blocked_websites(&mut self, cx: &mut Context<Self>) {
-        let hosts = self.settings.blocked_hosts();
+        let (now, offset) = clock_now();
+        let (hosts, release) = self.settings.blocked_hosts_at(now, offset);
+        self.applied_hosts = Some(hosts.clone());
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { crate::website_block::apply(&hosts) }).await;
+            let res = cx.background_executor().spawn(async move { crate::website_block::apply(&hosts, &release) }).await;
             let _ = this.update(cx, |this, cx| {
                 match res {
                     Ok(a) if a.pending > 0 => {

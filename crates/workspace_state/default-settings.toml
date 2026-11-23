@@ -18,6 +18,15 @@
 #   schedule = [
 #     { days = ["mon", "tue", "wed", "thu", "fri"], start = "09:00", end = "18:00" },
 #   ]
+#
+# [[website_schedules]]: sites blocked except during their "allowed" hours (same format as a
+#   project schedule; utc_offset optional). Switches on its own when the hours start/end.
+#
+#   [[website_schedules]]
+#   name = "social"
+#   utc_offset = "-05:00"
+#   websites = ["instagram.com", "x.com"]
+#   allowed = [{ days = ["sun"], start = "00:00", end = "00:00" }]   # Sundays only
 
 blocked_websites = [
   # Adult content
