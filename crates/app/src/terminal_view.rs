@@ -1,7 +1,7 @@
 //! GPUI view for a terminal session: grid rendering, keyboard/IME input, selection, scrolling.
 
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use gpui::{
@@ -28,6 +28,8 @@ pub enum TerminalViewEvent {
     Exited(Option<i32>),
     /// The user looked at this terminal: its attention badge was cleared.
     AttentionCleared,
+    /// ⌘-click on a file path in the output.
+    OpenPath { path: PathBuf, line: Option<usize>, column: Option<usize> },
 }
 
 /// Claude (via hooks) says this terminal needs a look.
@@ -273,6 +275,17 @@ impl TerminalView {
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         let Some((row, col, right)) = self.cell_at(event.position) else { return };
+        if event.modifiers.platform {
+            let rows: Vec<String> = (0..self.snapshot.rows).map(|r| self.snapshot.row_text(r)).collect();
+            let wrapped: Vec<bool> = (0..self.snapshot.rows)
+                .map(|r| self.snapshot.row(r).last().is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE)))
+                .collect();
+            let cwd = self.current_cwd();
+            if let Some((path, line, column)) = path_at(&rows, &wrapped, row, col, cwd.as_deref()) {
+                cx.emit(TerminalViewEvent::OpenPath { path, line, column });
+                return;
+            }
+        }
         if event.modifiers.shift {
             self.session.update_selection(row, col, right);
         } else {
@@ -494,6 +507,123 @@ pub struct PrepaintState {
 
 fn hsla(c: Rgb) -> Hsla {
     Rgba { r: c.r as f32 / 255., g: c.g as f32 / 255., b: c.b as f32 / 255., a: 1. }.into()
+}
+
+const PATH_STOP: &[char] = &['"', '\'', '`', '(', ')', '<', '>', '[', ']', '{', '}', '|', ',', ';'];
+
+/// Token (non-space, non-quote run) around char index `col` of `line`, with its char range.
+fn token_at(line: &[char], col: usize) -> Option<(usize, usize)> {
+    let ok = |c: char| !c.is_whitespace() && !PATH_STOP.contains(&c);
+    if col >= line.len() || !ok(line[col]) {
+        return None;
+    }
+    let mut a = col;
+    while a > 0 && ok(line[a - 1]) {
+        a -= 1;
+    }
+    let mut b = col + 1;
+    while b < line.len() && ok(line[b]) {
+        b += 1;
+    }
+    Some((a, b))
+}
+
+/// Split "path:12:3" / "path:12" into parts (only when the suffixes are numbers).
+fn split_line_col(t: &str) -> (&str, Option<usize>, Option<usize>) {
+    let mut parts = t.rsplitn(3, ':').collect::<Vec<_>>();
+    parts.reverse();
+    match parts.as_slice() {
+        [p, l, c] if l.parse::<usize>().is_ok() && c.parse::<usize>().is_ok() => (p, l.parse().ok(), c.parse().ok()),
+        [p, l] if l.parse::<usize>().is_ok() => (p, l.parse().ok(), None),
+        [p, rest @ ..] if rest.len() == 1 && rest[0].parse::<usize>().is_ok() => (p, rest[0].parse().ok(), None),
+        _ => {
+            // "a:b:12" → path may itself contain ':'
+            if let Some((p, l)) = t.rsplit_once(':') {
+                if let Ok(n) = l.parse::<usize>() {
+                    return (p, Some(n), None);
+                }
+            }
+            (t, None, None)
+        }
+    }
+}
+
+fn resolve_path(t: &str, cwd: Option<&Path>) -> Option<(PathBuf, Option<usize>, Option<usize>)> {
+    let t = t.strip_prefix("file://").unwrap_or(t);
+    // Trailing sentence punctuation is not part of the path ("…/a.png.").
+    for cand in [t, t.trim_end_matches(['.', ':', '!', '?'])] {
+        let (p, line, col) = split_line_col(cand);
+        if p.is_empty() {
+            continue;
+        }
+        let path = if let Some(rest) = p.strip_prefix("~/") {
+            PathBuf::from(std::env::var_os("HOME")?).join(rest)
+        } else if p.starts_with('/') {
+            PathBuf::from(p)
+        } else {
+            cwd?.join(p)
+        };
+        if path.exists() {
+            return Some((path, line, col));
+        }
+    }
+    None
+}
+
+/// Find an existing file path under (row, col). Handles soft-wrapped rows (terminal wrap
+/// flag) and hard-wrapped ones (TUIs like Claude Code break long paths onto the next line,
+/// usually indented): pieces are joined and the longest existing path wins.
+pub fn path_at(rows: &[String], wrapped: &[bool], row: usize, col: usize, cwd: Option<&Path>) -> Option<(PathBuf, Option<usize>, Option<usize>)> {
+    let chars: Vec<Vec<char>> = rows.iter().map(|r| r.chars().collect()).collect();
+    let (a, b) = token_at(chars.get(row)?, col)?;
+    let tok = |r: usize, a: usize, b: usize| chars[r][a..b].iter().collect::<String>();
+    let ends_row = |r: usize, b: usize| chars[r][b..].iter().all(|c| c.is_whitespace());
+    let starts_row = |r: usize, a: usize| chars[r][..a].iter().all(|c| c.is_whitespace());
+    // Walk up while this piece starts its row and the previous row ends with a token.
+    let mut pieces = vec![tok(row, a, b)];
+    let mut first_row = row;
+    let mut first_a = a;
+    while first_row > 0 && (starts_row(first_row, first_a) || wrapped[first_row - 1]) {
+        let prev = &chars[first_row - 1];
+        let end = prev.iter().rposition(|c| !c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
+        if end == 0 {
+            break;
+        }
+        let Some((pa, pb)) = token_at(prev, end - 1) else { break };
+        if pb != end {
+            break;
+        }
+        pieces.insert(0, tok(first_row - 1, pa, pb));
+        first_row -= 1;
+        first_a = pa;
+        if pieces.len() > 6 {
+            break;
+        }
+    }
+    let center = pieces.len() - 1;
+    let mut last_row = row;
+    let mut last_b = b;
+    while last_row + 1 < chars.len() && ends_row(last_row, last_b) && pieces.len() < 12 {
+        let next = &chars[last_row + 1];
+        let Some(start) = next.iter().position(|c| !c.is_whitespace()) else { break };
+        let Some((na, nb)) = token_at(next, start) else { break };
+        pieces.push(tok(last_row + 1, na, nb));
+        last_row += 1;
+        last_b = nb;
+    }
+    // Try every contiguous run that includes the clicked piece, longest first.
+    let mut best: Option<(usize, (PathBuf, Option<usize>, Option<usize>))> = None;
+    for i in 0..=center {
+        for j in center..pieces.len() {
+            let joined: String = pieces[i..=j].concat();
+            if let Some(found) = resolve_path(&joined, cwd) {
+                if best.as_ref().is_none_or(|(len, _)| joined.len() > *len) {
+                    best = Some((joined.len(), found));
+                }
+            }
+        }
+    }
+    best.map(|(_, f)| f)
 }
 
 /// How a visible row is drawn, from the shell-integration markers.
@@ -982,6 +1112,37 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tone_tests {
     use super::*;
+
+    #[test]
+    fn finds_paths_including_hard_wrapped_ones() {
+        let dir = std::env::temp_dir().join(format!("jt-path-{}", std::process::id()));
+        let deep = dir.join("projects/-Users-x-Desktop-repositories-blokay/tool-results");
+        std::fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("shot.png");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(dir.join("main.rs"), b"fn main(){}").unwrap();
+        let full = file.display().to_string();
+        // Claude-style hard wrap: path split mid-word, continuation indented, trailing '.'.
+        let cut = full.find("repositories").unwrap() + 4;
+        let rows = vec![
+            "  El PNG quedó en".to_string(),
+            format!("  {}", &full[..cut]),
+            format!("  {}.", &full[cut..]),
+            String::new(),
+        ];
+        let wrapped = vec![false; rows.len()];
+        let hit = path_at(&rows, &wrapped, 1, 5, None).unwrap();
+        assert_eq!(hit.0, file);
+        let hit = path_at(&rows, &wrapped, 2, 4, None).unwrap();
+        assert_eq!(hit.0, file, "clicking the second half works too");
+        // Relative path with line:col, resolved against the terminal cwd.
+        let rows = vec!["error at main.rs:12:5 here".to_string()];
+        let hit = path_at(&rows, &[false], 0, 10, Some(&dir)).unwrap();
+        assert_eq!((hit.0, hit.1, hit.2), (dir.join("main.rs"), Some(12), Some(5)));
+        // Plain words are not paths.
+        assert!(path_at(&rows, &[false], 0, 1, Some(&dir)).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn blocks_from_marks() {
