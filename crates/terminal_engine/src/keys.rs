@@ -164,9 +164,33 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// Encode a mouse report for an app that enabled mouse tracking.
+/// `button`: 0 left, 1 middle, 2 right, 3 release (legacy), 64/65 wheel up/down; add 32 for
+/// motion. `col`/`row` are 0-based grid cells. `pressed` = false sends a release.
+pub fn encode_mouse(button: u8, col: usize, row: usize, pressed: bool, sgr: bool, shift: bool, alt: bool, ctrl: bool) -> Vec<u8> {
+    let mods = (shift as u8) * 4 + (alt as u8) * 8 + (ctrl as u8) * 16;
+    let (x, y) = (col + 1, row + 1);
+    if sgr {
+        format!("\x1b[<{};{x};{y}{}", button + mods, if pressed { 'M' } else { 'm' }).into_bytes()
+    } else {
+        // X10/normal encoding: values offset by 32, coordinates capped at 223.
+        let b = if pressed { button } else { 3 } + mods + 32;
+        vec![0x1b, b'[', b'M', b, (x.min(223) + 32) as u8, (y.min(223) + 32) as u8]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_reports() {
+        assert_eq!(encode_mouse(0, 4, 9, true, true, false, false, false), b"\x1b[<0;5;10M");
+        assert_eq!(encode_mouse(0, 4, 9, false, true, false, false, false), b"\x1b[<0;5;10m");
+        assert_eq!(encode_mouse(64, 0, 0, true, true, false, false, false), b"\x1b[<64;1;1M");
+        assert_eq!(encode_mouse(32, 1, 1, true, true, true, false, false), b"\x1b[<36;2;2M");
+        assert_eq!(encode_mouse(65, 2, 3, true, false, false, false, false), vec![0x1b, b'[', b'M', 65 + 32, 3 + 32, 4 + 32]);
+    }
 
     fn enc(key: &str, f: impl FnOnce(&mut KeyInput)) -> Option<Vec<u8>> {
         let mut k = KeyInput { key, ..Default::default() };

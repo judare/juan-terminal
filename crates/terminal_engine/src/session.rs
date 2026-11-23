@@ -189,6 +189,18 @@ pub struct TermModeFlags {
     pub alt_screen: bool,
     pub alternate_scroll: bool,
     pub focus_in_out: bool,
+    /// The app asked for mouse reports (DECSET 1000 / 1002 / 1003).
+    pub mouse_click: bool,
+    pub mouse_drag: bool,
+    pub mouse_motion: bool,
+    /// SGR encoding (DECSET 1006).
+    pub sgr_mouse: bool,
+}
+
+impl TermModeFlags {
+    pub fn mouse_report(&self) -> bool {
+        self.mouse_click || self.mouse_drag || self.mouse_motion
+    }
 }
 
 impl Snapshot {
@@ -391,6 +403,10 @@ impl TerminalSession {
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
             alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
             focus_in_out: mode.contains(TermMode::FOCUS_IN_OUT),
+            mouse_click: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            mouse_drag: mode.contains(TermMode::MOUSE_DRAG),
+            mouse_motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
         };
 
         let cursor = content.cursor;
