@@ -67,6 +67,48 @@ impl FileDiff {
         out
     }
 
+    /// A patch for one change block (`lines` range of hunk `hi`, see [`Hunk::change_blocks`])
+    /// with up to 3 lines of surrounding context, suitable for `git apply --cached --unidiff-zero`.
+    /// Lets full-context diffs (one hunk per file) still stage change by change.
+    pub fn block_patch(&self, hi: usize, block: std::ops::Range<usize>) -> String {
+        const CTX: usize = 3;
+        let hunk = &self.hunks[hi];
+        let lines = &hunk.lines;
+        let mut s = block.start;
+        while s > 0 && block.start - s < CTX && lines[s - 1].kind == DiffLineKind::Context {
+            s -= 1;
+        }
+        let mut e = block.end;
+        while e < lines.len() && e - block.end < CTX && lines[e].kind == DiffLineKind::Context {
+            e += 1;
+        }
+        let slice = &lines[s..e];
+        let ol = slice.iter().filter(|l| l.old_no.is_some()).count();
+        let nl = slice.iter().filter(|l| l.new_no.is_some()).count();
+        // Empty ranges name the line *before* the change (0 at the start of the file).
+        let os = slice.iter().find_map(|l| l.old_no).unwrap_or_else(|| (hunk.old_start + lines[..s].iter().filter(|l| l.old_no.is_some()).count()).saturating_sub(1));
+        let ns = slice.iter().find_map(|l| l.new_no).unwrap_or_else(|| (hunk.new_start + lines[..s].iter().filter(|l| l.new_no.is_some()).count()).saturating_sub(1));
+        let mut out = String::new();
+        for h in &self.header {
+            out.push_str(h);
+            out.push('\n');
+        }
+        out.push_str(&format!("@@ -{os},{ol} +{ns},{nl} @@\n"));
+        for l in slice {
+            out.push(match l.kind {
+                DiffLineKind::Context => ' ',
+                DiffLineKind::Added => '+',
+                DiffLineKind::Removed => '-',
+            });
+            out.push_str(&l.text);
+            out.push('\n');
+            if l.no_newline {
+                out.push_str("\\ No newline at end of file\n");
+            }
+        }
+        out
+    }
+
     pub fn stats(&self) -> (usize, usize) {
         let mut add = 0;
         let mut del = 0;
@@ -171,27 +213,52 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
     files
 }
 
+impl Hunk {
+    /// Maximal runs of non-context lines (line index ranges): the individual changes.
+    pub fn change_blocks(&self) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.lines.len() {
+            if self.lines[i].kind == DiffLineKind::Context {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < self.lines.len() && self.lines[i].kind != DiffLineKind::Context {
+                i += 1;
+            }
+            out.push(start..i);
+        }
+        out
+    }
+}
+
 /// Pair lines for side-by-side display: removed lines on the left aligned with added lines
 /// on the right; context on both sides.
 pub fn side_by_side(hunk: &Hunk) -> Vec<(Option<&DiffLine>, Option<&DiffLine>)> {
+    side_by_side_indices(hunk).into_iter().map(|(l, r)| (l.map(|i| &hunk.lines[i]), r.map(|i| &hunk.lines[i]))).collect()
+}
+
+/// [`side_by_side`] as line indices into `hunk.lines`.
+pub fn side_by_side_indices(hunk: &Hunk) -> Vec<(Option<usize>, Option<usize>)> {
     let mut rows = Vec::new();
     let mut i = 0;
     let lines = &hunk.lines;
     while i < lines.len() {
         match lines[i].kind {
             DiffLineKind::Context => {
-                rows.push((Some(&lines[i]), Some(&lines[i])));
+                rows.push((Some(i), Some(i)));
                 i += 1;
             }
             _ => {
                 let mut removed = Vec::new();
                 let mut added = Vec::new();
                 while i < lines.len() && lines[i].kind == DiffLineKind::Removed {
-                    removed.push(&lines[i]);
+                    removed.push(i);
                     i += 1;
                 }
                 while i < lines.len() && lines[i].kind == DiffLineKind::Added {
-                    added.push(&lines[i]);
+                    added.push(i);
                     i += 1;
                 }
                 for k in 0..removed.len().max(added.len()) {
@@ -201,6 +268,76 @@ pub fn side_by_side(hunk: &Hunk) -> Vec<(Option<&DiffLine>, Option<&DiffLine>)> 
         }
     }
     rows
+}
+
+/// Byte ranges that differ between a removed line and the added line replacing it
+/// (word-level LCS), like VS Code's inline change highlight. Empty when the lines share
+/// nothing meaningful (the whole line is already marked as changed).
+pub fn inline_changes(old: &str, new: &str) -> (Vec<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>) {
+    let a = tokenize(old);
+    let b = tokenize(new);
+    if a.is_empty() || b.is_empty() || a.len() * b.len() > 250_000 {
+        return (Vec::new(), Vec::new());
+    }
+    let (n, m) = (a.len(), b.len());
+    // lcs[i][j] = LCS length of a[i..], b[j..]
+    let mut lcs = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[at(i, j)] = if old[a[i].clone()] == new[b[j].clone()] { lcs[at(i + 1, j + 1)] + 1 } else { lcs[at(i + 1, j)].max(lcs[at(i, j + 1)]) };
+        }
+    }
+    let mut keep_a = vec![false; n];
+    let mut keep_b = vec![false; m];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old[a[i].clone()] == new[b[j].clone()] {
+            keep_a[i] = true;
+            keep_b[j] = true;
+            i += 1;
+            j += 1;
+        } else if lcs[at(i + 1, j)] >= lcs[at(i, j + 1)] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let meaningful = a.iter().zip(&keep_a).any(|(r, k)| *k && !old[r.clone()].trim().is_empty());
+    if !meaningful {
+        return (Vec::new(), Vec::new());
+    }
+    let ranges = |toks: &[std::ops::Range<usize>], keep: &[bool]| {
+        let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+        for (r, k) in toks.iter().zip(keep) {
+            if *k {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.end == r.start => last.end = r.end,
+                _ => out.push(r.clone()),
+            }
+        }
+        out
+    };
+    (ranges(&a, &keep_a), ranges(&b, &keep_b))
+}
+
+/// Words (alphanumeric/underscore runs), whitespace runs and single punctuation characters.
+fn tokenize(s: &str) -> Vec<std::ops::Range<usize>> {
+    let class = |c: char| if c.is_alphanumeric() || c == '_' { 1 } else if c.is_whitespace() { 2 } else { 0 };
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut prev = None;
+    for (i, c) in s.char_indices() {
+        let k = class(c);
+        let end = i + c.len_utf8();
+        match out.last_mut() {
+            Some(last) if k != 0 && prev == Some(k) => last.end = end,
+            _ => out.push(i..end),
+        }
+        prev = Some(k);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -252,5 +389,23 @@ index 111..222 100644
         assert_eq!(rows[1].1.unwrap().text, "TWO");
         assert!(rows[2].0.is_none());
         assert_eq!(rows[2].1.unwrap().text, "three");
+    }
+
+    #[test]
+    fn inline_changes_marks_changed_words() {
+        let (a, b) = inline_changes("let x = foo(1);", "let x = bar(1, 2);");
+        assert_eq!(a, vec![8..11]);
+        assert_eq!(&"let x = bar(1, 2);"[b[0].clone()], "bar");
+        assert_eq!(&"let x = bar(1, 2);"[b[1].clone()], ", 2");
+        assert_eq!(inline_changes("abc", "xyz"), (vec![], vec![]));
+    }
+
+    #[test]
+    fn block_patch_has_own_header() {
+        let d = parse_diff(SAMPLE);
+        let h = &d[0].hunks[0];
+        assert_eq!(h.change_blocks(), vec![1..4]);
+        let p = d[0].block_patch(0, 1..4);
+        assert!(p.contains("@@ -1,3 +1,4 @@\n one\n-two\n+TWO\n+three\n four\n"), "{p}");
     }
 }

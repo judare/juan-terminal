@@ -1,10 +1,11 @@
-//! Diff viewer: unified or side-by-side, syntax highlighted, hunk navigation and
-//! per-hunk stage/unstage for working-tree/index diffs.
+//! Diff viewer in the style of VS Code: the whole file (single-file diffs carry full context),
+//! side-by-side or unified, syntax highlighted, with the changed words inside each modified line
+//! highlighted. Navigation and stage/unstage work per change block.
 
 use std::path::{Path, PathBuf};
 
 use editor::{HIGHLIGHT_NAMES, HighlightSpan, Language, highlight};
-use git_engine::{DiffLine, DiffLineKind, FileDiff, side_by_side};
+use git_engine::{DiffLineKind, FileDiff, inline_changes, side_by_side_indices};
 use gpui::{
     App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, HighlightStyle, KeyBinding,
     Render, ScrollStrategy, SharedString, StyledText, UniformListScrollHandle, Window, actions, div,
@@ -59,6 +60,15 @@ enum Row {
 /// Per-line highlight spans (byte ranges within the line) for old and new sides.
 type LineSpans = Vec<(std::ops::Range<usize>, u16)>;
 
+/// One contiguous run of changed lines.
+struct Block {
+    file: usize,
+    hunk: usize,
+    lines: std::ops::Range<usize>,
+    /// First row showing this block.
+    row: usize,
+}
+
 pub struct DiffView {
     pub title: SharedString,
     pub source: DiffSource,
@@ -67,9 +77,13 @@ pub struct DiffView {
     root: Option<PathBuf>,
     side_by_side: bool,
     rows: Vec<Row>,
-    hunk_rows: Vec<usize>,
+    blocks: Vec<Block>,
+    /// Row index -> block whose first row it is (carries the block's actions).
+    row_block: std::collections::HashMap<usize, usize>,
     /// [file][hunk][line] -> spans
     spans: Vec<Vec<Vec<LineSpans>>>,
+    /// [file][hunk][line] -> changed byte ranges within a modified line.
+    emphasis: Vec<Vec<Vec<Vec<std::ops::Range<usize>>>>>,
     scroll: UniformListScrollHandle,
     current_hunk: usize,
     focus_handle: FocusHandle,
@@ -80,15 +94,18 @@ impl EventEmitter<DiffViewEvent> for DiffView {}
 impl DiffView {
     pub fn new(title: impl Into<SharedString>, source: DiffSource, root: Option<PathBuf>, files: Vec<FileDiff>, cx: &mut Context<Self>) -> Self {
         let spans = files.iter().map(highlight_file).collect();
+        let emphasis = files.iter().map(emphasis_file).collect();
         let mut this = Self {
             title: title.into(),
             source,
             files,
             root,
-            side_by_side: false,
+            side_by_side: true,
             rows: Vec::new(),
-            hunk_rows: Vec::new(),
+            blocks: Vec::new(),
+            row_block: Default::default(),
             spans,
+            emphasis,
             scroll: UniformListScrollHandle::new(),
             current_hunk: 0,
             focus_handle: cx.focus_handle(),
@@ -99,6 +116,7 @@ impl DiffView {
 
     pub fn set_files(&mut self, files: Vec<FileDiff>, cx: &mut Context<Self>) {
         self.spans = files.iter().map(highlight_file).collect();
+        self.emphasis = files.iter().map(emphasis_file).collect();
         self.files = files;
         self.rebuild_rows();
         cx.notify();
@@ -110,7 +128,8 @@ impl DiffView {
 
     fn rebuild_rows(&mut self) {
         self.rows.clear();
-        self.hunk_rows.clear();
+        self.blocks.clear();
+        self.row_block.clear();
         let multi = self.files.len() > 1;
         for (fi, file) in self.files.iter().enumerate() {
             if multi {
@@ -120,31 +139,71 @@ impl DiffView {
                 self.rows.push(Row::Binary);
                 continue;
             }
+            // A single hunk starting at the top is the whole file: no `@@` separator.
+            let whole_file = file.hunks.len() == 1 && file.hunks[0].old_start <= 1 && file.hunks[0].new_start <= 1;
             for (hi, hunk) in file.hunks.iter().enumerate() {
-                self.hunk_rows.push(self.rows.len());
-                self.rows.push(Row::HunkHeader(fi, hi));
+                if !whole_file {
+                    self.rows.push(Row::HunkHeader(fi, hi));
+                }
+                let mut blocks = hunk.change_blocks().into_iter().peekable();
+                let first_row = self.rows.len();
                 if self.side_by_side {
-                    for (l, r) in side_by_side(hunk) {
-                        let idx = |x: Option<&DiffLine>| x.and_then(|x| hunk.lines.iter().position(|y| std::ptr::eq(x, y)));
-                        self.rows.push(Row::Split(fi, hi, idx(l), idx(r)));
+                    for (l, r) in side_by_side_indices(hunk) {
+                        self.rows.push(Row::Split(fi, hi, l, r));
                     }
                 } else {
                     for li in 0..hunk.lines.len() {
                         self.rows.push(Row::Unified(fi, hi, li));
                     }
                 }
+                // Map each block's first line to the row that shows it.
+                for (ri, row) in self.rows[first_row..].iter().enumerate() {
+                    let Some(b) = blocks.peek() else { break };
+                    let shows = match row {
+                        Row::Unified(_, _, li) => *li == b.start,
+                        Row::Split(_, _, l, r) => l.is_some_and(|x| x >= b.start) || r.is_some_and(|x| x >= b.start),
+                        _ => false,
+                    };
+                    if shows {
+                        let lines = blocks.next().unwrap();
+                        self.row_block.insert(first_row + ri, self.blocks.len());
+                        self.blocks.push(Block { file: fi, hunk: hi, lines, row: first_row + ri });
+                    }
+                }
             }
         }
+        self.current_hunk = self.current_hunk.min(self.blocks.len().saturating_sub(1));
     }
 
     fn jump_hunk(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.hunk_rows.is_empty() {
+        if self.blocks.is_empty() {
             return;
         }
-        let n = self.hunk_rows.len() as isize;
+        let n = self.blocks.len() as isize;
         self.current_hunk = (self.current_hunk as isize + delta).rem_euclid(n) as usize;
-        self.scroll.scroll_to_item(self.hunk_rows[self.current_hunk], ScrollStrategy::Top);
+        self.scroll.scroll_to_item(self.blocks[self.current_hunk].row, ScrollStrategy::Center);
         cx.notify();
+    }
+
+    /// Open / Stage buttons for the change block starting at row `ix`.
+    fn block_actions(&self, ix: usize, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let b = &self.blocks[*self.row_block.get(&ix)?];
+        let lines = &self.files[b.file].hunks[b.hunk].lines;
+        let line = lines[b.lines.clone()].iter().chain(&lines[b.lines.end..]).find_map(|l| l.new_no).unwrap_or(1).saturating_sub(1);
+        let mut row = div().flex().flex_none().gap(px(6.)).px(px(8.));
+        if let Some(path) = self.file_path(b.file).filter(|p| p.is_file()) {
+            row = row.child(toolbar_button(("open-block", ix), "Open").on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                cx.emit(DiffViewEvent::OpenFile { path: path.clone(), line })
+            })));
+        }
+        if let DiffSource::Changes { repo, staged, .. } = &self.source {
+            let (repo, staged) = (repo.clone(), *staged);
+            let patch = self.files[b.file].block_patch(b.hunk, b.lines.clone());
+            row = row.child(toolbar_button(("stage-block", ix), if staged { "Unstage" } else { "Stage" }).on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                cx.emit(DiffViewEvent::ApplyHunk { repo: repo.clone(), patch: patch.clone(), reverse: staged })
+            })));
+        }
+        Some(row)
     }
 
     fn file_path(&self, fi: usize) -> Option<PathBuf> {
@@ -154,16 +213,35 @@ impl DiffView {
 
     fn render_code(&self, fi: usize, hi: usize, li: usize) -> StyledText {
         let line = &self.files[fi].hunks[hi].lines[li];
-        let text = line.text.replace('\t', "    ");
-        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = if text.len() == line.text.len() {
-            self.spans[fi][hi][li]
-                .iter()
-                .filter(|(r, _)| r.end <= text.len())
-                .map(|(r, k)| (r.clone(), HighlightStyle { color: Some(theme::rgb(theme::syntax_color(HIGHLIGHT_NAMES[*k as usize]))), ..Default::default() }))
-                .collect()
-        } else {
-            Vec::new()
+        // Expand tabs, keeping a map from source byte offsets to display offsets.
+        let mut text = String::with_capacity(line.text.len());
+        let mut map = Vec::with_capacity(line.text.len() + 1);
+        for (i, c) in line.text.char_indices() {
+            map.resize(i, text.len());
+            map.push(text.len());
+            if c == '\t' {
+                text.push_str("    ");
+            } else {
+                text.push(c);
+            }
+        }
+        map.resize(line.text.len() + 1, text.len());
+        let at = |r: &std::ops::Range<usize>| map[r.start.min(line.text.len())]..map[r.end.min(line.text.len())];
+        let syntax = self.spans[fi][hi][li]
+            .iter()
+            .map(|(r, k)| (at(r), HighlightStyle { color: Some(theme::rgb(theme::syntax_color(HIGHLIGHT_NAMES[*k as usize]))), ..Default::default() }))
+            .filter(|(r, _)| !r.is_empty())
+            .collect::<Vec<_>>();
+        let emph_bg = match line.kind {
+            DiffLineKind::Added => WORD_ADDED_BG,
+            _ => WORD_REMOVED_BG,
         };
+        let emphasis = self.emphasis[fi][hi][li]
+            .iter()
+            .map(|r| (at(r), HighlightStyle { background_color: Some(theme::rgb(emph_bg)), ..Default::default() }))
+            .filter(|(r, _)| !r.is_empty())
+            .collect::<Vec<_>>();
+        let highlights: Vec<_> = if emphasis.is_empty() { syntax } else { gpui::combine_highlights(syntax, emphasis).collect() };
         StyledText::new(SharedString::from(text)).with_highlights(highlights)
     }
 }
@@ -218,6 +296,27 @@ fn highlight_file(file: &FileDiff) -> Vec<Vec<LineSpans>> {
         .collect()
 }
 
+/// Changed byte ranges within each modified line, pairing removed and added lines the same
+/// way the side-by-side view does.
+fn emphasis_file(file: &FileDiff) -> Vec<Vec<Vec<std::ops::Range<usize>>>> {
+    file.hunks
+        .iter()
+        .map(|hunk| {
+            let mut out = vec![Vec::new(); hunk.lines.len()];
+            for (l, r) in side_by_side_indices(hunk) {
+                if let (Some(l), Some(r)) = (l, r) {
+                    if l != r {
+                        let (a, b) = inline_changes(&hunk.lines[l].text, &hunk.lines[r].text);
+                        out[l] = a;
+                        out[r] = b;
+                    }
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 impl Focusable for DiffView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -225,6 +324,9 @@ impl Focusable for DiffView {
 }
 
 const ROW_H: f32 = 20.;
+/// Stronger tint behind the exact words that changed inside a modified line.
+const WORD_ADDED_BG: u32 = 0x2d5a36;
+const WORD_REMOVED_BG: u32 = 0x6a2a32;
 
 fn line_bg(kind: DiffLineKind) -> Option<u32> {
     match kind {
@@ -248,8 +350,6 @@ fn gutter(n: Option<usize>) -> gpui::Div {
 impl Render for DiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.rows.len();
-        let can_stage = matches!(self.source, DiffSource::Changes { .. });
-        let staged = matches!(self.source, DiffSource::Changes { staged: true, .. });
         let (adds, dels) = self.files.iter().fold((0, 0), |acc, f| {
             let (a, d) = f.stats();
             (acc.0 + a, acc.1 + d)
@@ -302,8 +402,11 @@ impl Render for DiffView {
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(DiffViewEvent::Resolve(true)))),
                     )
             })
-            .child(toolbar_button("prev-hunk", "↑ Hunk").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.jump_hunk(-1, cx))))
-            .child(toolbar_button("next-hunk", "↓ Hunk").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.jump_hunk(1, cx))))
+            .when(!self.blocks.is_empty(), |d| {
+                d.child(div().text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("{} of {} changes", self.current_hunk + 1, self.blocks.len())))
+            })
+            .child(toolbar_button("prev-hunk", "↑ Change").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.jump_hunk(-1, cx))))
+            .child(toolbar_button("next-hunk", "↓ Change").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.jump_hunk(1, cx))))
             .child(
                 toolbar_button("toggle-sbs", if self.side_by_side { "Unified" } else { "Side by side" }).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.side_by_side = !this.side_by_side;
@@ -364,17 +467,6 @@ impl Render for DiffView {
                                             cx.emit(DiffViewEvent::OpenFile { path: path.clone(), line })
                                         })));
                                     }
-                                    if can_stage {
-                                        if let DiffSource::Changes { repo, .. } = &this.source {
-                                            let repo = repo.clone();
-                                            let patch = this.files[fi].hunk_patch(hi);
-                                            row = row.child(
-                                                toolbar_button(("stage-hunk", ix), if staged { "Unstage hunk" } else { "Stage hunk" }).on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                                    cx.emit(DiffViewEvent::ApplyHunk { repo: repo.clone(), patch: patch.clone(), reverse: staged })
-                                                })),
-                                            );
-                                        }
-                                    }
                                     row.into_any_element()
                                 }
                                 Row::Unified(fi, hi, li) => {
@@ -384,6 +476,7 @@ impl Render for DiffView {
                                         DiffLineKind::Removed => "−",
                                         DiffLineKind::Context => " ",
                                     };
+                                    let actions = this.block_actions(ix, cx);
                                     base.when_some(line_bg(l.kind), |d, c| d.bg(theme::rgb(c)))
                                         .child(gutter(l.old_no))
                                         .child(gutter(l.new_no))
@@ -392,7 +485,8 @@ impl Render for DiffView {
                                             DiffLineKind::Removed => theme::DELETED,
                                             DiffLineKind::Context => theme::TEXT_FAINT,
                                         })).child(sign))
-                                        .child(div().text_color(theme::rgb(theme::TEXT)).child(this.render_code(fi, hi, li)))
+                                        .child(div().flex_1().min_w_0().overflow_hidden().text_color(theme::rgb(theme::TEXT)).child(this.render_code(fi, hi, li)))
+                                        .children(actions)
                                         .into_any_element()
                                 }
                                 Row::Split(fi, hi, left, right) => {
@@ -405,15 +499,17 @@ impl Render for DiffView {
                                             d = d
                                                 .when_some(line_bg(kind), |d, c| d.bg(theme::rgb(c)))
                                                 .child(gutter(if old { l.old_no } else { l.new_no }))
-                                                .child(div().text_color(theme::rgb(theme::TEXT)).child(this.render_code(fi, hi, i)));
+                                                .child(div().flex_1().min_w_0().overflow_hidden().text_color(theme::rgb(theme::TEXT)).child(this.render_code(fi, hi, i)));
                                         } else {
                                             d = d.bg(theme::rgb(0x18191c));
                                         }
                                         d
                                     };
+                                    let actions = this.block_actions(ix, cx);
                                     base.child(half(left, true))
                                         .child(div().w(px(1.)).h_full().bg(theme::rgb(theme::BORDER)))
                                         .child(half(right, false))
+                                        .children(actions)
                                         .into_any_element()
                                 }
                             }

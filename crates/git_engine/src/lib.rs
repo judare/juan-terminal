@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use anyhow::{Context, Result, bail};
 
 pub mod diff;
-pub use diff::{DiffLine, DiffLineKind, FileDiff, Hunk, parse_diff, side_by_side};
+pub use diff::{DiffLine, DiffLineKind, FileDiff, Hunk, inline_changes, parse_diff, side_by_side, side_by_side_indices};
 
 fn git(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
@@ -198,17 +198,20 @@ pub fn parse_status(out: &[u8]) -> RepoStatus {
     st
 }
 
-/// Unified diff text for one file. `staged`: index vs HEAD; otherwise worktree vs index.
+/// Context large enough that single-file diffs show the whole file (as VS Code does).
+const FULL_CONTEXT: &str = "--unified=1000000";
+
+/// Unified diff text for one file (whole file as context). `staged`: index vs HEAD; otherwise worktree vs index.
 /// Untracked files are diffed against /dev/null.
 pub fn file_diff(repo: &Path, change: &FileChange, staged: bool) -> Result<String> {
     let mut cmd = git(repo);
     if !staged && change.unstaged == Some(ChangeKind::Untracked) {
-        cmd.args(["diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", &change.path]);
+        cmd.args(["diff", "--no-color", "--no-ext-diff", FULL_CONTEXT, "--no-index", "--", "/dev/null", &change.path]);
         // --no-index exits 1 when files differ.
         let out = cmd.output().context("failed to run git")?;
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
-    cmd.args(["diff", "--no-color", "--no-ext-diff", "-M"]);
+    cmd.args(["diff", "--no-color", "--no-ext-diff", FULL_CONTEXT, "-M"]);
     if staged {
         cmd.arg("--cached");
     }
@@ -231,7 +234,7 @@ pub fn diff_contents(name: &str, old: &str, new: &str) -> Result<String> {
     std::fs::write(dir.join("new").join(&base), new)?;
     let out = Command::new("git")
         .current_dir(&dir)
-        .args(["diff", "--no-color", "--no-ext-diff", "--no-index", "--"])
+        .args(["diff", "--no-color", "--no-ext-diff", FULL_CONTEXT, "--no-index", "--"])
         .arg(format!("old/{base}"))
         .arg(format!("new/{base}"))
         .output()
@@ -247,7 +250,7 @@ pub fn diff_refs(repo: &Path, base: &str, head: &str, path: Option<&str>) -> Res
     let mut cmd = git(repo);
     cmd.args(["diff", "--no-color", "--no-ext-diff", "-M", &format!("{base}...{head}")]);
     if let Some(p) = path {
-        cmd.args(["--", p]);
+        cmd.args([FULL_CONTEXT, "--", p]);
     }
     run_text(cmd)
 }
@@ -556,13 +559,17 @@ mod tests {
         fs::write(r.join("f.txt"), changed).unwrap();
         let st = status(&r).unwrap();
         let d = parse_diff(&file_diff(&r, &st.files[0], false).unwrap());
-        assert_eq!(d[0].hunks.len(), 2);
-        apply_to_index(&r, &d[0].hunk_patch(0), false).unwrap();
+        // Full context: one hunk with two separate change blocks.
+        assert_eq!(d[0].hunks.len(), 1);
+        let blocks = d[0].hunks[0].change_blocks();
+        assert_eq!(blocks.len(), 2);
+        apply_to_index(&r, &d[0].block_patch(0, blocks[0].clone()), false).unwrap();
         let staged = parse_diff(&file_diff(&r, &st.files[0], true).unwrap());
-        assert_eq!(staged[0].hunks.len(), 1);
-        assert!(staged[0].hunks[0].lines.iter().any(|l| l.text == "line 2 changed"));
+        let sb = staged[0].hunks[0].change_blocks();
+        assert_eq!(sb.len(), 1);
+        assert!(staged[0].hunks[0].lines[sb[0].clone()].iter().any(|l| l.text == "line 2 changed"));
         // Unstage it again.
-        apply_to_index(&r, &staged[0].hunk_patch(0), true).unwrap();
+        apply_to_index(&r, &staged[0].block_patch(0, sb[0].clone()), true).unwrap();
         assert!(file_diff(&r, &st.files[0], true).unwrap().is_empty());
         fs::remove_dir_all(r).unwrap();
     }
