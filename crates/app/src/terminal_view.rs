@@ -449,7 +449,17 @@ impl TerminalView {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let item = cx.read_from_clipboard();
+        let has_image = item.as_ref().is_some_and(|i| i.entries().iter().any(|e| matches!(e, gpui::ClipboardEntry::Image(_))));
+        let text = item.as_ref().and_then(|i| i.text());
+        // Claude Code reads images from the clipboard itself on Ctrl-V (like in other
+        // terminals): hand it an image when there is one (a copied image may also carry its
+        // URL as text), or when there's nothing textual to paste.
+        if has_image && (self.claude_fg || text.is_none()) {
+            self.write_user_input(b"\x16".to_vec(), cx);
+            return;
+        }
+        if let Some(text) = text {
             let bytes = encode_paste(&text, self.snapshot.mode.bracketed_paste);
             self.write_user_input(bytes, cx);
         }
