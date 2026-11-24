@@ -27,7 +27,7 @@ actions!(
         PageUp, PageDown, Backspace, Delete, DeleteWordLeft, DeleteToLineStart, Newline, Indent,
         Outdent, SelectAll, Copy, Cut, Paste, Undo, Redo, Save, ToggleComment, Find, FindNext,
         FindPrevious, SelectLine, GoToLine, ToggleMarkdownLive, GoToDefinition, InsertTable,
-        ToggleWordWrap, DismissMenu, SelectNextOccurrence, SelectAllOccurrences, AddCursorAbove,
+        ToggleWordWrap, ExportPdf, DismissMenu, SelectNextOccurrence, SelectAllOccurrences, AddCursorAbove,
         AddCursorBelow,
     ]
 );
@@ -248,6 +248,13 @@ pub struct EditorView {
     /// CSV showing the table (vs. the text editor).
     table_mode: bool,
     _asset_sub: Option<Subscription>,
+    _asset_obs: Option<Subscription>,
+    /// Cached dirty state of an editable asset (xlsx cells, PDF, PPTX).
+    asset_dirty: bool,
+    /// .docx edited as Markdown: the Word model that saves the text back into the file.
+    pub docx: Option<crate::office::docx::DocxModel>,
+    /// Markdown/Word → corporate PDF dialog.
+    export: Option<Entity<crate::md_export::ExportDialog>>,
     focus_handle: FocusHandle,
     spans: Vec<HighlightSpan>,
     spans_version: u64,
@@ -321,6 +328,10 @@ impl EditorView {
             csv_source: false,
             table_mode: false,
             _asset_sub: None,
+            _asset_obs: None,
+            asset_dirty: false,
+            docx: None,
+            export: None,
             focus_handle: cx.focus_handle(),
             spans: Vec::new(),
             spans_version: u64::MAX,
@@ -372,7 +383,30 @@ impl EditorView {
         doc.path = Some(path.clone());
         let mut this = Self::new(doc, font_size, cx);
         let focus = this.focus_handle.clone();
-        this.asset = Some(cx.new(|cx| crate::asset_view::AssetView::new(path, kind, focus, cx)));
+        let asset = cx.new(|cx| crate::asset_view::AssetView::new(path, kind, focus, cx));
+        this._asset_obs = Some(cx.observe(&asset, |this, asset, cx| {
+            let d = asset.read(cx).is_dirty(cx);
+            if d != this.asset_dirty {
+                this.asset_dirty = d;
+                if !d {
+                    this.preview = false;
+                }
+                cx.emit(EditorEvent::Changed);
+            }
+            cx.notify();
+        }));
+        this.asset = Some(asset);
+        this
+    }
+
+    /// Word document: shown and edited as live Markdown, saved back into the .docx (⌘S).
+    pub fn new_docx(model: crate::office::docx::DocxModel, font_size: f32, cx: &mut Context<Self>) -> Self {
+        let mut doc = Document::from_str(&model.markdown, Language::Markdown);
+        doc.path = Some(model.path.clone());
+        doc.mark_saved();
+        let mut this = Self::new(doc, font_size, cx);
+        this.markdown_live = true;
+        this.docx = Some(model);
         this
     }
 
@@ -393,6 +427,7 @@ impl EditorView {
                 this.autoscroll = true;
                 cx.notify();
             }
+            crate::asset_view::AssetEvent::Changed => {}
         }));
         this.asset = Some(asset);
         this.csv_source = true;
@@ -725,7 +760,7 @@ impl EditorView {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.doc.is_dirty()
+        self.doc.is_dirty() || self.asset_dirty
     }
 
     /// New buffer (⌘N) that has never been saved.
@@ -762,8 +797,49 @@ impl EditorView {
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
+        self.save_in(None, cx)
+    }
+
+    fn save_in(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) -> bool {
         if self.pure_asset() {
-            return true;
+            let Some(asset) = self.asset.clone() else { return true };
+            let r = asset.update(cx, |a, cx| a.save(window, cx));
+            return match r {
+                Ok(()) => {
+                    self.asset_dirty = asset.read(cx).is_dirty(cx);
+                    self.preview = false;
+                    cx.emit(EditorEvent::Changed);
+                    if let Some(p) = self.doc.path.clone() {
+                        cx.emit(EditorEvent::Saved(p));
+                    }
+                    cx.notify();
+                    true
+                }
+                Err(e) => {
+                    cx.emit(EditorEvent::Error(e));
+                    false
+                }
+            };
+        }
+        if let Some(model) = self.docx.as_mut() {
+            let text = self.doc.text();
+            return match model.save(&text) {
+                Ok(()) => {
+                    self.doc.mark_saved();
+                    self.disk_conflict = false;
+                    self.preview = false;
+                    cx.emit(EditorEvent::Changed);
+                    if let Some(p) = self.doc.path.clone() {
+                        cx.emit(EditorEvent::Saved(p));
+                    }
+                    cx.notify();
+                    true
+                }
+                Err(e) => {
+                    cx.emit(EditorEvent::Error(format!("Couldn't save the Word document: {e}")));
+                    false
+                }
+            };
         }
         if self.is_untitled() {
             cx.emit(EditorEvent::SaveAs);
@@ -795,6 +871,22 @@ impl EditorView {
     /// Called when the window regains focus: pick up external modifications.
     pub fn check_disk(&mut self, cx: &mut Context<Self>) {
         if self.pure_asset() || !self.doc.changed_on_disk() {
+            return;
+        }
+        if self.docx.is_some() {
+            if self.doc.is_dirty() {
+                self.disk_conflict = true;
+            } else if let Some(path) = self.doc.path.clone() {
+                match crate::office::docx::DocxModel::load(&path) {
+                    Ok(m) => {
+                        self.doc.replace_all_keep_cursor(&m.markdown);
+                        self.doc.mark_saved();
+                        self.docx = Some(m);
+                    }
+                    Err(e) => cx.emit(EditorEvent::Error(e)),
+                }
+            }
+            cx.notify();
             return;
         }
         if self.doc.is_dirty() {
@@ -1041,7 +1133,37 @@ impl EditorView {
     }
 
     /// ⌘S: format with oxfmt (if the repo has it) as an undoable edit, save, then lint.
-    fn save_action(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+    fn export_pdf(&mut self, _: &ExportPdf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.language != Language::Markdown {
+            return;
+        }
+        let source = self.doc.path.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled.md"));
+        let text = self.doc.text();
+        let dialog = cx.new(|cx| crate::md_export::ExportDialog::new(source, text, window, cx));
+        cx.subscribe_in(&dialog, window, |this, _, e: &crate::md_export::ExportEvent, window, cx| match e {
+            crate::md_export::ExportEvent::Close => {
+                this.export = None;
+                window.focus(&this.focus_handle);
+                cx.notify();
+            }
+            crate::md_export::ExportEvent::Done(p) => {
+                this.export = None;
+                window.focus(&this.focus_handle);
+                cx.open_with_system(p);
+                cx.notify();
+            }
+            crate::md_export::ExportEvent::Error(_) => {}
+        })
+        .detach();
+        self.export = Some(dialog);
+        cx.notify();
+    }
+
+    fn save_action(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pure_asset() || self.docx.is_some() {
+            self.save_in(Some(window), cx);
+            return;
+        }
         let fmt = self.tools.as_ref().and_then(|t| t.oxfmt.clone());
         let (Some(fmt), Some(path)) = (fmt, self.doc.path.clone()) else {
             if self.save(cx) {
@@ -1541,7 +1663,7 @@ impl Render for EditorView {
                 .id("editor")
                 .key_context("Editor")
                 .size_full()
-                .when(self.csv_source, |d| d.on_action(cx.listener(Self::save_action)))
+                .on_action(cx.listener(Self::save_action))
                 .child(asset);
         }
         let focused_editor = cx.entity();
@@ -1650,6 +1772,7 @@ impl Render for EditorView {
             .key_context("Editor")
             .track_focus(&self.focus_handle)
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme::rgb(theme::EDITOR_BG))
@@ -1747,6 +1870,7 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::save_action))
+            .on_action(cx.listener(Self::export_pdf))
             .on_action(cx.listener(|this, _: &Find, w, cx| this.open_find(false, w, cx)))
             .on_action(cx.listener(|this, _: &GoToLine, w, cx| this.open_find(true, w, cx)))
             .on_action(cx.listener(Self::toggle_markdown_live))
@@ -1777,6 +1901,7 @@ impl Render for EditorView {
                 .with_priority(2)
             }))
             .children(conflict)
+            .children(self.export.clone().map(|d| gpui::deferred(d).with_priority(2)))
             .when(self.doc.language == Language::Markdown || self.is_svg() || self.csv_source, |d| {
                 let svg = self.is_svg();
                 let csv = self.csv_source;
@@ -1797,7 +1922,10 @@ impl Render for EditorView {
                             if on {
                                 this.toggle_markdown_live(&ToggleMarkdownLive, w, cx)
                             }
-                        }))),
+                        })))
+                        .when(!csv && !svg, |d| {
+                            d.child(div().w(px(8.))).child(md_toggle("md-export", "Export PDF", false).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.export_pdf(&ExportPdf, w, cx))))
+                        }),
                 )
             })
             .children(find_bar)

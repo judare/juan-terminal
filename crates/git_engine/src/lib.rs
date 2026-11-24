@@ -9,6 +9,26 @@ use anyhow::{Context, Result, bail};
 pub mod diff;
 pub use diff::{DiffLine, DiffLineKind, FileDiff, Hunk, inline_changes, parse_diff, side_by_side, side_by_side_indices};
 
+/// Office documents shown as text in diffs: (attributes file, textconv command).
+static TEXTCONV: std::sync::OnceLock<(std::path::PathBuf, String)> = std::sync::OnceLock::new();
+
+/// Make `git diff` show .docx/.xlsx/.pptx as text through `command <file>` (git textconv).
+/// `attributes` must map the extensions to `diff=jtoffice` (and include the user's own rules).
+pub fn set_office_textconv(attributes: std::path::PathBuf, command: String) {
+    let _ = TEXTCONV.set((attributes, command));
+}
+
+/// `git` for diff commands: adds the Office textconv, when configured.
+fn git_diff(repo: &Path) -> Command {
+    let mut cmd = git(repo);
+    if let Some((attrs, conv)) = TEXTCONV.get() {
+        cmd.arg("-c").arg(format!("core.attributesFile={}", attrs.display()));
+        cmd.arg("-c").arg(format!("diff.jtoffice.textconv={conv}"));
+        cmd.arg("-c").arg("diff.jtoffice.cachetextconv=false");
+    }
+    cmd
+}
+
 fn git(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo);
@@ -204,7 +224,7 @@ const FULL_CONTEXT: &str = "--unified=1000000";
 /// Unified diff text for one file (whole file as context). `staged`: index vs HEAD; otherwise worktree vs index.
 /// Untracked files are diffed against /dev/null.
 pub fn file_diff(repo: &Path, change: &FileChange, staged: bool) -> Result<String> {
-    let mut cmd = git(repo);
+    let mut cmd = git_diff(repo);
     if !staged && change.unstaged == Some(ChangeKind::Untracked) {
         cmd.args(["diff", "--no-color", "--no-ext-diff", FULL_CONTEXT, "--no-index", "--", "/dev/null", &change.path]);
         // --no-index exits 1 when files differ.
@@ -247,7 +267,7 @@ pub fn diff_contents(name: &str, old: &str, new: &str) -> Result<String> {
 
 /// Diff between two refs (branch comparison), whole repo or one path.
 pub fn diff_refs(repo: &Path, base: &str, head: &str, path: Option<&str>) -> Result<String> {
-    let mut cmd = git(repo);
+    let mut cmd = git_diff(repo);
     cmd.args(["diff", "--no-color", "--no-ext-diff", "-M", &format!("{base}...{head}")]);
     if let Some(p) = path {
         cmd.args([FULL_CONTEXT, "--", p]);

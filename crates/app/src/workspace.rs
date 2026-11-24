@@ -33,6 +33,9 @@ actions!(
         NewTerminal,
         NewWindow,
         NewFile,
+        NewWordDocument,
+        NewSpreadsheet,
+        NewPresentation,
         CloseTerminal,
         NextTerminal,
         PreviousTerminal,
@@ -62,6 +65,7 @@ actions!(
         ToggleCommandPalette,
         OpenSettings,
         ExtendProjectHours,
+        ShowUsage,
     ]
 );
 
@@ -114,6 +118,8 @@ struct DirEntry {
     is_dir: bool,
     /// The virtual "others" folder of a repository.
     virtual_others: bool,
+    /// Gone from disk but deleted in git: listed struck through.
+    deleted: bool,
 }
 
 /// Key used in `expanded` for a repository's virtual "others" folder.
@@ -151,6 +157,8 @@ struct ContextMenu {
     is_dir: bool,
     /// Repository roots / project roots can't be renamed or trashed from here.
     is_root: bool,
+    /// Opened from the Git panel: offer "Locate in Explorer" (reveal in the file tree).
+    locate: bool,
 }
 
 enum NameAction {
@@ -186,6 +194,8 @@ pub struct Workspace {
     sidebar_mode: SidebarMode,
     quick_open: Option<(Entity<QuickOpen>, Subscription)>,
     palette: Option<(Entity<crate::command_palette::CommandPalette>, Subscription, Option<FocusHandle>)>,
+    /// Agent usage dashboard (full-window overlay) and the focus to restore when it closes.
+    usage: Option<(Entity<crate::usage_view::UsageView>, Subscription, Option<FocusHandle>)>,
     search_panel: Option<Entity<SearchPanel>>,
     git_panel: Option<Entity<GitPanel>>,
     /// Created on first visit; dropped (stops polling) when hidden is not needed: it only
@@ -245,7 +255,13 @@ pub struct Workspace {
     dir_cache: HashMap<PathBuf, Rc<Vec<DirEntry>>>,
     /// Per repository root: (others, regular) split of its top-level entries.
     others_cache: HashMap<PathBuf, (Rc<Vec<DirEntry>>, Rc<Vec<DirEntry>>)>,
+    /// Git-deleted entries by parent dir (from the git panel), refreshed each sidebar render.
+    deleted_entries: Rc<HashMap<PathBuf, Vec<(PathBuf, bool)>>>,
     rows: Rc<Vec<Row>>,
+    tree_scroll: gpui::UniformListScrollHandle,
+    /// Path revealed with "Locate in Explorer": highlighted, scrolled to on the next render.
+    located: Option<PathBuf>,
+    locate_pending: bool,
     sidebar_visible: bool,
     sidebar_width: f32,
     resizing_sidebar: bool,
@@ -305,6 +321,7 @@ impl Workspace {
             sidebar_mode: SidebarMode::Files,
             quick_open: None,
             palette: None,
+            usage: None,
             search_panel: None,
             git_panel: None,
             ports_panel: None,
@@ -344,7 +361,11 @@ impl Workspace {
             expanded: HashSet::new(),
             dir_cache: HashMap::new(),
             others_cache: HashMap::new(),
+            deleted_entries: Default::default(),
             rows: Rc::new(Vec::new()),
+            tree_scroll: gpui::UniformListScrollHandle::new(),
+            located: None,
+            locate_pending: false,
             sidebar_visible: true,
             sidebar_width,
             resizing_sidebar: false,
@@ -480,7 +501,7 @@ impl Workspace {
                         }
                         // Follow symlinks for the dir check.
                         let is_dir = e.path().is_dir();
-                        Some(DirEntry { name: name.into(), path: e.path(), is_dir, virtual_others: false })
+                        Some(DirEntry { name: name.into(), path: e.path(), is_dir, virtual_others: false, deleted: false })
                     })
                     .collect()
             })
@@ -489,6 +510,21 @@ impl Workspace {
         let rc = Rc::new(entries);
         self.dir_cache.insert(dir.to_path_buf(), rc.clone());
         rc
+    }
+
+    /// `entries` of `dir` plus the files deleted in git that used to be there.
+    fn with_deleted(&self, dir: &Path, entries: Rc<Vec<DirEntry>>) -> Rc<Vec<DirEntry>> {
+        let Some(gone) = self.deleted_entries.get(dir).filter(|g| !g.is_empty()) else { return entries };
+        let mut all: Vec<DirEntry> = entries.as_ref().clone();
+        for (path, is_dir) in gone {
+            if all.iter().any(|e| &e.path == path) {
+                continue;
+            }
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            all.push(DirEntry { name: name.into(), path: path.clone(), is_dir: *is_dir, virtual_others: false, deleted: true });
+        }
+        all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        Rc::new(all)
     }
 
     /// Start terminals and reopen files for the active project, lazily, once.
@@ -859,6 +895,25 @@ impl Workspace {
         cx.notify();
     }
 
+    fn toggle_usage(&mut self, _: &ShowUsage, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::usage_view::{UsageEvent, UsageView};
+        if let Some((_, _, prev)) = self.usage.take() {
+            match prev {
+                Some(p) => window.focus(&p),
+                None => self.focus_main(window, cx),
+            }
+            cx.notify();
+            return;
+        }
+        let prev = window.focused(cx);
+        let view = cx.new(|cx| UsageView::new(window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+            UsageEvent::Dismiss => this.toggle_usage(&ShowUsage, window, cx),
+        });
+        self.usage = Some((view, sub, prev));
+        cx.notify();
+    }
+
     fn toggle_palette(&mut self, _: &ToggleCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
         use crate::command_palette::{CommandPalette, PaletteEvent};
         if let Some((_, _, prev)) = self.palette.take() {
@@ -1184,13 +1239,24 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Diff of one working-tree/index change in a tab.
+    fn open_change_diff(&mut self, repo: PathBuf, change: git_engine::FileChange, staged: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let title = format!("{}{}", change.path.rsplit('/').next().unwrap_or(&change.path), if staged { " (staged)" } else { "" });
+        let source = DiffSource::Changes { repo: repo.clone(), path: change.path.clone(), staged };
+        self.load_diff(title, source, Some(repo.clone()), window, cx, move || git_engine::file_diff(&repo, &change, staged));
+    }
+
     fn on_git_event(&mut self, event: &GitPanelEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             GitPanelEvent::OpenDiff { repo, change, staged } => {
-                let (repo, change, staged) = (repo.clone(), change.clone(), *staged);
-                let title = format!("{}{}", change.path.rsplit('/').next().unwrap_or(&change.path), if staged { " (staged)" } else { "" });
-                let source = DiffSource::Changes { repo: repo.clone(), path: change.path.clone(), staged };
-                self.load_diff(title, source, Some(repo.clone()), window, cx, move || git_engine::file_diff(&repo, &change, staged));
+                // Images/media/binaries: a text diff says only "Binary file"; show the file.
+                let full = repo.join(&change.path);
+                if crate::asset_view::asset_kind(&full).is_some() && full.is_file() {
+                    self.open_file_preview(&full, window, cx);
+                    self.persist(cx);
+                    return;
+                }
+                self.open_change_diff(repo.clone(), change.clone(), *staged, window, cx);
             }
             GitPanelEvent::OpenCommit { repo, commit } => {
                 let (r, hash) = (repo.clone(), commit.hash.clone());
@@ -1206,6 +1272,11 @@ impl Workspace {
                 let path = path.clone();
                 self.open_file(&path, true, window, cx);
                 self.persist(cx);
+            }
+            GitPanelEvent::ContextMenu { position, path } => {
+                let exists = path.exists();
+                self.context_menu = Some(ContextMenu { position: *position, target: path.clone(), is_dir: path.is_dir(), is_root: !exists, locate: true });
+                cx.notify();
             }
             GitPanelEvent::Changed => {
                 self.refresh_branches();
@@ -1379,6 +1450,35 @@ impl Workspace {
 
     // ---- editors ------------------------------------------------------------------------
 
+    /// New blank Word/Excel/PowerPoint file: ask where, write the template, open it.
+    fn new_office(&mut self, ext: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self
+            .active_project()
+            .and_then(|p| p.root.clone().or_else(|| p.repositories.first().map(|r| r.path.clone())))
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Documents")))
+            .unwrap_or_default();
+        let name = match ext {
+            "docx" => "Document.docx",
+            "xlsx" => "Workbook.xlsx",
+            _ => "Presentation.pptx",
+        };
+        let rx = cx.prompt_for_new_path(&dir, Some(name));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else { return };
+            let path = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) { path } else { path.with_extension(ext) };
+            let Some(blank) = crate::office::template(&path) else { return };
+            let res = std::fs::write(&path, blank);
+            let _ = this.update_in(cx, |this, window, cx| match res {
+                Ok(()) => this.open_file(&path, true, window, cx),
+                Err(e) => {
+                    this.error = Some(format!("{}: {e}", path.display()).into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn open_file(&mut self, path: &Path, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.diff_active = false;
         let key = self.active_key();
@@ -1394,7 +1494,21 @@ impl Workspace {
                 return;
             }
             let csv_doc = crate::asset_view::is_text_table(path).then(|| editor::Document::open(path).ok()).flatten();
-            let view = if let Some(doc) = csv_doc {
+            let docx = if crate::office::docx::is_docx(path) {
+                match crate::office::docx::DocxModel::load(path) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        self.error = Some(format!("{}: {e}", path.display()).into());
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let view = if let Some(m) = docx {
+                cx.new(|cx| EditorView::new_docx(m, font_size, cx))
+            } else if let Some(doc) = csv_doc {
                 cx.new(|cx| EditorView::new_csv(doc, font_size, cx))
             } else if let Some(kind) = crate::asset_view::asset_kind(path) {
                 let p = path.to_path_buf();
@@ -1536,7 +1650,7 @@ impl Workspace {
     /// Find oxfmt/oxlint for the file's repository (cached) and hand them to the editor.
     fn attach_file_tools(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
         let Some(path) = view.read(cx).path().cloned() else { return };
-        if view.read(cx).asset.is_some() {
+        if view.read(cx).asset.is_some() || view.read(cx).docx.is_some() {
             return;
         }
         let Some(repo) = self
@@ -2034,7 +2148,7 @@ impl Workspace {
     // ---- file operations ----------------------------------------------------------------
 
     fn open_context_menu(&mut self, position: gpui::Point<gpui::Pixels>, target: PathBuf, is_dir: bool, is_root: bool, cx: &mut Context<Self>) {
-        self.context_menu = Some(ContextMenu { position, target, is_dir, is_root });
+        self.context_menu = Some(ContextMenu { position, target, is_dir, is_root, locate: false });
         cx.notify();
     }
 
@@ -2091,8 +2205,11 @@ impl Workspace {
                     if path.exists() {
                         Err(format!("“{name}” already exists"))
                     } else {
+                        // Office files start from a blank document (an empty file isn't valid).
+                        let blank = crate::office::template(&path).unwrap_or(&[]);
                         std::fs::create_dir_all(path.parent().unwrap_or(dir))
-                            .and_then(|_| std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(|_| ()))
+                            .and_then(|_| std::fs::OpenOptions::new().write(true).create_new(true).open(&path))
+                            .and_then(|mut f| std::io::Write::write_all(&mut f, blank))
                             .map(|_| (path, true))
                             .map_err(|e| e.to_string())
                     }
@@ -2250,6 +2367,8 @@ impl Workspace {
         let (d1, d2, d3, d4, d5) = (dir.clone(), dir.clone(), dir.clone(), target.clone(), target.clone());
         let (t1, t2, t3, t4) = (target.clone(), target.clone(), target.clone(), target.clone());
 
+        let locate = menu.locate;
+        let t_locate = target.clone();
         let mut list = div()
             .w(px(230.))
             .p(px(4.))
@@ -2264,6 +2383,10 @@ impl Workspace {
                 this.context_menu = None;
                 cx.notify();
             }))
+            .when(locate, |d| {
+                d.child(item("cm-locate", "icons/folder-open.svg", "Locate in Explorer").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.locate_in_tree(&t_locate, cx))))
+                    .child(sep())
+            })
             .child(item("cm-new-file", "icons/new-file.svg", "New File…").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.prompt_name(NameAction::NewFile(d1.clone()), w, cx))))
             .child(item("cm-new-folder", "icons/new-folder.svg", "New Folder…").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.prompt_name(NameAction::NewFolder(d2.clone()), w, cx))));
         if !is_root {
@@ -2470,6 +2593,42 @@ impl Workspace {
         let v = (Rc::new(others), Rc::new(regular));
         self.others_cache.insert(repo.to_path_buf(), v.clone());
         v
+    }
+
+    /// Show `path` in the file tree: Files mode, every ancestor expanded, row highlighted and
+    /// scrolled into view. A missing path (deleted file) reveals its folder.
+    fn locate_in_tree(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        let mut target = path.to_path_buf();
+        while !target.exists() {
+            match target.parent() {
+                Some(p) => target = p.to_path_buf(),
+                None => return,
+            }
+        }
+        let Some(project) = self.active_project().cloned() else { return };
+        let Some(repo) = project.repositories.iter().map(|r| r.path.clone()).find(|r| target.starts_with(r)) else { return };
+        self.collapsed.remove(&project.id);
+        self.sidebar_visible = true;
+        self.sidebar_mode = SidebarMode::Files;
+        // Top-level entry may live in the repo's virtual "others" folder.
+        if let Some(top) = target.strip_prefix(&repo).ok().and_then(|r| r.components().next()).map(|c| repo.join(c)) {
+            let (others, _) = self.repo_split(&repo);
+            if others.iter().any(|e| e.path == top) {
+                self.expanded.insert(others_key(&repo));
+            }
+        }
+        let mut dir = if target.is_dir() { Some(target.clone()) } else { target.parent().map(|p| p.to_path_buf()) };
+        while let Some(d) = dir {
+            if !d.starts_with(&repo) {
+                break;
+            }
+            self.expanded.insert(d.clone());
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+        self.located = Some(target);
+        self.locate_pending = true;
+        cx.notify();
     }
 
     fn toggle_dir(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -2793,11 +2952,12 @@ impl Workspace {
                 });
                 if repo_expanded && !missing {
                     let (others, regular) = self.repo_split(&repo.path);
+                    let regular = self.with_deleted(&repo.path, regular);
                     if !others.is_empty() {
                         let key = others_key(&repo.path);
                         let open = self.expanded.contains(&key);
                         rows.push(Row::Entry {
-                            entry: DirEntry { name: "others".into(), path: key, is_dir: true, virtual_others: true },
+                            entry: DirEntry { name: "others".into(), path: key, is_dir: true, virtual_others: true, deleted: false },
                             depth: 1,
                             expanded: open,
                             dimmed: false,
@@ -2830,7 +2990,7 @@ impl Workspace {
                     let key = others_key(root);
                     let open = self.expanded.contains(&key);
                     rows.push(Row::Entry {
-                        entry: DirEntry { name: "others".into(), path: key, is_dir: true, virtual_others: true },
+                        entry: DirEntry { name: "others".into(), path: key, is_dir: true, virtual_others: true, deleted: false },
                         depth: 0,
                         expanded: open,
                         dimmed: false,
@@ -2852,6 +3012,7 @@ impl Workspace {
 
     fn push_tree(&mut self, dir: &Path, depth: usize, selected: &Option<PathBuf>, rows: &mut Vec<Row>) {
         let entries = self.children(dir);
+        let entries = self.with_deleted(dir, entries);
         for entry in entries.iter() {
             let expanded = entry.is_dir && self.expanded.contains(&entry.path);
             rows.push(Row::Entry { entry: entry.clone(), depth, expanded, dimmed: is_dimmed(&entry.name) });
@@ -3001,10 +3162,16 @@ impl Workspace {
                     .into_any_element()
             }
             Row::Entry { entry, depth, expanded, dimmed, .. } => {
-                let selected = active_path == Some(&entry.path);
+                let selected = active_path == Some(&entry.path) || self.located.as_ref() == Some(&entry.path);
                 let path = entry.path.clone();
                 let is_dir = entry.is_dir;
-                let text_color = if selected {
+                let mark = self.git_panel.as_ref().and_then(|g| g.read(cx).tree_marks().get(&entry.path).copied());
+                let gone = entry.deleted;
+                let text_color = if gone {
+                    theme::DELETED
+                } else if let Some(m) = mark {
+                    m.color
+                } else if selected {
                     theme::TEXT
                 } else if dimmed {
                     theme::TEXT_FAINT
@@ -3032,9 +3199,16 @@ impl Workspace {
                         })
                     })
                     .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
+                        this.located = None;
                         if is_dir {
                             if e.click_count() <= 1 {
                                 this.toggle_dir(&path, cx);
+                            }
+                        } else if gone {
+                            // Not on disk: show what was deleted.
+                            if let Some((repo, change)) = this.git_panel.as_ref().and_then(|g| g.read(cx).change_at(&path)) {
+                                let staged = change.unstaged.is_none();
+                                this.open_change_diff(repo, change, staged, w, cx);
                             }
                         } else if e.click_count() >= 2 {
                             this.open_file(&path, true, w, cx);
@@ -3054,8 +3228,25 @@ impl Workspace {
                             .whitespace_nowrap()
                             .text_ellipsis()
                             .text_color(theme::rgb(text_color))
+                            .when(gone, |d| d.line_through())
                             .child(entry.name.clone()),
                     )
+                    .when_some(mark, |d, m| {
+                        // Folder counts are quieter than a file's status letter.
+                        let (label, size, weight) = match m.letter {
+                            Some(l) => (l.to_string(), 11., gpui::FontWeight::SEMIBOLD),
+                            None => (m.count.to_string(), 10., gpui::FontWeight::NORMAL),
+                        };
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(size))
+                                .font_family(theme::MONO_FONT)
+                                .font_weight(weight)
+                                .text_color(theme::rgb(m.color))
+                                .child(label),
+                        )
+                    })
                     .into_any_element()
             }
         };
@@ -3064,7 +3255,16 @@ impl Workspace {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.deleted_entries = self.git_panel.as_ref().map(|g| g.read(cx).deleted_entries()).unwrap_or_default();
         self.rows = if self.sidebar_mode == SidebarMode::Files { self.build_rows() } else { Rc::new(Vec::new()) };
+        if self.locate_pending && self.sidebar_mode == SidebarMode::Files {
+            self.locate_pending = false;
+            if let Some(target) = self.located.as_ref() {
+                if let Some(ix) = self.rows.iter().position(|r| matches!(r, Row::Entry { entry, .. } if &entry.path == target)) {
+                    self.tree_scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
+                }
+            }
+        }
         let search_panel = (self.sidebar_mode == SidebarMode::Search).then(|| self.search_panel.clone()).flatten();
         let git_panel = (self.sidebar_mode == SidebarMode::Git).then(|| self.git_panel.clone()).flatten();
         let git_total = self.git_panel.as_ref().map(|g| g.read(cx).total_changes()).unwrap_or(0);
@@ -3110,8 +3310,19 @@ impl Workspace {
                     .flex_none()
                     .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_FAINT)).child("PROJECTS"))
                     .child(
-                        icon_button("add-project", "icons/plus.svg")
-                            .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.open_project(&OpenProject, w, cx))),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                icon_button("usage-stats", "icons/chart.svg")
+                                    .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Agent usage (⌘⇧U)")).into())
+                                    .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.toggle_usage(&ShowUsage, w, cx))),
+                            )
+                            .child(
+                                icon_button("add-project", "icons/plus.svg")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.open_project(&OpenProject, w, cx))),
+                            ),
                     ),
             )
             .child(
@@ -3129,10 +3340,10 @@ impl Workspace {
                         this.search_in_project(&SearchInProject, w, cx);
                     })))
                     .child(mode_tab("mode-tools", "icons/gear.svg", "Tools", self.sidebar_mode == SidebarMode::Tools).when(problems > 0, |d| d.child(
-                        div().px(px(5.)).rounded_full().bg(theme::rgb(0x3a1f22)).text_size(px(12.)).text_color(theme::rgb(0xf0b3b8)).child(problems.to_string()),
+                        mode_badge(problems, 0x8c2f39, 0xffffff),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_tools(w, cx))))
                     .child(mode_tab("mode-git", "icons/git.svg", "Git", self.sidebar_mode == SidebarMode::Git).when(git_total > 0, |d| d.child(
-                        div().px(px(6.)).rounded_full().bg(theme::rgb(0x1f2a40)).text_size(px(14.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::ACCENT)).child(git_total.to_string()),
+                        mode_badge(git_total, 0x2f5fb3, 0xffffff),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
                         this.show_git(w, cx);
                     })))
@@ -3153,6 +3364,7 @@ impl Workspace {
                         range.map(|ix| this.render_row(ix, active_path.as_ref(), cx)).collect::<Vec<_>>()
                     }),
                 )
+                .track_scroll(self.tree_scroll.clone())
                 .flex_1()
                 .w_full()
                 .pb(px(8.)),
@@ -3287,10 +3499,12 @@ impl Workspace {
             let (title, dirty, preview) = (e.title(), e.is_dirty(), e.preview);
             let (errors, warnings) = e.problem_counts();
             let (icon_path, icon_color) = crate::assets::file_icon(&title);
+            let full_path: Option<SharedString> = e.path().map(|p| p.display().to_string().into());
             let tab_ref = tab.clone();
             bar = bar.child(
                 tab_chip(("editor-tab", ix), icon_path, icon_color, title, is_active, false, dirty)
                     .when(preview, |d| d.italic())
+                    .when_some(full_path, |d, p| d.tooltip(move |_, cx| cx.new(|_| crate::git_panel::DynTooltip(p.clone())).into()))
                     .when(errors + warnings > 0, |d| {
                         d.child(
                             div()
@@ -3422,9 +3636,33 @@ fn empty_state(title: &'static str, hint: &'static str) -> gpui::Div {
         .child(div().text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(hint))
 }
 
+/// Count badge pinned to the top-right corner of a sidebar mode tab: never takes space from
+/// the icon (a long count used to squeeze it).
+fn mode_badge(n: usize, bg: u32, fg: u32) -> gpui::Div {
+    let text = if n > 999 { "999+".to_string() } else { n.to_string() };
+    div()
+        .absolute()
+        .top(px(1.))
+        .right(px(-3.))
+        .h(px(14.))
+        .min_w(px(14.))
+        .px(px(3.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme::rgb(bg))
+        .text_size(px(9.5))
+        .line_height(px(14.))
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(theme::rgb(fg))
+        .child(text)
+}
+
 fn mode_tab(id: &'static str, icon_path: &'static str, label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .relative()
         .flex()
         .items_center()
         .justify_center()
@@ -3437,7 +3675,7 @@ fn mode_tab(id: &'static str, icon_path: &'static str, label: &'static str, acti
         .text_size(px(14.))
         .when(active, |d| d.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT)))
         .when(!active, |d| d.text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::HOVER))))
-        .child(gpui::svg().path(icon_path).size(px(20.)).text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })))
+        .child(gpui::svg().path(icon_path).size(px(20.)).flex_none().text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })))
         .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(label)).into())
 }
 
@@ -3555,6 +3793,8 @@ impl Render for Workspace {
         let center = self.render_editor_area(cx);
         let right = self.terminal_visible.then(|| self.render_terminal_panel(cx));
         let resizing = self.resizing_sidebar || self.resizing_terminal || self.resizing_actions;
+        // Native video players sit above GPUI content: hide them while an overlay is open.
+        let overlay = self.palette.is_some() || self.quick_open.is_some() || self.usage.is_some() || context_menu.is_some() || new_tab_menu.is_some() || name_prompt.is_some();
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -3568,6 +3808,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(|this, _: &NewWindow, window, cx| this.open_project_window(None, window, cx)))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| this.new_untitled(window, cx)))
+            .on_action(cx.listener(|this, _: &NewWordDocument, window, cx| this.new_office("docx", window, cx)))
+            .on_action(cx.listener(|this, _: &NewSpreadsheet, window, cx| this.new_office("xlsx", window, cx)))
+            .on_action(cx.listener(|this, _: &NewPresentation, window, cx| this.new_office("pptx", window, cx)))
             .on_action(cx.listener(Self::close_terminal))
             .on_action(cx.listener(|this, _: &NextTerminal, w, cx| this.cycle_terminal(true, w, cx)))
             .on_action(cx.listener(|this, _: &PreviousTerminal, w, cx| this.cycle_terminal(false, w, cx)))
@@ -3579,6 +3822,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::toggle_quick_open))
             .on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::toggle_usage))
             .on_action(cx.listener(Self::close_diff))
             .on_action(cx.listener(|this, _: &ShowGit, w, cx| this.show_git(w, cx)))
             .on_action(cx.listener(|this, _: &ShowTools, w, cx| this.show_tools(w, cx)))
@@ -3773,6 +4017,11 @@ impl Render for Workspace {
                         .child(div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(qo)),
                 )
             })
+            .when_some(self.usage.as_ref().map(|(u, _, _)| u.clone()), |d, u| {
+                d.child(div().id("usage-overlay").occlude().absolute().top_0().left_0().size_full().child(u))
+            })
+            // Last child: paints after every player slot in this window.
+            .child(crate::video_player::frame_end(overlay))
     }
 }
 

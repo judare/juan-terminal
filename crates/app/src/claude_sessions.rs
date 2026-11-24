@@ -25,7 +25,7 @@ pub fn projects_dir() -> PathBuf {
     }
 }
 
-fn text_of(content: &serde_json::Value) -> Option<String> {
+pub(crate) fn text_of(content: &serde_json::Value) -> Option<String> {
     match content {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Array(items) => items.iter().find_map(|i| (i["type"] == "text").then(|| i["text"].as_str().map(str::to_string)).flatten()),

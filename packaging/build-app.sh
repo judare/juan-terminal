@@ -46,6 +46,48 @@ cat > "$WORK/Contents/Info.plist" <<PLIST
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
+      <key>CFBundleTypeName</key><string>Office document or PDF</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>com.adobe.pdf</string>
+        <string>org.openxmlformats.wordprocessingml.document</string>
+        <string>org.openxmlformats.wordprocessingml.document.macroenabled</string>
+        <string>org.openxmlformats.spreadsheetml.sheet</string>
+        <string>org.openxmlformats.spreadsheetml.sheet.macroenabled</string>
+        <string>org.openxmlformats.presentationml.presentation</string>
+        <string>org.openxmlformats.presentationml.presentation.macroenabled</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Markdown, text or source code</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>net.daringfireball.markdown</string>
+        <string>public.plain-text</string>
+        <string>public.source-code</string>
+        <string>public.script</string>
+        <string>public.json</string>
+        <string>public.yaml</string>
+        <string>public.css</string>
+        <string>public.log</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Image, video or audio</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.image</string>
+        <string>public.movie</string>
+        <string>public.audio</string>
+      </array>
+    </dict>
+    <dict>
       <key>CFBundleTypeName</key><string>Document</string>
       <key>CFBundleTypeRole</key><string>Editor</string>
       <key>LSHandlerRank</key><string>Alternate</string>

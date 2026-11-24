@@ -18,11 +18,28 @@ fn find<'a>(list: &'a [SshServer], key: &str) -> Option<&'a SshServer> {
 }
 
 pub fn handle(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServer>) -> Option<Value> {
-    handle_with(project_id, msg, list, &|| String::from("Dev server listing is not available."))
+    handle_with(project_id, msg, list, &Extra::none())
 }
 
-/// `dev_servers`: report for the `list_dev_servers` tool (provided by the app).
-pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServer>, dev_servers: &dyn Fn() -> String) -> Option<Value> {
+/// Tools provided by the app on top of the SSH ones.
+pub struct Extra<'a> {
+    /// Report for the `list_dev_servers` tool.
+    pub dev_servers: &'a dyn Fn() -> String,
+    /// Extra tool definitions appended to `tools/list`.
+    pub tools: Vec<Value>,
+    /// Runs an extra tool: `Some((content blocks, is_error))`, `None` if the name isn't ours.
+    pub call: &'a dyn Fn(&str, &Value) -> Option<(Vec<Value>, bool)>,
+    /// Appended to the server instructions.
+    pub instructions: &'a str,
+}
+
+impl Extra<'static> {
+    pub fn none() -> Self {
+        Extra { dev_servers: &|| String::from("Dev server listing is not available."), tools: Vec::new(), call: &|_, _| None, instructions: "" }
+    }
+}
+
+pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServer>, extra: &Extra) -> Option<Value> {
     let id = msg.get("id").cloned()?;
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or_default();
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -31,10 +48,11 @@ pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServ
             "protocolVersion": params.get("protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "juan-terminal", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "You are running inside juan-terminal, the user's development workspace. When the user asks to see, screenshot, open or test their app/page (e.g. with Moli: `moli fetch --layout --dump screenshot URL > shot.png`, or any browser tool), first call list_dev_servers and use this project's local dev server URL (http://localhost:PORT) rather than the production site, unless they explicitly ask for production. If none is running, start it yourself in the background (list_dev_servers gives the repo's start command), wait until the URL responds, and then take the screenshot — don't fall back to production. For the project's remote machines use list_servers and ssh_exec.",
+            "instructions": format!("{}{}", "You are running inside juan-terminal, the user's development workspace. When the user asks to see, screenshot, open or test their app/page (e.g. with Moli: `moli fetch --layout --dump screenshot URL > shot.png`, or any browser tool), first call list_dev_servers and use this project's local dev server URL (http://localhost:PORT) rather than the production site, unless they explicitly ask for production. If none is running, start it yourself in the background (list_dev_servers gives the repo's start command), wait until the URL responds, and then take the screenshot — don't fall back to production. For the project's remote machines use list_servers and ssh_exec.", extra.instructions),
         }),
         "ping" => json!({}),
-        "tools/list" => json!({"tools": [
+        "tools/list" => {
+            let mut tools = json!([
             {
                 "name": "list_dev_servers",
                 "description": "List local dev servers (listening ports) of the current project, with their localhost URLs, process and working directory. Use it before looking at or screenshotting the user's app so you use the local version.",
@@ -56,12 +74,19 @@ pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServ
                     "timeout_secs": {"type": "integer", "description": "Default 60, max 600"},
                 }, "required": ["server", "command"]},
             },
-        ]}),
+        ]);
+            tools.as_array_mut().expect("array").extend(extra.tools.iter().cloned());
+            json!({"tools": tools})
+        }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let (text, is_error) = if name == "list_dev_servers" { (dev_servers(), false) } else { call(project_id, name, &args, &list) };
-            json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+            if let Some((content, is_error)) = (extra.call)(name, &args) {
+                json!({"content": content, "isError": is_error})
+            } else {
+                let (text, is_error) = if name == "list_dev_servers" { ((extra.dev_servers)(), false) } else { call(project_id, name, &args, &list) };
+                json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+            }
         }
         _ => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("Method not found: {method}")}})),
     };
@@ -116,10 +141,10 @@ fn call(project_id: &str, name: &str, args: &Value, list: &impl Fn() -> Vec<SshS
 
 /// Serve MCP over stdin/stdout until EOF.
 pub fn serve_stdio() {
-    serve_stdio_with(&|| String::from("Dev server listing is not available."))
+    serve_stdio_with(&Extra::none())
 }
 
-pub fn serve_stdio_with(dev_servers: &dyn Fn() -> String) {
+pub fn serve_stdio_with(extra: &Extra) {
     let project_id = std::env::var("JT_PROJECT_ID").unwrap_or_default();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -129,7 +154,7 @@ pub fn serve_stdio_with(dev_servers: &dyn Fn() -> String) {
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-        if let Some(reply) = handle_with(&project_id, &msg, || servers(&project_id), dev_servers) {
+        if let Some(reply) = handle_with(&project_id, &msg, || servers(&project_id), extra) {
             let _ = writeln!(stdout, "{reply}");
             let _ = stdout.flush();
         }

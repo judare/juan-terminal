@@ -88,6 +88,12 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Caret at the end, nothing selected.
+    pub fn move_end(&mut self, cx: &mut Context<Self>) {
+        self.selected_range = self.content.len()..self.content.len();
+        cx.notify();
+    }
+
     pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
         self.selected_range = 0..self.content.len();
         cx.notify();

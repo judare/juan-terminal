@@ -159,6 +159,12 @@ impl Document {
         Ok(())
     }
 
+    /// Treat the current text as what's on disk (saved through another writer, e.g. .docx).
+    pub fn mark_saved(&mut self) {
+        self.saved_version = self.version;
+        self.disk_mtime = self.path.as_ref().and_then(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
+    }
+
     /// True when the file on disk changed since we loaded or saved it.
     pub fn changed_on_disk(&self) -> bool {
         let Some(path) = &self.path else { return false };
