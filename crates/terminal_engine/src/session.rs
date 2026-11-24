@@ -67,11 +67,13 @@ pub struct SessionConfig {
     pub program: Option<(String, Vec<String>)>,
     /// Scrollback lines; bounded on purpose.
     pub scrollback: usize,
+    /// Output of a previous session (from `dump_ansi`) shown above the new shell's prompt.
+    pub restore: Option<String>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { cwd: None, env: HashMap::new(), program: None, scrollback: 10_000 }
+        Self { cwd: None, env: HashMap::new(), program: None, scrollback: 10_000, restore: None }
     }
 }
 
@@ -289,6 +291,11 @@ impl TerminalSession {
 
         let term_config = Config { scrolling_history: config.scrollback, ..Config::default() };
         let term = Arc::new(FairMutex::new(Term::new(term_config, &dims, listener.clone())));
+        if let Some(text) = config.restore.as_deref().filter(|t| !t.is_empty()) {
+            // Before the reader thread starts, so the new prompt lands below it.
+            let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+            parser.advance(&mut *term.lock(), text.as_bytes());
+        }
 
         let theme = Arc::new(ThemeState::default());
         theme.light.store(palette.is_light(), Ordering::Relaxed);
@@ -494,6 +501,76 @@ impl TerminalSession {
             }
         }
         out.marks.sort_by_key(|m| m.0);
+    }
+
+    /// Scrollback + screen above the cursor line as text with SGR colors, at most
+    /// `max_lines` lines, for restoring after a relaunch. `None` while a full-screen app
+    /// (alternate screen) is running or when there is nothing to keep.
+    pub fn dump_ansi(&self, max_lines: usize) -> Option<String> {
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = term.grid();
+        let cols = grid.columns();
+        let top = -(grid.history_size() as i32);
+        // The cursor line holds the live prompt: the new shell prints its own.
+        let end = grid.cursor.point.line.0 - 1;
+        if end < top {
+            return None;
+        }
+        let start = top.max(end - max_lines as i32 + 1);
+        let mut out = String::new();
+        let mut style = String::new();
+        let mut blank_run = 0usize;
+        for line in start..=end {
+            let row = &grid[Line(line)];
+            // Last cell with something visible (text or a non-default background).
+            let last = (0..cols).rev().find(|&c| {
+                let cell = &row[Column(c)];
+                cell.c != ' ' || !matches!(cell.bg, alacritty_terminal::vte::ansi::Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background))
+            });
+            let mut text = String::new();
+            if let Some(last) = last {
+                for c in 0..=last {
+                    let cell = &row[Column(c)];
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    let sgr = sgr_for(cell.fg, cell.bg, cell.flags);
+                    if sgr != style {
+                        text.push_str(if sgr.is_empty() { "\x1b[0m" } else { &sgr });
+                        style = sgr;
+                    }
+                    text.push(if cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c });
+                    if let Some(zw) = cell.zerowidth() {
+                        text.extend(zw.iter());
+                    }
+                }
+            }
+            let wrapped = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+            if text.is_empty() && !wrapped {
+                blank_run += 1;
+                continue;
+            }
+            for _ in 0..blank_run {
+                out.push_str("\r\n");
+            }
+            blank_run = 0;
+            out.push_str(&text);
+            if !wrapped {
+                if !style.is_empty() {
+                    out.push_str("\x1b[0m");
+                    style.clear();
+                }
+                out.push_str("\r\n");
+            }
+        }
+        if out.trim().is_empty() {
+            return None;
+        }
+        out.push_str("\x1b[0m");
+        Some(out)
     }
 
     /// Case-insensitive search over scrollback + screen. Soft-wrapped rows are joined, so a
@@ -747,6 +824,60 @@ fn pid_cwd(pid: i32) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// SGR sequence for a cell's colors and attributes ("" for the default style).
+fn sgr_for(fg: alacritty_terminal::vte::ansi::Color, bg: alacritty_terminal::vte::ansi::Color, flags: Flags) -> String {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    let mut parts: Vec<String> = Vec::new();
+    let mut dim = flags.contains(Flags::DIM);
+    let color = |c: Color, fg: bool, dim: &mut bool| -> Option<String> {
+        let base = if fg { 30 } else { 40 };
+        match c {
+            Color::Spec(rgb) => Some(format!("{};2;{};{};{}", base + 8, rgb.r, rgb.g, rgb.b)),
+            Color::Indexed(i) => Some(format!("{};5;{}", base + 8, i)),
+            Color::Named(n) => {
+                let n = n as usize;
+                match n {
+                    0..=7 => Some((base + n).to_string()),
+                    8..=15 => Some((base + 60 + n - 8).to_string()),
+                    // DimBlack..DimWhite
+                    259..=266 => {
+                        *dim |= fg;
+                        Some((base + n - 259).to_string())
+                    }
+                    _ if n == NamedColor::DimForeground as usize => {
+                        *dim |= fg;
+                        None
+                    }
+                    _ => None,
+                }
+            }
+        }
+    };
+    let f = color(fg, true, &mut dim);
+    let b = color(bg, false, &mut dim);
+    if flags.contains(Flags::BOLD) {
+        parts.push("1".into());
+    }
+    if dim {
+        parts.push("2".into());
+    }
+    if flags.contains(Flags::ITALIC) {
+        parts.push("3".into());
+    }
+    if flags.intersects(Flags::ALL_UNDERLINES) {
+        parts.push("4".into());
+    }
+    if flags.contains(Flags::INVERSE) {
+        parts.push("7".into());
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        parts.push("9".into());
+    }
+    parts.extend(f);
+    parts.extend(b);
+    if parts.is_empty() { String::new() } else { format!("\x1b[0;{}m", parts.join(";")) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,4 +1066,24 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(s.foreground_cwd().map(|p| p.canonicalize().unwrap()), Some(dir));
     }
+
+    #[test]
+    fn scrollback_dump_round_trips() {
+        let (mut s, mut rx) = TerminalSession::spawn(
+            sh("i=0; while [ $i -lt 30 ]; do echo line$i; i=$((i+1)); done; printf '\\033[1;31mred\\033[0m plain\\n'; printf 'xxxxxxxxxxxxxxxxWrapped\\n'"),
+            TermDims::new(20, 8, 8, 16),
+            Palette::dark(),
+        )
+        .unwrap();
+        run_until_exit(&mut s, &mut rx);
+        let dump = s.dump_ansi(1000).expect("has output");
+        assert!(dump.contains("line0\r\n") && dump.contains("\x1b[0;1;31mred\x1b[0m plain"), "{dump:?}");
+        assert!(dump.contains("xxxxxxxxxxxxxxxxWrapped"), "wrapped line joined: {dump:?}");
+        let (mut r, mut rx2) = TerminalSession::spawn(SessionConfig { restore: Some(dump.clone()), ..sh("true") }, TermDims::new(20, 8, 8, 16), Palette::dark()).unwrap();
+        run_until_exit(&mut r, &mut rx2);
+        assert_eq!(r.search("line29", 10).0.len(), 1);
+        assert_eq!(r.dump_ansi(1000).as_deref(), Some(dump.as_str()));
+        assert_eq!(s.dump_ansi(5).unwrap().matches("\r\n").count(), 4, "capped to the last lines");
+    }
+
 }

@@ -548,15 +548,15 @@ fn call_tool(inner: &Inner, name: &str, args: &Value) -> Result<Value, (i64, Str
     }
 }
 
-/// Claude Code settings (passed with `--settings`) whose hooks report Stop / Notification
-/// events back to this server, tagged with the terminal they came from.
+/// Claude Code settings (passed with `--settings`) whose hooks report Stop / Notification /
+/// SessionEnd / UserPromptSubmit events back to this server, tagged with the terminal they came from.
 pub fn hook_settings_json() -> String {
     let cmd = r#"[ -n "$CLAUDE_CODE_SSE_PORT" ] && [ -n "$JT_HOOK_TOKEN" ] && curl -s -m 2 -X POST -H "X-JT-Token: $JT_HOOK_TOKEN" -H "X-JT-Terminal: $JT_TERMINAL_ID" -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$CLAUDE_CODE_SSE_PORT/hook" >/dev/null 2>&1; exit 0"#;
     let hook = json!([{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}]);
     // statusLine: hand the payload to juan-terminal (which draws its own bar) and print nothing.
     let status = r#"[ -n "$CLAUDE_CODE_SSE_PORT" ] && [ -n "$JT_HOOK_TOKEN" ] && curl -s -m 1 -X POST -H "X-JT-Token: $JT_HOOK_TOKEN" -H "X-JT-Terminal: $JT_TERMINAL_ID" -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$CLAUDE_CODE_SSE_PORT/statusline" >/dev/null 2>&1; exit 0"#;
     json!({
-        "hooks": {"Stop": hook, "Notification": hook},
+        "hooks": {"Stop": hook, "Notification": hook, "SessionEnd": hook, "UserPromptSubmit": hook},
         "statusLine": {"type": "command", "command": status, "padding": 0},
     })
     .to_string()

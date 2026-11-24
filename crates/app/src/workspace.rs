@@ -32,6 +32,7 @@ actions!(
     [
         NewTerminal,
         NewWindow,
+        NewFile,
         CloseTerminal,
         NextTerminal,
         PreviousTerminal,
@@ -204,6 +205,8 @@ pub struct Workspace {
     pub(crate) claude_pending: Option<crate::claude_bridge::PendingDiff>,
     pub(crate) claude_sessions: usize,
     next_terminal_id: u64,
+    /// Saved output for the next terminal spawned (restoring a project's tabs).
+    pending_restore: Option<String>,
     /// Repos found by rediscovery, applied to the Git panel when a window is at hand.
     pending_git_repos: Option<Vec<(String, PathBuf)>>,
     /// Launcher action waiting for its project to become active.
@@ -258,11 +261,15 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(store: StateStore, state: WorkspaceState, primary: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let dock_owner = cx.entity_id().as_u64();
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
+                this.save_scrollback(cx);
                 this.persist(cx);
                 async {}
             }),
+            // A closed window no longer counts toward the Dock badge.
+            cx.on_release(move |_, _| crate::claude_bridge::set_dock_count(dock_owner, 0)),
             cx.observe_window_bounds(window, |this, window, _| {
                 if let WindowBounds::Windowed(b) = window.window_bounds() {
                     this.state.window = Some(WindowGeometry {
@@ -311,6 +318,7 @@ impl Workspace {
             claude_pending: None,
             claude_sessions: 0,
             next_terminal_id: 1,
+            pending_restore: None,
             pending_git_repos: None,
             pending_launch: None,
             tools_panel: None,
@@ -539,6 +547,7 @@ impl Workspace {
             let has_claude = saved.iter().any(|t| t.title.as_deref() == Some("Claude"));
             for t in &saved {
                 let cwd = t.cwd.clone().filter(|p| p.is_dir()).or_else(|| default_cwd.clone());
+                self.pending_restore = t.scrollback.as_deref().and_then(|id| std::fs::read_to_string(scrollback_file(id)).ok());
                 if t.title.as_deref() == Some("Claude") {
                     self.open_claude(cwd, t.repository.clone(), window, cx);
                 } else {
@@ -639,7 +648,7 @@ impl Workspace {
             }
             env.extend(p.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        let config = SessionConfig { cwd: cwd.clone(), env, program, ..SessionConfig::default() };
+        let config = SessionConfig { cwd: cwd.clone(), env, program, restore: self.pending_restore.take(), ..SessionConfig::default() };
         let (session, rx) = match TerminalSession::spawn(config, TermDims::new(80, 24, 8, 16), theme::terminal_palette()) {
             Ok(s) => s,
             Err(err) => {
@@ -1406,35 +1415,7 @@ impl Workspace {
                 }
             };
             self.attach_file_tools(&view, cx);
-            let sub = cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
-                EditorEvent::OpenLocation { path, line, character } => {
-                    let (path, line, character) = (path.clone(), *line, *character);
-                    this.open_file(&path, true, window, cx);
-                    if let Some(e) = this.active_editor().cloned() {
-                        e.update(cx, |e, cx| e.go_to(line, character, cx));
-                    }
-                    this.persist(cx);
-                }
-                EditorEvent::Changed => {
-                    this.sync_ide(cx);
-                    cx.notify();
-                }
-                EditorEvent::SelectionChanged => this.sync_ide(cx),
-                EditorEvent::Saved(path) => {
-                    if *path == workspace_state::settings_path() {
-                        this.reload_settings(window, cx);
-                    }
-                    this.upload_if_remote(path, cx);
-                    if let Some(gp) = &this.git_panel {
-                        gp.update(cx, |g, cx| g.refresh_path(path, cx));
-                    }
-                }
-                EditorEvent::Error(e) => {
-                    this.error = Some(e.clone().into());
-                    cx.notify();
-                }
-            });
-            self._subscriptions.push(sub);
+            self.subscribe_editor(&view, window, cx);
             let tabs = self.editors.entry(key).or_default();
             tabs.tabs.push(view);
             tabs.active = tabs.tabs.len() - 1;
@@ -1445,6 +1426,78 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn subscribe_editor(&mut self, view: &Entity<EditorView>, window: &mut Window, cx: &mut Context<Self>) {
+        let sub = cx.subscribe_in(view, window, |this, view, event, window, cx| match event {
+            EditorEvent::SaveAs => this.save_as(view.clone(), false, window, cx),
+            EditorEvent::OpenLocation { path, line, character } => {
+                let (path, line, character) = (path.clone(), *line, *character);
+                this.open_file(&path, true, window, cx);
+                if let Some(e) = this.active_editor().cloned() {
+                    e.update(cx, |e, cx| e.go_to(line, character, cx));
+                }
+                this.persist(cx);
+            }
+            EditorEvent::Changed => {
+                this.sync_ide(cx);
+                cx.notify();
+            }
+            EditorEvent::SelectionChanged => this.sync_ide(cx),
+            EditorEvent::Saved(path) => {
+                if *path == workspace_state::settings_path() {
+                    this.reload_settings(window, cx);
+                }
+                this.upload_if_remote(path, cx);
+                if let Some(gp) = &this.git_panel {
+                    gp.update(cx, |g, cx| g.refresh_path(path, cx));
+                }
+            }
+            EditorEvent::Error(e) => {
+                this.error = Some(e.clone().into());
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(sub);
+    }
+
+    /// ⌘N: empty untitled buffer; its first save asks where to put it.
+    fn new_untitled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff_active = false;
+        let font_size = self.font_size;
+        let view = cx.new(|cx| EditorView::new(editor::Document::from_str("", editor::Language::PlainText), font_size, cx));
+        self.subscribe_editor(&view, window, cx);
+        let tabs = self.editors.entry(self.active_key()).or_default();
+        tabs.tabs.push(view.clone());
+        tabs.active = tabs.tabs.len() - 1;
+        window.focus(&view.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Native save panel for an untitled buffer (starting in the active project); the chosen
+    /// extension sets the language. `close` removes the tab once written.
+    fn save_as(&mut self, view: Entity<EditorView>, close: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self
+            .active_project()
+            .and_then(|p| p.root.clone().or_else(|| p.repositories.first().map(|r| r.path.clone())))
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let rx = cx.prompt_for_new_path(&dir, Some("untitled.txt"));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                view.update(cx, |v, cx| v.set_path(path.clone(), cx));
+                if !view.update(cx, |v, cx| v.save(cx)) {
+                    return;
+                }
+                this.attach_file_tools(&view, cx);
+                this.persist(cx);
+                if close {
+                    this.remove_editor(&view, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Open files dropped on the window or handed over by Finder/Dock ("Open With").
@@ -1577,6 +1630,7 @@ impl Workspace {
             cx.spawn_in(window, async move |this, cx| {
                 let answer = answer.await.unwrap_or(2);
                 let _ = this.update_in(cx, |this, window, cx| match answer {
+                    0 if view.read(cx).is_untitled() => this.save_as(view.clone(), true, window, cx),
                     0 => {
                         if view.update(cx, |v, cx| v.save(cx)) {
                             this.remove_editor(&view, window, cx);
@@ -1622,7 +1676,7 @@ impl Workspace {
     fn save_all(&mut self, cx: &mut Context<Self>) {
         for tabs in self.editors.values() {
             for e in &tabs.tabs {
-                if e.read(cx).is_dirty() {
+                if e.read(cx).is_dirty() && !e.read(cx).is_untitled() {
                     e.update(cx, |e, cx| e.save(cx));
                 }
             }
@@ -1730,6 +1784,7 @@ impl Workspace {
         if self.state.autosave {
             self.save_all(cx);
         }
+        self.save_scrollback(cx);
         self.persist(cx);
         if self.primary {
             self.primary = false;
@@ -1886,7 +1941,7 @@ impl Workspace {
         if self.locked.contains(&active) {
             // Hours are over: save files and close the project (terminals get SIGHUP).
             for e in self.editors.get(&active).map(|t| t.tabs.clone()).unwrap_or_default() {
-                if e.read(cx).is_dirty() {
+                if e.read(cx).is_dirty() && !e.read(cx).is_untitled() {
                     e.update(cx, |e, cx| e.save(cx));
                 }
             }
@@ -2425,6 +2480,39 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Write each live terminal's output to `scrollback/<jt_id>.ansi` (quit / window close),
+    /// so a relaunch shows it again. Files untouched for two weeks are dropped.
+    fn save_scrollback(&mut self, cx: &mut Context<Self>) {
+        let dir = workspace_state::state_dir().join("scrollback");
+        let _ = std::fs::create_dir_all(&dir);
+        for (key, tabs) in &self.terminals {
+            if key == SCRATCH {
+                continue;
+            }
+            for t in &tabs.tabs {
+                let t = t.read(cx);
+                if t.has_exited() {
+                    continue;
+                }
+                let file = scrollback_file(&t.jt_id);
+                match t.dump_scrollback() {
+                    Some(text) => {
+                        let _ = std::fs::write(&file, text);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&file);
+                    }
+                }
+            }
+        }
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(14 * 24 * 3600);
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.metadata().and_then(|m| m.modified()).is_ok_and(|m| m < cutoff) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     /// Persist state, including live terminals' working directories and open files.
     pub(crate) fn persist(&mut self, cx: &mut Context<Self>) {
         for (key, tabs) in &self.terminals {
@@ -2438,7 +2526,12 @@ impl Workspace {
                 .filter(|t| !t.read(cx).has_exited())
                 .map(|t| {
                     let t = t.read(cx);
-                    TerminalState { title: t.label.clone().filter(|l| l == "Claude"), cwd: t.current_cwd(), repository: t.repository.clone() }
+                    TerminalState {
+                        title: t.label.clone().filter(|l| l == "Claude"),
+                        cwd: t.current_cwd(),
+                        repository: t.repository.clone(),
+                        scrollback: Some(t.jt_id.clone()),
+                    }
                 })
                 .collect();
             project.active_terminal = Some(tabs.active);
@@ -3474,6 +3567,7 @@ impl Render for Workspace {
             .text_color(theme::rgb(theme::TEXT))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(|this, _: &NewWindow, window, cx| this.open_project_window(None, window, cx)))
+            .on_action(cx.listener(|this, _: &NewFile, window, cx| this.new_untitled(window, cx)))
             .on_action(cx.listener(Self::close_terminal))
             .on_action(cx.listener(|this, _: &NextTerminal, w, cx| this.cycle_terminal(true, w, cx)))
             .on_action(cx.listener(|this, _: &PreviousTerminal, w, cx| this.cycle_terminal(false, w, cx)))
@@ -3788,4 +3882,10 @@ pub fn toggle_theme(cx: &mut App) {
         });
     }
     cx.refresh_windows();
+}
+
+/// Saved output of terminal `id` (see `Workspace::save_scrollback`).
+fn scrollback_file(id: &str) -> PathBuf {
+    let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    workspace_state::state_dir().join("scrollback").join(format!("{safe}.ansi"))
 }

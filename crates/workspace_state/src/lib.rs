@@ -120,6 +120,8 @@ pub struct TerminalState {
     pub cwd: Option<PathBuf>,
     /// Repository this terminal belongs to, if any.
     pub repository: Option<String>,
+    /// Saved output (`scrollback/<id>.ansi` in the state dir), shown again on restore.
+    pub scrollback: Option<String>,
 }
 
 impl WorkspaceState {
@@ -389,7 +391,7 @@ mod tests {
         let p = state.project_mut(&id).unwrap();
         p.env.insert("NODE_ENV".into(), "development".into());
         p.commands.push(ProjectCommand { name: "dev".into(), command: "pnpm dev".into(), repository: None });
-        p.terminals.push(TerminalState { title: None, cwd: Some(dir.clone()), repository: None });
+        p.terminals.push(TerminalState { title: None, cwd: Some(dir.clone()), repository: None, scrollback: None });
         state.window = Some(WindowGeometry { x: 1.0, y: 2.0, width: 800.0, height: 600.0 });
         store.save(&state).unwrap();
         let mut loaded = store.load();

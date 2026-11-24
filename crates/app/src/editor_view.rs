@@ -27,7 +27,8 @@ actions!(
         PageUp, PageDown, Backspace, Delete, DeleteWordLeft, DeleteToLineStart, Newline, Indent,
         Outdent, SelectAll, Copy, Cut, Paste, Undo, Redo, Save, ToggleComment, Find, FindNext,
         FindPrevious, SelectLine, GoToLine, ToggleMarkdownLive, GoToDefinition, InsertTable,
-        ToggleWordWrap, DismissMenu,
+        ToggleWordWrap, DismissMenu, SelectNextOccurrence, SelectAllOccurrences, AddCursorAbove,
+        AddCursorBelow,
     ]
 );
 
@@ -88,6 +89,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f12", GoToDefinition, c),
         KeyBinding::new("alt-z", ToggleWordWrap, c),
         KeyBinding::new("escape", DismissMenu, c),
+        KeyBinding::new("cmd-d", SelectNextOccurrence, c),
+        KeyBinding::new("cmd-ctrl-g", SelectAllOccurrences, c),
+        KeyBinding::new("cmd-alt-up", AddCursorAbove, c),
+        KeyBinding::new("cmd-alt-down", AddCursorBelow, c),
     ]);
 }
 
@@ -100,6 +105,8 @@ pub enum EditorEvent {
     Saved(PathBuf),
     /// Caret/selection or diagnostics changed (Claude IDE sync).
     SelectionChanged,
+    /// Save requested on an untitled buffer: the workspace asks where to put it.
+    SaveAs,
 }
 
 /// Oxfmt/Oxlint found for the repository containing this file.
@@ -696,6 +703,7 @@ impl EditorView {
             return;
         }
         if self.doc.language == Language::Markdown {
+            self.doc.clear_extra();
             self.markdown_live = !self.markdown_live;
             self.autoscroll = true;
             cx.notify();
@@ -720,12 +728,33 @@ impl EditorView {
         self.doc.is_dirty()
     }
 
+    /// New buffer (⌘N) that has never been saved.
+    pub fn is_untitled(&self) -> bool {
+        self.doc.path.is_none() && self.asset.is_none()
+    }
+
+    /// Give an untitled buffer its file: the language follows the new extension.
+    pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.doc.language = Language::from_path(&path);
+        self.doc.path = Some(path);
+        self.spans.clear();
+        self.spans_version = u64::MAX;
+        self.md_blocks_version = u64::MAX;
+        self.md_cache = None;
+        self.markdown_live = self.doc.language == Language::Markdown && self.doc.line_count() < 5000;
+        self.svg_preview = false;
+        self.schedule_highlight(Duration::ZERO, cx);
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+    }
+
     pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         self.font_size = px(size + theme::EDITOR_FONT_BONUS);
         cx.notify();
     }
 
     pub fn go_to(&mut self, line: usize, col: usize, cx: &mut Context<Self>) {
+        self.doc.clear_extra();
         let pos = self.doc.pos(line, col);
         self.doc.set_cursor(pos, false);
         self.autoscroll = true;
@@ -735,6 +764,10 @@ impl EditorView {
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
         if self.pure_asset() {
             return true;
+        }
+        if self.is_untitled() {
+            cx.emit(EditorEvent::SaveAs);
+            return false;
         }
         if let Some(path) = &self.doc.path {
             for s in &self.lsp {
@@ -894,13 +927,21 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Markdown live view draws a single caret: keep only the primary one there.
+    fn single_cursor_in_live(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_live && self.doc.has_multi() {
+            self.doc.clear_extra();
+            cx.notify();
+        }
+    }
+
     /// Up/down by visual row when soft wrap is active (like VS Code).
     fn move_visual(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
         if !extend && self.slash_key(if delta < 0 { crate::slash_menu::SlashKey::Up } else { crate::slash_menu::SlashKey::Down }, cx) {
             return;
         }
-        if self.wrap_cols == usize::MAX || self.markdown_live {
-            self.run(cx, |d| d.move_vertical(delta, extend));
+        if self.wrap_cols == usize::MAX || self.markdown_live || self.doc.has_multi() {
+            self.run(cx, |d| d.each_cursor(|d| d.move_vertical(delta, extend)));
             return;
         }
         let head = self.doc.selection.head;
@@ -959,6 +1000,11 @@ impl EditorView {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.has_multi() {
+            // One line per cursor; pasting with the same number of cursors splits it back.
+            cx.write_to_clipboard(ClipboardItem::new_string(self.doc.selections_text().join("\n")));
+            return;
+        }
         let text = if self.doc.selection.is_empty() {
             // Copy the whole line when nothing is selected (common editor behavior).
             let (line, _) = self.doc.line_col(self.doc.selection.head);
@@ -970,6 +1016,11 @@ impl EditorView {
     }
 
     fn cut(&mut self, _: &Cut, w: &mut Window, cx: &mut Context<Self>) {
+        if self.doc.has_multi() {
+            self.copy(&Copy, w, cx);
+            self.run(cx, |d| d.each_cursor(|d| d.insert("")));
+            return;
+        }
         if self.doc.selection.is_empty() {
             let head = self.doc.selection.head;
             self.doc.select_line_at(head);
@@ -980,7 +1031,12 @@ impl EditorView {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-            self.run(cx, |d| d.insert(&text));
+            let pieces: Vec<String> = text.split('\n').map(str::to_string).collect();
+            self.run(cx, |d| {
+                if !d.insert_per_cursor(&pieces) {
+                    d.each_cursor(|d| d.insert(&text));
+                }
+            });
         }
     }
 
@@ -1212,6 +1268,7 @@ impl EditorView {
         find.current = find.matches.iter().position(|m| m.start >= head).or((!find.matches.is_empty()).then_some(0));
         if jump {
             if let Some(m) = find.current.map(|i| find.matches[i].clone()) {
+                self.doc.clear_extra();
                 self.doc.selection = Selection { anchor: m.start, head: m.end };
                 self.autoscroll = true;
             }
@@ -1232,6 +1289,7 @@ impl EditorView {
         };
         find.current = Some(next);
         let m = find.matches[next].clone();
+        self.doc.clear_extra();
         self.doc.selection = Selection { anchor: m.start, head: m.end };
         self.autoscroll = true;
         cx.notify();
@@ -1268,6 +1326,14 @@ impl EditorView {
     fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         let Some(pos) = self.pos_at(e.position) else { return };
+        // ⌥-click: add (or remove) a caret.
+        if e.modifiers.alt && e.click_count == 1 && !self.markdown_live {
+            self.doc.toggle_cursor_at(pos);
+            self.selecting = false;
+            cx.notify();
+            return;
+        }
+        self.doc.clear_extra();
         if e.modifiers.platform && e.click_count == 1 && !self.markdown_live {
             self.doc.set_cursor(pos, false);
             self.go_to_definition(cx);
@@ -1455,7 +1521,7 @@ macro_rules! cmd {
         $cx.listener(move |$this: &mut EditorView, _, _, cx| {
             let f: fn(&mut Document, isize) = $body;
             let page = $this.page_lines();
-            $this.run(cx, |d| f(d, page));
+            $this.run(cx, |d| d.each_cursor(|d| f(d, page)));
         })
     };
 }
@@ -1614,6 +1680,11 @@ impl Render for EditorView {
             .on_action::<DeleteWordLeft>(cmd!(this, cx, |d, _| d.delete_word_backward()))
             .on_action::<DeleteToLineStart>(cmd!(this, cx, |d, _| d.delete_to_line_start()))
             .on_action(cx.listener(|this, _: &DismissMenu, _, cx| {
+                if this.doc.has_multi() {
+                    this.doc.clear_extra();
+                    cx.notify();
+                    return;
+                }
                 if !this.slash_key(crate::slash_menu::SlashKey::Escape, cx) {
                     cx.propagate();
                 }
@@ -1622,31 +1693,54 @@ impl Render for EditorView {
                 if this.slash_key(crate::slash_menu::SlashKey::Enter, cx) {
                     return;
                 }
-                if !(this.markdown_live && this.table_enter(cx)) {
-                    this.run(cx, |d| d.newline());
+                if !(this.markdown_live && !this.doc.has_multi() && this.table_enter(cx)) {
+                    this.run(cx, |d| d.each_cursor(|d| d.newline()));
                 }
             }))
             .on_action(cx.listener(|this, _: &Indent, _, cx| {
-                if !(this.markdown_live && this.table_tab(true, cx)) {
-                    this.run(cx, |d| d.indent());
+                if !(this.markdown_live && !this.doc.has_multi() && this.table_tab(true, cx)) {
+                    this.run(cx, |d| d.each_cursor(|d| d.indent()));
                 }
             }))
             .on_action(cx.listener(|this, _: &Outdent, _, cx| {
-                if !(this.markdown_live && this.table_tab(false, cx)) {
-                    this.run(cx, |d| d.outdent());
+                if !(this.markdown_live && !this.doc.has_multi() && this.table_tab(false, cx)) {
+                    this.run(cx, |d| d.each_cursor(|d| d.outdent()));
                 }
             }))
             .on_action(cx.listener(Self::insert_table))
-            .on_action::<SelectAll>(cmd!(this, cx, |d, _| d.select_all()))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.run(cx, |d| d.select_all())))
             .on_action::<SelectLine>(cmd!(this, cx, |d, _| {
                 let head = d.selection.range().start;
                 d.select_line_at(head)
             }))
-            .on_action::<Undo>(cmd!(this, cx, |d, _| {
-                d.undo();
+            .on_action(cx.listener(|this, _: &Undo, _, cx| {
+                this.run(cx, |d| {
+                    d.undo();
+                })
             }))
-            .on_action::<Redo>(cmd!(this, cx, |d, _| {
-                d.redo();
+            .on_action(cx.listener(|this, _: &Redo, _, cx| {
+                this.run(cx, |d| {
+                    d.redo();
+                })
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextOccurrence, _, cx| {
+                this.run(cx, |d| d.select_next_occurrence());
+                this.single_cursor_in_live(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectAllOccurrences, _, cx| {
+                if !this.markdown_live {
+                    this.run(cx, |d| d.select_all_occurrences());
+                }
+            }))
+            .on_action(cx.listener(|this, _: &AddCursorAbove, _, cx| {
+                if !this.markdown_live {
+                    this.run(cx, |d| d.add_cursor_vertical(-1));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &AddCursorBelow, _, cx| {
+                if !this.markdown_live {
+                    this.run(cx, |d| d.add_cursor_vertical(1));
+                }
             }))
             .on_action::<ToggleComment>(cmd!(this, cx, |d, _| d.toggle_comment()))
             .on_action(cx.listener(Self::copy))
@@ -1766,7 +1860,7 @@ impl EntityInputHandler for EditorView {
             return;
         }
         let text = text.to_string();
-        self.run(cx, |d| d.insert(&text));
+        self.run(cx, |d| d.each_cursor(|d| d.insert(&text)));
         self.update_slash_menu(Some(&text));
     }
 
@@ -1842,6 +1936,8 @@ struct Prepaint {
     gutter: Vec<(Point<Pixels>, ShapedLine)>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     cursor: Option<Bounds<Pixels>>,
+    /// Secondary carets (multi-cursor).
+    extra_cursors: Vec<Bounds<Pixels>>,
     marked: Option<(Point<Pixels>, ShapedLine)>,
     line_height: Pixels,
     text_clip: Bounds<Pixels>,
@@ -1986,6 +2082,18 @@ impl Element for EditorElement {
             // Spans are only valid for the version they were computed from.
             let spans: &[HighlightSpan] = if view.spans_version == view.doc.version() { &view.spans } else { &[] };
             let sel = view.doc.selection.range();
+            // Secondary cursors: (selection range, caret line, caret column).
+            let extra_sels: Vec<(Range<usize>, usize, usize)> = view
+                .doc
+                .all_selections()
+                .into_iter()
+                .skip(1)
+                .map(|s| {
+                    let (l, c) = view.doc.line_col(s.head);
+                    (s.range(), l, c)
+                })
+                .collect();
+            let mut extra_cursors = Vec::new();
             let find_ranges: Vec<(Range<usize>, bool)> = view
                 .find
                 .as_ref()
@@ -2086,6 +2194,18 @@ impl Element for EditorElement {
                         let x = text_origin.x + rl.x_of(cur_col);
                         cursor = Some(Bounds::new(point(x, y), size(px(2.), line_height)));
                     }
+                    for (r, cl, cc) in &extra_sels {
+                        if !r.is_empty() && r.start <= line_end_char && r.end >= line_start_char {
+                            let a = r.start.max(line_start_char) - line_start_char;
+                            let b = r.end.min(line_end_char) - line_start_char;
+                            let extra = if (last && r.end > line_end_char) || (!last && b > end) { char_width * 0.6 } else { px(0.) };
+                            band(a, b, extra, color(theme::SELECTION), &mut quads);
+                        }
+                        if *cl == line && rl.contains_cursor((*cc).min(ncols)) {
+                            let x = text_origin.x + rl.x_of(*cc);
+                            extra_cursors.push(Bounds::new(point(x, y), size(px(2.), line_height)));
+                        }
+                    }
                     lines.push((point(text_origin.x, y), rl.shaped.clone()));
                     rendered.push(rl);
                 }
@@ -2112,6 +2232,7 @@ impl Element for EditorElement {
                 gutter,
                 lines,
                 cursor: if focused { cursor } else { None },
+                extra_cursors: if focused { extra_cursors } else { Vec::new() },
                 marked,
                 line_height,
                 text_clip: Bounds::new(point(text_left, bounds.origin.y), size(text_width, bounds.size.height)),
@@ -2141,6 +2262,9 @@ impl Element for EditorElement {
             }
             if let Some(c) = state.cursor {
                 window.paint_quad(fill(c, color(theme::ACCENT)));
+            }
+            for c in &state.extra_cursors {
+                window.paint_quad(fill(*c, color(theme::ACCENT)));
             }
         });
     }
