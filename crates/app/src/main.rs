@@ -143,6 +143,7 @@ fn main() {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("New Window", workspace::NewWindow),
+                    MenuItem::action("New File", workspace::NewFile),
                     MenuItem::action("New Terminal", workspace::NewTerminal),
                     MenuItem::action("Open Project…", workspace::OpenProject),
                     MenuItem::action("Add Repository…", workspace::AddRepository),
@@ -331,6 +332,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", w::PreviousEditor, Some("Editor")),
         KeyBinding::new("cmd-t", w::NewTerminal, Some("Workspace")),
         KeyBinding::new("cmd-shift-n", w::NewWindow, Some("Workspace")),
+        KeyBinding::new("cmd-n", w::NewFile, Some("Workspace")),
         KeyBinding::new("cmd-w", w::CloseTerminal, Some("Workspace")),
         KeyBinding::new("cmd-shift-]", w::NextTerminal, Some("Workspace")),
         KeyBinding::new("cmd-shift-[", w::PreviousTerminal, Some("Workspace")),

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/gpui"]
 members = ["crates/app", "crates/workspace_state", "crates/terminal_engine", "crates/editor", "crates/project_search", "crates/git_engine", "crates/code_quality", "crates/lsp_client", "crates/claude_ide", "crates/ssh_remote"]
 
 [workspace.package]
@@ -40,3 +41,8 @@ opt-level = 3
 
 [profile.dev]
 debug = 1
+
+# Local gpui fork: fixes a main-thread deadlock in window_did_change_key_status
+# (resignKeyWindow called while holding window_state lock). See vendor/gpui.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

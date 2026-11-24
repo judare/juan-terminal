@@ -225,7 +225,7 @@ fn statusline_posts_are_forwarded() {
 #[test]
 fn hook_settings_are_valid_claude_settings() {
     let v: Value = serde_json::from_str(&hook_settings_json()).unwrap();
-    for ev in ["Stop", "Notification"] {
+    for ev in ["Stop", "Notification", "SessionEnd", "UserPromptSubmit"] {
         let cmd = v["hooks"][ev][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("/hook") && cmd.contains("$JT_HOOK_TOKEN"));
     }

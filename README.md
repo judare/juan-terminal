@@ -25,6 +25,12 @@ The app appears in the Dock. State: `~/Library/Application Support/juan-terminal
 | ⌘B | Toggle sidebar |
 | ⌘= ⌘- ⌘0 | Font size |
 | ⇧PgUp/PgDn, ⌘Home/End | Scroll |
+| ⌘N | New untitled file (first save asks where; the extension sets the language) |
+| ⌥-click | Add / remove a cursor |
+| ⌥⌘↑ / ⌥⌘↓ | Add cursor above / below |
+| ⌘D / ⌃⌘G | Select next / all occurrences (multi-cursor); Esc back to one cursor |
+
+Terminal output (last 5,000 lines) is saved on quit / window close and shown again when the tabs are restored.
 
 Click a repository in the sidebar to open (or jump to) a terminal in it.
 

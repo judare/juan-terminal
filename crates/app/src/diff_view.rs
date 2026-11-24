@@ -1,5 +1,5 @@
 //! Diff viewer in the style of VS Code: the whole file (single-file diffs carry full context),
-//! side-by-side or unified, syntax highlighted, with the changed words inside each modified line
+//! unified (default) or side-by-side, syntax highlighted, with the changed words inside each modified line
 //! highlighted. Navigation and stage/unstage work per change block.
 
 use std::path::{Path, PathBuf};
@@ -13,6 +13,9 @@ use gpui::{
 };
 
 use crate::theme;
+
+/// Last layout picked with the toggle; new diff views open with it (unified by default).
+static SIDE_BY_SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 actions!(diff_view, [NextHunk, PreviousHunk, ToggleSideBySide, AcceptProposal, RejectProposal]);
 
@@ -100,7 +103,7 @@ impl DiffView {
             source,
             files,
             root,
-            side_by_side: true,
+            side_by_side: SIDE_BY_SIDE.load(std::sync::atomic::Ordering::Relaxed),
             rows: Vec::new(),
             blocks: Vec::new(),
             row_block: Default::default(),
@@ -173,6 +176,13 @@ impl DiffView {
             }
         }
         self.current_hunk = self.current_hunk.min(self.blocks.len().saturating_sub(1));
+    }
+
+    fn toggle_layout(&mut self, cx: &mut Context<Self>) {
+        self.side_by_side = !self.side_by_side;
+        SIDE_BY_SIDE.store(self.side_by_side, std::sync::atomic::Ordering::Relaxed);
+        self.rebuild_rows();
+        cx.notify();
     }
 
     fn jump_hunk(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -336,15 +346,32 @@ fn line_bg(kind: DiffLineKind) -> Option<u32> {
     }
 }
 
+/// Stronger tint for the line-number gutter of a changed line.
+fn gutter_bg(kind: DiffLineKind) -> Option<u32> {
+    match kind {
+        DiffLineKind::Added => Some(0x23402a),
+        DiffLineKind::Removed => Some(0x4a2226),
+        DiffLineKind::Context => None,
+    }
+}
+
 fn gutter(n: Option<usize>) -> gpui::Div {
     div()
         .w(px(44.))
+        .h_full()
         .flex_none()
         .pr(px(8.))
         .flex()
+        .items_center()
         .justify_end()
         .text_color(theme::rgb(theme::GUTTER_TEXT))
         .child(n.map(|n| n.to_string()).unwrap_or_default())
+}
+
+/// Line-number gutter tinted for its line kind; changed lines get brighter numbers.
+fn kind_gutter(n: Option<usize>, kind: DiffLineKind) -> gpui::Div {
+    gutter(n)
+        .when_some(gutter_bg(kind), |d, c| d.bg(theme::rgb(c)).text_color(theme::rgb(theme::GUTTER_TEXT_ACTIVE)))
 }
 
 impl Render for DiffView {
@@ -408,11 +435,8 @@ impl Render for DiffView {
             .child(toolbar_button("prev-hunk", "↑ Change").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.jump_hunk(-1, cx))))
             .child(toolbar_button("next-hunk", "↓ Change").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.jump_hunk(1, cx))))
             .child(
-                toolbar_button("toggle-sbs", if self.side_by_side { "Unified" } else { "Side by side" }).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.side_by_side = !this.side_by_side;
-                    this.rebuild_rows();
-                    cx.notify();
-                })),
+                toolbar_button("toggle-sbs", if self.side_by_side { "Unified" } else { "Side by side" })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_layout(cx))),
             );
 
         let body = if self.is_empty() {
@@ -478,9 +502,9 @@ impl Render for DiffView {
                                     };
                                     let actions = this.block_actions(ix, cx);
                                     base.when_some(line_bg(l.kind), |d, c| d.bg(theme::rgb(c)))
-                                        .child(gutter(l.old_no))
-                                        .child(gutter(l.new_no))
-                                        .child(div().w(px(16.)).flex_none().text_color(theme::rgb(match l.kind {
+                                        .child(kind_gutter(l.old_no, l.kind))
+                                        .child(kind_gutter(l.new_no, l.kind))
+                                        .child(div().w(px(24.)).pl(px(8.)).flex_none().text_color(theme::rgb(match l.kind {
                                             DiffLineKind::Added => theme::ADDED,
                                             DiffLineKind::Removed => theme::DELETED,
                                             DiffLineKind::Context => theme::TEXT_FAINT,
@@ -498,7 +522,7 @@ impl Render for DiffView {
                                             let kind = l.kind;
                                             d = d
                                                 .when_some(line_bg(kind), |d, c| d.bg(theme::rgb(c)))
-                                                .child(gutter(if old { l.old_no } else { l.new_no }))
+                                                .child(kind_gutter(if old { l.old_no } else { l.new_no }, kind))
                                                 .child(div().flex_1().min_w_0().overflow_hidden().text_color(theme::rgb(theme::TEXT)).child(this.render_code(fi, hi, i)));
                                         } else {
                                             d = d.bg(theme::rgb(0x18191c));
@@ -537,11 +561,7 @@ impl Render for DiffView {
             }))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| this.jump_hunk(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousHunk, _, cx| this.jump_hunk(-1, cx)))
-            .on_action(cx.listener(|this, _: &ToggleSideBySide, _, cx| {
-                this.side_by_side = !this.side_by_side;
-                this.rebuild_rows();
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &ToggleSideBySide, _, cx| this.toggle_layout(cx)))
             .size_full()
             .flex()
             .flex_col()

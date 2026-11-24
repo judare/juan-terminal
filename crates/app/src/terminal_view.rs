@@ -37,6 +37,9 @@ struct TermSearch {
     _sub: Subscription,
 }
 
+/// Lines of output kept per terminal across relaunches.
+const SCROLLBACK_KEEP_LINES: usize = 5_000;
+
 pub enum TerminalViewEvent {
     TitleChanged,
     Exited(Option<i32>),
@@ -293,6 +296,14 @@ impl TerminalView {
             .unwrap_or_else(|| "shell".into())
     }
 
+    /// Drop the Claude badge (and tell the workspace so the sidebar / Dock repaint).
+    pub fn clear_attention(&mut self, cx: &mut Context<Self>) {
+        if self.attention.take().is_some() {
+            cx.emit(TerminalViewEvent::AttentionCleared);
+            cx.notify();
+        }
+    }
+
     /// Type text into the terminal as if the user did (used to auto-start commands).
     pub fn is_claude_running(&self) -> bool {
         self.session.foreground_exe().is_some_and(|p| p.to_string_lossy().contains("claude"))
@@ -472,6 +483,11 @@ impl TerminalView {
         self.session.write(text.as_bytes().to_vec());
     }
 
+    /// Output so far (with colors), for showing it again after a relaunch.
+    pub fn dump_scrollback(&self) -> Option<String> {
+        self.session.dump_ansi(SCROLLBACK_KEEP_LINES)
+    }
+
     pub fn has_exited(&self) -> bool {
         self.exit_code.is_some()
     }
@@ -498,6 +514,10 @@ impl TerminalView {
                         });
                     }));
                 }
+                // Claude quit (or was killed) while its badge was up: nothing waits anymore.
+                if self.attention.is_some() && !self.is_claude_running() {
+                    self.clear_attention(cx);
+                }
                 cx.notify()
             }
             SessionEvent::Title(t) => {
@@ -512,6 +532,7 @@ impl TerminalView {
             SessionEvent::ClipboardStore(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             SessionEvent::Exited(code) => {
                 self.exit_code = Some(code);
+                self.clear_attention(cx);
                 cx.emit(TerminalViewEvent::Exited(code));
                 cx.notify();
             }

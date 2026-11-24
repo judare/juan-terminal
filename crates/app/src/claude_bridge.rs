@@ -251,12 +251,20 @@ impl Workspace {
     }
 
     fn on_claude_hook(&mut self, terminal: Option<String>, event: &str, message: Option<String>, cwd: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let found = terminal.as_deref().and_then(|id| self.find_terminal(id, cx));
         let attention = match event {
             "Stop" => Attention::Done,
             "Notification" => Attention::NeedsInput,
+            // Session closed or the user answered: that terminal no longer waits on them.
+            "SessionEnd" | "UserPromptSubmit" => {
+                if let Some((_, t)) = &found {
+                    t.update(cx, |t, cx| t.clear_attention(cx));
+                }
+                cx.notify();
+                return;
+            }
             _ => return,
         };
-        let found = terminal.as_deref().and_then(|id| self.find_terminal(id, cx));
         let looking_at_it = window.is_window_active() && found.as_ref().is_some_and(|(_, t)| t.read(cx).focus_handle(cx).is_focused(window));
         if let Some((_, t)) = &found {
             if !looking_at_it {
