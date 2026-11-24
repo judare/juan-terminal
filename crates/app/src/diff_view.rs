@@ -206,7 +206,11 @@ impl DiffView {
                 cx.emit(DiffViewEvent::OpenFile { path: path.clone(), line })
             })));
         }
-        if let DiffSource::Changes { repo, staged, .. } = &self.source {
+        // Office documents are diffed as text (textconv): a text patch can't be applied to them.
+        let office = self.file_path(b.file).is_some_and(|p| {
+            p.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "docx" | "docm" | "xlsx" | "xlsm" | "xls" | "ods" | "pptx" | "pptm"))
+        });
+        if let (false, DiffSource::Changes { repo, staged, .. }) = (office, &self.source) {
             let (repo, staged) = (repo.clone(), *staged);
             let patch = self.files[b.file].block_patch(b.hunk, b.lines.clone());
             row = row.child(toolbar_button(("stage-block", ix), if staged { "Unstage" } else { "Stage" }).on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {

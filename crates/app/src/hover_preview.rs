@@ -12,7 +12,8 @@ use crate::theme;
 
 #[derive(Clone, Debug)]
 pub enum Preview {
-    Image { path: PathBuf, title: String, caption: String },
+    /// `size`: natural pixel size, to fit the image in the space available.
+    Image { path: PathBuf, title: String, caption: String, size: Option<(f32, f32)> },
     Code { title: String, caption: String, lines: Vec<(usize, String, Vec<(std::ops::Range<usize>, u32)>)>, lit: Option<usize> },
     Folder { title: String, entries: Vec<(String, bool)>, more: usize },
     File { title: String, caption: String, thumb: Option<PathBuf> },
@@ -94,7 +95,8 @@ pub fn for_path(path: &Path, line: Option<usize>) -> Option<Preview> {
     let size = meta.len();
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg") {
-        return Some(Preview::Image { path: path.to_path_buf(), title, caption: format!("{} · {}", ext.to_uppercase(), human_size(size)) });
+        let natural = imagesize::size(path).ok().map(|s| (s.width as f32, s.height as f32)).filter(|(w, h)| *w > 0. && *h > 0.);
+        return Some(Preview::Image { path: path.to_path_buf(), title, caption: format!("{} · {}", ext.to_uppercase(), human_size(size)), size: natural });
     }
     if size <= 1_048_576 {
         if let Ok(bytes) = std::fs::read(path) {
@@ -191,7 +193,29 @@ pub fn session_image(session_id: &str, cwd: Option<&Path>, n: usize) -> Option<P
     None
 }
 
-pub fn render(p: &Preview) -> gpui::AnyElement {
+/// Card chrome around the content: padding 8 + border 1 on each side.
+const CHROME: f32 = 18.;
+/// Header row + gap under the image.
+const HEADER_H: f32 = 24.;
+
+/// Image box that fits `natural` inside `max_w`×`max_h` (capped at 520×360, never upscaled).
+fn fit_image(natural: Option<(f32, f32)>, max_w: f32, max_h: f32) -> (f32, f32) {
+    let (bw, bh) = (max_w.min(520.).max(60.), max_h.min(360.).max(60.));
+    let (w, h) = natural.unwrap_or((bw, bh));
+    let k = (bw / w).min(bh / h).min(1.);
+    ((w * k).max(1.), (h * k).max(1.))
+}
+
+/// Approximate card width, for placing it inside the view.
+pub fn card_width(p: &Preview, max_w: f32, max_h: f32) -> f32 {
+    match p {
+        Preview::Image { size, .. } => (fit_image(*size, max_w - CHROME, max_h - CHROME - HEADER_H).0 + CHROME).max(200.).min(max_w),
+        _ => 380f32.min(max_w),
+    }
+}
+
+/// `max_w`/`max_h`: space available for the whole card.
+pub fn render(p: &Preview, max_w: f32, max_h: f32) -> gpui::AnyElement {
     let card = div()
         .flex()
         .flex_col()
@@ -202,7 +226,9 @@ pub fn render(p: &Preview) -> gpui::AnyElement {
         .border_1()
         .border_color(theme::rgb(0x363a42))
         .shadow_lg()
-        .max_w(px(560.));
+        .overflow_hidden()
+        .max_w(px(max_w.min(560.)))
+        .max_h(px(max_h.max(80.)));
     let header = |title: &str, caption: &str| {
         div()
             .flex()
@@ -213,10 +239,12 @@ pub fn render(p: &Preview) -> gpui::AnyElement {
             .child(div().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(caption.to_string()))
     };
     match p {
-        Preview::Image { path, title, caption } => card
-            .child(div().max_w(px(520.)).max_h(px(360.)).child(gpui::img(path.clone()).max_w(px(520.)).max_h(px(360.)).object_fit(gpui::ObjectFit::Contain)))
-            .child(header(title, caption))
-            .into_any_element(),
+        Preview::Image { path, title, caption, size } => {
+            let (w, h) = fit_image(*size, max_w - CHROME, max_h - CHROME - HEADER_H);
+            card.child(gpui::img(path.clone()).w(px(w)).h(px(h)).flex_none().object_fit(gpui::ObjectFit::Contain))
+                .child(header(title, caption))
+                .into_any_element()
+        }
         Preview::Code { title, caption, lines, lit } => {
             let mut body = div().flex().flex_col().font_family(theme::MONO_FONT).text_size(px(11.5));
             for (n, text, hl) in lines {

@@ -21,6 +21,8 @@ pub enum GitPanelEvent {
     OpenCommit { repo: PathBuf, commit: Commit },
     CompareBranch { repo: PathBuf, base: String, head: String },
     OpenFile(PathBuf),
+    /// Right-click on a changed file: show the file context menu (with "Locate in Explorer").
+    ContextMenu { position: gpui::Point<gpui::Pixels>, path: PathBuf },
     /// Status changed (refresh open diffs, branch labels…).
     Changed,
 }
@@ -40,8 +42,21 @@ struct RepoState {
     _subs: Vec<Subscription>,
 }
 
+/// Git decoration for a file-tree row: color, plus the status letter (files) or the number
+/// of changed files below it (folders, any depth).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeMark {
+    pub color: u32,
+    pub letter: Option<&'static str>,
+    pub count: usize,
+}
+
 pub struct GitPanel {
     repos: Vec<RepoState>,
+    /// Absolute path -> decoration, rebuilt when any status changes.
+    tree_marks: std::rc::Rc<std::collections::HashMap<PathBuf, TreeMark>>,
+    /// Parent dir -> deleted entries in it (path, is_dir), so the tree can still list them.
+    deleted: std::rc::Rc<std::collections::HashMap<PathBuf, Vec<(PathBuf, bool)>>>,
     /// Repos with a status query in flight (polling never stacks up).
     refreshing: std::collections::HashSet<PathBuf>,
 }
@@ -50,7 +65,7 @@ impl EventEmitter<GitPanelEvent> for GitPanel {}
 
 impl GitPanel {
     pub fn new() -> Self {
-        Self { repos: Vec::new(), refreshing: Default::default() }
+        Self { repos: Vec::new(), tree_marks: Default::default(), deleted: Default::default(), refreshing: Default::default() }
     }
 
     /// Set repositories for the active project and refresh their status.
@@ -96,6 +111,7 @@ impl GitPanel {
                     }
                 })
                 .collect();
+            self.rebuild_tree_marks();
         }
         self.refresh_all(cx);
     }
@@ -103,6 +119,78 @@ impl GitPanel {
     /// Total changed files across all repositories (for the sidebar badge).
     pub fn total_changes(&self) -> usize {
         self.repos.iter().filter_map(|r| r.status.as_ref()).map(|s| s.files.len()).sum()
+    }
+
+    pub fn tree_marks(&self) -> std::rc::Rc<std::collections::HashMap<PathBuf, TreeMark>> {
+        self.tree_marks.clone()
+    }
+
+    /// Repo and change for an absolute path in any repository's status.
+    pub fn change_at(&self, abs: &std::path::Path) -> Option<(PathBuf, FileChange)> {
+        self.repos.iter().find_map(|r| {
+            let rel = abs.strip_prefix(&r.path).ok()?.to_string_lossy().into_owned();
+            let f = r.status.as_ref()?.files.iter().find(|f| f.path == rel)?;
+            Some((r.path.clone(), f.clone()))
+        })
+    }
+
+    /// Deleted files (and folders gone with them), keyed by parent dir.
+    pub fn deleted_entries(&self) -> std::rc::Rc<std::collections::HashMap<PathBuf, Vec<(PathBuf, bool)>>> {
+        self.deleted.clone()
+    }
+
+    fn rebuild_tree_marks(&mut self) {
+        // Folder color: the "strongest" change below it (added < modified < conflicted).
+        fn rank(c: u32) -> u8 {
+            match c {
+                theme::ADDED => 0,
+                0xff6b6b => 2,
+                _ => 1,
+            }
+        }
+        let mut map: std::collections::HashMap<PathBuf, TreeMark> = Default::default();
+        let mut deleted: std::collections::HashMap<PathBuf, Vec<(PathBuf, bool)>> = Default::default();
+        for repo in &self.repos {
+            let Some(st) = repo.status.as_ref() else { continue };
+            for f in &st.files {
+                let kind = f.unstaged.or(f.staged).unwrap_or(ChangeKind::Modified);
+                let color = kind_color(kind);
+                let path = repo.path.join(&f.path);
+                map.insert(path.clone(), TreeMark { color, letter: Some(kind.letter()), count: 0 });
+                if kind == ChangeKind::Deleted && !path.exists() {
+                    // The file, plus every missing folder above it (once each).
+                    let mut child = path.clone();
+                    let mut is_dir = false;
+                    while let Some(parent) = child.parent() {
+                        let list = deleted.entry(parent.to_path_buf()).or_default();
+                        if list.iter().any(|(p, _)| *p == child) {
+                            break;
+                        }
+                        list.push((child.clone(), is_dir));
+                        if parent.exists() || !parent.starts_with(&repo.path) {
+                            break;
+                        }
+                        child = parent.to_path_buf();
+                        is_dir = true;
+                    }
+                }
+                let dir_color = if kind == ChangeKind::Deleted { theme::MODIFIED } else { color };
+                let mut dir = path.parent();
+                while let Some(d) = dir {
+                    if !d.starts_with(&repo.path) || d == repo.path {
+                        break;
+                    }
+                    let m = map.entry(d.to_path_buf()).or_insert(TreeMark { color: dir_color, letter: None, count: 0 });
+                    m.count += 1;
+                    if rank(dir_color) > rank(m.color) {
+                        m.color = dir_color;
+                    }
+                    dir = d.parent();
+                }
+            }
+        }
+        self.tree_marks = std::rc::Rc::new(map);
+        self.deleted = std::rc::Rc::new(deleted);
     }
 
     pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
@@ -160,6 +248,7 @@ impl GitPanel {
                 }
                 // Polling runs every few seconds: only repaint when something changed.
                 if changed {
+                    this.rebuild_tree_marks();
                     cx.emit(GitPanelEvent::Changed);
                     cx.notify();
                 }
@@ -295,12 +384,7 @@ impl GitPanel {
 
     fn render_change(&self, ix: usize, change: &FileChange, staged: bool, row_id: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let kind = if staged { change.staged } else { change.unstaged }.unwrap_or(ChangeKind::Modified);
-        let color = match kind {
-            ChangeKind::Added | ChangeKind::Untracked => theme::ADDED,
-            ChangeKind::Deleted => theme::DELETED,
-            ChangeKind::Conflicted => 0xff6b6b,
-            _ => theme::MODIFIED,
-        };
+        let color = kind_color(kind);
         let name = change.path.rsplit('/').next().unwrap_or(&change.path).to_string();
         let mut dir = change.path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
         // Only show the folder when it fits next to the name (a 1-char ellipsis looks broken).
@@ -316,6 +400,7 @@ impl GitPanel {
         let (c_open, c_stage, c_discard) = (change.clone(), change.clone(), change.clone());
         let p_open = path.clone();
         let file_path = path.join(&change.path);
+        let menu_path = file_path.clone();
         div()
             .id(SharedString::from(format!("chg-{ix}-{staged}-{row_id}")))
             .group(group.clone())
@@ -335,6 +420,10 @@ impl GitPanel {
                 } else {
                     cx.emit(GitPanelEvent::OpenDiff { repo: p_open.clone(), change: c_open.clone(), staged });
                 }
+            }))
+            .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |_, e: &gpui::MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                cx.emit(GitPanelEvent::ContextMenu { position: e.position, path: menu_path.clone() });
             }))
             .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(theme::rgb(icon_color)))
             .child(
@@ -381,6 +470,15 @@ impl GitPanel {
                     })),
             )
             .child(div().w(px(12.)).flex_none().flex().justify_end().text_size(px(11.)).font_family(theme::MONO_FONT).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(color)).child(kind.letter()))
+    }
+}
+
+fn kind_color(kind: ChangeKind) -> u32 {
+    match kind {
+        ChangeKind::Added | ChangeKind::Untracked => theme::ADDED,
+        ChangeKind::Deleted => theme::DELETED,
+        ChangeKind::Conflicted => 0xff6b6b,
+        _ => theme::MODIFIED,
     }
 }
 

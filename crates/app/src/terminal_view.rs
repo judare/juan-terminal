@@ -838,7 +838,7 @@ impl TerminalView {
                     if let Some((sid, scwd, n)) = image {
                         let p = crate::hover_preview::session_image(&sid, scwd.as_deref(), n)?;
                         return crate::hover_preview::for_path(&p, None).map(|pv| match pv {
-                            crate::hover_preview::Preview::Image { path, caption, .. } => crate::hover_preview::Preview::Image { path, title: format!("[Image #{n}]"), caption },
+                            crate::hover_preview::Preview::Image { path, caption, size, .. } => crate::hover_preview::Preview::Image { path, title: format!("[Image #{n}]"), caption, size },
                             other => other,
                         });
                     }
@@ -971,7 +971,13 @@ impl Render for TerminalView {
             // The grid sits inside the root's padding (px 10, pt 6).
             let (x, y) = (at.x + px(10.), at.y + px(6.));
             let lower = at.y > l.size.height / 2.;
-            let el = div().absolute().left((x + px(14.)).min((l.size.width - px(380.)).max(px(0.)))).child(crate::hover_preview::render(pv));
+            // Space it can use: the view minus an 8 px margin, on the side of the pointer it opens to.
+            let (vw, vh) = (f32::from(l.size.width), f32::from(l.size.height));
+            let max_w = (vw - 16.).max(120.);
+            let max_h = if lower { f32::from(y) - 14. - 8. } else { vh - f32::from(y) - 18. - 8. }.max(80.);
+            let card_w = crate::hover_preview::card_width(pv, max_w, max_h);
+            let left = (f32::from(x) + 14.).min(vw - card_w - 8.).max(8.);
+            let el = div().absolute().left(px(left)).child(crate::hover_preview::render(pv, max_w, max_h));
             if lower { el.bottom(l.size.height - y + px(14.)) } else { el.top(y + px(18.)) }
         });
         let search_bar = self.render_search_bar(cx);
@@ -1291,7 +1297,67 @@ pub fn path_at(rows: &[String], wrapped: &[bool], row: usize, col: usize, cwd: O
             }
         }
     }
+    if best.is_none() {
+        // Relative to a subfolder of the cwd (Claude prints paths relative to where it ran a
+        // command, e.g. `06-me-conviene/logo.png` under `store/`): find a folder named like
+        // the first component below the cwd and resolve from its parent.
+        let cwd = cwd?;
+        let mut index: Option<HashMap<String, Vec<PathBuf>>> = None;
+        for i in 0..=center {
+            for j in center..pieces.len() {
+                let joined: String = pieces[i..=j].concat();
+                let t = joined.trim_end_matches(['.', ':', '!', '?']);
+                let (p, line, col) = split_line_col(t);
+                if p.starts_with('/') || p.starts_with('~') || p.starts_with("file:") {
+                    continue;
+                }
+                let Some((first, _)) = p.split_once('/') else { continue };
+                if first.is_empty() || first == "." || first == ".." {
+                    continue;
+                }
+                let idx = index.get_or_insert_with(|| subdir_index(cwd));
+                for dir in idx.get(first).into_iter().flatten() {
+                    let Some(base) = dir.parent() else { continue };
+                    let path = base.join(p);
+                    if path.exists() && best.as_ref().is_none_or(|(len, _)| joined.len() > *len) {
+                        best = Some((joined.len(), (path, line, col)));
+                    }
+                }
+            }
+        }
+    }
     best.map(|(_, f)| f)
+}
+
+/// Folder name -> folders with that name below `root` (bounded breadth-first walk, skipping
+/// hidden and dependency/build folders).
+fn subdir_index(root: &Path) -> HashMap<String, Vec<PathBuf>> {
+    const SKIP: &[&str] = &["node_modules", "target", "vendor", "dist", "build", "Pods", "DerivedData", "__pycache__"];
+    let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            seen += 1;
+            if seen > 5000 {
+                return out;
+            }
+            let path = e.path();
+            out.entry(name).or_default().push(path.clone());
+            if depth < 4 {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+    out
 }
 
 /// How a visible row is drawn, from the shell-integration markers.
@@ -1873,6 +1939,18 @@ mod tone_tests {
         assert_eq!(fmt_ms(30), "30ms");
         assert_eq!(fmt_ms(1500), "1.50s");
         assert_eq!(fmt_ms(125_000), "2m 05s");
+    }
+
+    #[test]
+    fn resolves_path_relative_to_a_subfolder() {
+        let dir = std::env::temp_dir().join(format!("jt-sub-{}", std::process::id()));
+        let leaf = dir.join("apps/store/06-x");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("logo.png"), b"x").unwrap();
+        let rows = vec!["  ⎿ Wrote 06-x/logo.png ok".to_string()];
+        let hit = path_at(&rows, &[false], 0, 14, Some(&dir)).unwrap();
+        assert_eq!(hit.0, leaf.join("logo.png"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

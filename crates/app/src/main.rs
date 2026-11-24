@@ -2,6 +2,12 @@
 
 mod actions_panel;
 mod asset_view;
+mod default_apps;
+mod md_export;
+mod office;
+mod pdf_view;
+mod pptx_view;
+mod brave;
 mod claude_bridge;
 mod claude_sessions;
 mod assets;
@@ -30,6 +36,9 @@ mod text_input;
 mod theme;
 mod tools_panel;
 mod totp;
+mod usage_stats;
+mod usage_view;
+mod video_player;
 mod website_block;
 mod workspace;
 
@@ -54,7 +63,7 @@ pub(crate) fn startup_log(line: &str) {
 }
 
 /// Write `<state>/mcp/<project>.json` registering our `--mcp-servers` stdio server for Claude
-/// (dev servers of the project, SSH servers, ssh_exec). Returns its path.
+/// (dev servers of the project, SSH servers, ssh_exec, the user's Brave). Returns its path.
 pub(crate) fn servers_mcp_config(project: &workspace_state::Project) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = workspace_state::state_dir().join("mcp");
@@ -75,11 +84,21 @@ pub(crate) fn servers_mcp_config(project: &workspace_state::Project) -> Option<s
 }
 
 fn main() {
+    // git textconv for Office documents: print the file as text.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("--textconv") {
+        match args.get(2).map(|p| office::to_text(std::path::Path::new(p))) {
+            Some(Ok(t)) => print!("{t}"),
+            Some(Err(e)) => println!("(couldn't read document: {e})"),
+            None => {}
+        }
+        return;
+    }
     // Stdio MCP server for Claude (spawned by `claude`, not a GUI launch).
     if std::env::args().any(|a| a == "--mcp-servers") {
         let project_id = std::env::var("JT_PROJECT_ID").unwrap_or_default();
         let app_pid: i32 = std::env::var("JT_APP_PID").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
-        ssh_remote::mcp::serve_stdio_with(&|| {
+        let dev_servers = || {
             let roots: Vec<(String, std::path::PathBuf)> = workspace_state::StateStore::default_location()
                 .load()
                 .projects
@@ -88,7 +107,8 @@ fn main() {
                 .map(|p| p.repositories.iter().map(|r| (r.name.clone(), r.path.clone())).chain(p.root.clone().map(|r| (p.name.clone(), r))).collect())
                 .unwrap_or_default();
             ports::dev_servers_report(app_pid, &roots)
-        });
+        };
+        ssh_remote::mcp::serve_stdio_with(&ssh_remote::mcp::Extra { dev_servers: &dev_servers, tools: brave::tools(), call: &brave::call, instructions: brave::INSTRUCTIONS });
         return;
     }
     let started = Instant::now();
@@ -109,6 +129,12 @@ fn main() {
         let _ = open_tx.unbounded_send(urls);
     });
     app.run(move |cx: &mut App| {
+        // Office documents and PDFs open here by default (once; Finder's choice wins after).
+        std::thread::spawn(default_apps::claim_once);
+        // Diffs of .docx/.xlsx/.pptx as text (git textconv through this binary).
+        if let (Some(attrs), Ok(exe)) = (office::install_git_textconv(), std::env::current_exe()) {
+            git_engine::set_office_textconv(attrs, format!("'{}' --textconv", exe.display().to_string().replace('\'', "'\\''")));
+        }
         cx.spawn(async move |cx| {
             use futures::StreamExt;
             while let Some(urls) = open_rx.next().await {
@@ -144,6 +170,9 @@ fn main() {
                 items: vec![
                     MenuItem::action("New Window", workspace::NewWindow),
                     MenuItem::action("New File", workspace::NewFile),
+                    MenuItem::action("New Word Document…", workspace::NewWordDocument),
+                    MenuItem::action("New Excel Workbook…", workspace::NewSpreadsheet),
+                    MenuItem::action("New PowerPoint Presentation…", workspace::NewPresentation),
                     MenuItem::action("New Terminal", workspace::NewTerminal),
                     MenuItem::action("Open Project…", workspace::OpenProject),
                     MenuItem::action("Add Repository…", workspace::AddRepository),
@@ -181,6 +210,7 @@ fn main() {
                     MenuItem::action("Toggle Sidebar", workspace::ToggleSidebar),
                     MenuItem::action("Toggle Terminal", workspace::ToggleTerminalPanel),
                     MenuItem::action("Toggle Light / Dark Theme", workspace::ToggleTheme),
+                    MenuItem::action("Agent Usage", workspace::ShowUsage),
                     MenuItem::action("Command Palette…", workspace::ToggleCommandPalette),
                     MenuItem::action("Go to File…", workspace::ToggleQuickOpen),
                     MenuItem::action("Search in Project", workspace::SearchInProject),
@@ -316,6 +346,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-p", w::ToggleQuickOpen, Some("Workspace")),
         KeyBinding::new("cmd-shift-p", w::ToggleCommandPalette, Some("Workspace")),
         KeyBinding::new("cmd-alt-t", w::ToggleTheme, Some("Workspace")),
+        KeyBinding::new("cmd-shift-u", w::ShowUsage, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", w::SearchInProject, Some("Workspace")),
         KeyBinding::new("cmd-shift-e", w::ShowFiles, Some("Workspace")),
         KeyBinding::new("cmd-shift-c", w::OpenClaude, Some("Workspace")),
