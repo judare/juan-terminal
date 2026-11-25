@@ -1141,7 +1141,12 @@ impl ServersPanel {
             let path = ssh_remote::join_remote(dir, &e.name);
             let expanded = e.is_dir && b.expanded.contains(&path);
             let group: SharedString = format!("rf-{id}-{path}").into();
-            let (icon, color) = if e.is_dir { (if expanded { "icons/folder-open.svg" } else { "icons/folder.svg" }, 0x7aa2f7) } else { crate::assets::file_icon(&e.name) };
+            let row_icon = if e.is_dir {
+                crate::assets::folder_icon_el(&e.name, expanded, 13., None, false)
+            } else {
+                let (icon, color) = crate::assets::file_icon(&e.name);
+                gpui::svg().path(icon).size(px(13.)).flex_none().text_color(theme::rgb(color)).into_any_element()
+            };
             let (id1, id2, id3, id4, id5, id6) = (id.to_string(), id.to_string(), id.to_string(), id.to_string(), id.to_string(), id.to_string());
             let (p1, p2, p3, p4, p5, p6) = (path.clone(), path.clone(), path.clone(), path.clone(), path.clone(), path.clone());
             let is_dir = e.is_dir;
@@ -1170,7 +1175,7 @@ impl ServersPanel {
                 } else {
                     div().w(px(9.)).flex_none().into_any_element()
                 })
-                .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(theme::rgb(color)))
+                .child(row_icon)
                 .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.5)).text_color(theme::rgb(if e.name.starts_with('.') { theme::TEXT_MUTED } else { theme::TEXT })).child(e.name.clone()))
                 .when(!is_dir, |d| d.child(div().flex_none().text_size(px(10.)).text_color(theme::rgb(theme::TEXT_FAINT)).group_hover(group.clone(), |s| s.invisible()).child(human_size(e.size))));
             // Hover actions.

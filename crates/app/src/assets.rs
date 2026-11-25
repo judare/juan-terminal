@@ -72,7 +72,6 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/file.svg", include_bytes!("../assets/icons/file.svg")),
     ("icons/files.svg", include_bytes!("../assets/icons/files.svg")),
     ("icons/finder.svg", include_bytes!("../assets/icons/finder.svg")),
-    ("icons/folder-others.svg", include_bytes!("../assets/icons/folder-others.svg")),
     ("icons/folder-open.svg", include_bytes!("../assets/icons/folder-open.svg")),
     ("icons/folder.svg", include_bytes!("../assets/icons/folder.svg")),
     ("icons/gear.svg", include_bytes!("../assets/icons/gear.svg")),
@@ -132,11 +131,11 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        Ok(ICONS.iter().find(|(p, _)| *p == path).map(|(_, b)| Cow::Borrowed(*b)))
+        Ok(ICONS.iter().chain(crate::folder_icons::FILES).find(|(p, _)| *p == path).map(|(_, b)| Cow::Borrowed(*b)))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        Ok(ICONS.iter().filter(|(p, _)| p.starts_with(path)).map(|(p, _)| SharedString::from(*p)).collect())
+        Ok(ICONS.iter().chain(crate::folder_icons::FILES).filter(|(p, _)| p.starts_with(path)).map(|(p, _)| SharedString::from(*p)).collect())
     }
 }
 
@@ -197,6 +196,27 @@ pub fn file_icon(name: &str) -> (&'static str, u32) {
     }
 }
 
+/// Generic folder tint.
+pub const FOLDER_COLOR: u32 = 0x8fa3bf;
+
+/// Folder icon: a solid folder, plus a badge in its corner for well-known names (src, tests,
+/// jobs…). `faint` replaces both tints (dimmed rows); `virtual_others` is the "others" group.
+pub fn folder_icon_el(name: &str, expanded: bool, size: f32, faint: Option<u32>, virtual_others: bool) -> gpui::AnyElement {
+    use gpui::{IntoElement, ParentElement, Styled, div, px};
+    let kind = if virtual_others { Some(crate::folder_icons::OTHERS) } else { crate::folder_icons::kind(&name.to_ascii_lowercase()) };
+    let Some(k) = kind else {
+        let path = if expanded { "icons/folder-open.svg" } else { "icons/folder.svg" };
+        return gpui::svg().path(path).size(px(size)).flex_none().text_color(crate::theme::rgb(faint.unwrap_or(FOLDER_COLOR))).into_any_element();
+    };
+    div()
+        .relative()
+        .flex_none()
+        .size(px(size))
+        .child(gpui::svg().path(if expanded { k.open } else { k.closed }).size(px(size)).text_color(crate::theme::rgb(faint.unwrap_or(k.color))))
+        .child(gpui::svg().path(k.badge).absolute().top_0().left_0().size(px(size)).text_color(crate::theme::rgb(faint.unwrap_or(k.badge_color))))
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +226,14 @@ mod tests {
         for name in ["a.ts", "a.tsx", "a.vue", "a.rs", "a.json", "a.md", "x.toml", "x.sh", "x.css", "x.html", "x.png", ".env.local", "package.json", "Cargo.lock", ".gitignore", "x.pem", "x.py", "noext", "a.pdf", "a.docx", "a.xlsx", "a.pptx", "a.csv", "a.mp4", "a.mp3", "a.zip", "a.woff2", "a.sql", "a.svg", "a.js"] {
             let (path, _) = file_icon(name);
             assert!(Assets.load(path).unwrap().is_some(), "{path} missing");
+        }
+        for name in ["tests", "jobs", "src", "components", "assets", "styles", "docs", "config", "scripts", "api", "db", "dist", "hooks", "utils", "locales", "types", "store", ".github", "pages", "jobs", "vitest", "bridge", "migrations", ".claude"] {
+            for open in [false, true] {
+                let k = crate::folder_icons::kind(name).expect(name);
+                for path in [if open { k.open } else { k.closed }, k.badge] {
+                    assert!(Assets.load(path).unwrap().is_some(), "{path} missing");
+                }
+            }
         }
         for path in ["icons/folder.svg", "icons/folder-open.svg", "icons/chevron-right.svg", "icons/chevron-down.svg", "icons/repo.svg", "icons/plus.svg", "icons/close.svg", "icons/search.svg"] {
             assert!(Assets.load(path).unwrap().is_some(), "{path} missing");

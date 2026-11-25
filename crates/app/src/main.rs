@@ -3,6 +3,7 @@
 mod actions_panel;
 mod asset_view;
 mod default_apps;
+mod folder_icons;
 mod md_export;
 mod office;
 mod pdf_view;
