@@ -111,6 +111,8 @@ pub enum EditorEvent {
     OpenFile(PathBuf),
     /// "Pedir a Claude…" on a WhatsApp chat tab.
     AskClaude { jid: String, instruction: String },
+    /// Open another WhatsApp chat (a group member from the info sheet).
+    OpenChat { jid: String, name: String },
 }
 
 /// Oxfmt/Oxlint found for the repository containing this file.
@@ -417,6 +419,7 @@ impl EditorView {
         this._chat_sub = Some(cx.subscribe(&chat, |this, chat, e: &crate::chat_view::ChatEvent, cx| match e {
             crate::chat_view::ChatEvent::OpenFile(p) => cx.emit(EditorEvent::OpenFile(p.clone())),
             crate::chat_view::ChatEvent::AskClaude { jid, instruction } => cx.emit(EditorEvent::AskClaude { jid: jid.clone(), instruction: instruction.clone() }),
+            crate::chat_view::ChatEvent::OpenChat { jid, name } => cx.emit(EditorEvent::OpenChat { jid: jid.clone(), name: name.clone() }),
             crate::chat_view::ChatEvent::TitleChanged => {
                 this.chat_title = Some(chat.read(cx).name.clone().into());
                 cx.emit(EditorEvent::Changed);

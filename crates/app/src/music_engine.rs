@@ -314,7 +314,7 @@ pub fn set_now_playing(info: Option<NowPlaying>) {
     }
 }
 
-// ---- menu bar item -----------------------------------------------------------------------------
+// ---- menu bar item: a mini player ------------------------------------------------------------
 
 /// What the menu bar item's menu asks for.
 #[derive(Clone, Copy, Debug)]
@@ -322,9 +322,12 @@ pub enum MenuCommand {
     Remote(Remote),
     OpenSearch,
     Stop,
+    /// 👍 (true) / 👎 (false) on what's playing.
+    Rate(bool),
 }
 
-const MENU_COMMANDS: [MenuCommand; 7] = [
+/// Indexed by the controls' `tag`.
+const MENU_COMMANDS: [MenuCommand; 9] = [
     MenuCommand::Remote(Remote::Toggle),
     MenuCommand::Remote(Remote::SkipBackward),
     MenuCommand::Remote(Remote::SkipForward),
@@ -332,19 +335,70 @@ const MENU_COMMANDS: [MenuCommand; 7] = [
     MenuCommand::Remote(Remote::Next),
     MenuCommand::OpenSearch,
     MenuCommand::Stop,
+    MenuCommand::Rate(true),
+    MenuCommand::Rate(false),
 ];
 
 static MENU_TX: std::sync::Mutex<Option<UnboundedSender<MenuCommand>>> = std::sync::Mutex::new(None);
 
+/// What the mini player shows.
+pub struct StatusInfo<'a> {
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub playing: bool,
+    pub elapsed: f64,
+    pub duration: f64,
+    pub artwork: Option<&'a Path>,
+    pub rating: Option<bool>,
+    /// 0xRRGGBB of the mode (progress bar, chosen rating).
+    pub accent: u32,
+}
+
 struct StatusItem {
     item: Id,
-    header: Id,
+    art: Id,
+    art_path: Option<String>,
+    title: Id,
+    artist: Id,
+    fill: Id,
+    elapsed: Id,
+    total: Id,
     toggle: Id,
+    up: Id,
+    down: Id,
 }
 
 thread_local! {
     static STATUS: std::cell::RefCell<Option<StatusItem>> = const { std::cell::RefCell::new(None) };
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+unsafe impl objc::Encode for NSRect {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+    }
+}
+
+fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+    NSRect { x, y, w, h }
+}
+
+// Layout of the mini player (flipped view: y grows downwards).
+const MP_W: f64 = 320.;
+const MP_PAD: f64 = 14.;
+const MP_ART_W: f64 = 112.;
+const MP_ART_H: f64 = 63.;
+const MP_TRACK_Y: f64 = 92.;
+const MP_TRACK_W: f64 = MP_W - 2. * MP_PAD;
+const MP_BUTTONS_Y: f64 = 122.;
+const MP_H: f64 = 166.;
 
 extern "C" fn on_menu_item(_: &Object, _: Sel, sender: Id) {
     let tag: isize = unsafe { msg_send![sender, tag] };
@@ -368,7 +422,98 @@ fn menu_target() -> Id {
     }
 }
 
-/// Menu bar item for the player: what's playing, and play / pause, ±15 s, prev / next.
+extern "C" fn is_flipped(_: &Object, _: Sel) -> objc::runtime::BOOL {
+    YES
+}
+
+/// An `NSView` with a top-left origin.
+fn flipped_view(frame: NSRect) -> Id {
+    use objc::declare::ClassDecl;
+    static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cls = *CLASS.get_or_init(|| {
+        let mut decl = ClassDecl::new("JTMusicFlippedView", class!(NSView)).expect("JTMusicFlippedView");
+        unsafe { decl.add_method(sel!(isFlipped), is_flipped as extern "C" fn(&Object, Sel) -> objc::runtime::BOOL) };
+        decl.register() as *const objc::runtime::Class as usize
+    });
+    unsafe {
+        let v: Id = msg_send![cls as *const objc::runtime::Class, alloc];
+        msg_send![v, initWithFrame: frame]
+    }
+}
+
+fn ns_color(rgb: u32, alpha: f64) -> Id {
+    let c = |shift: u32| ((rgb >> shift) & 0xff) as f64 / 255.;
+    unsafe { msg_send![class!(NSColor), colorWithSRGBRed: c(16) green: c(8) blue: c(0) alpha: alpha] }
+}
+
+unsafe fn set_layer_bg(view: Id, color: Id) {
+    let layer: Id = msg_send![view, layer];
+    if !layer.is_null() {
+        let cg: *const std::ffi::c_void = msg_send![color, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg];
+    }
+}
+
+/// Plain view with a rounded, colored layer.
+unsafe fn layer_view(parent: Id, frame: NSRect, color: Id, radius: f64) -> Id {
+    let v: Id = msg_send![class!(NSView), alloc];
+    let v: Id = msg_send![v, initWithFrame: frame];
+    let _: () = msg_send![v, setWantsLayer: YES];
+    let layer: Id = msg_send![v, layer];
+    let _: () = msg_send![layer, setCornerRadius: radius];
+    let _: () = msg_send![layer, setMasksToBounds: YES];
+    set_layer_bg(v, color);
+    let _: () = msg_send![parent, addSubview: v];
+    v
+}
+
+/// Label truncated with "…" after `lines` lines.
+unsafe fn label(parent: Id, frame: NSRect, size: f64, weight: f64, color: Id, lines: isize, mono: bool) -> Id {
+    let l: Id = msg_send![class!(NSTextField), wrappingLabelWithString: ns_string("")];
+    let _: () = msg_send![l, setFrame: frame];
+    let font: Id = if mono { msg_send![class!(NSFont), monospacedDigitSystemFontOfSize: size weight: weight] } else { msg_send![class!(NSFont), systemFontOfSize: size weight: weight] };
+    let _: () = msg_send![l, setFont: font];
+    let _: () = msg_send![l, setTextColor: color];
+    let _: () = msg_send![l, setSelectable: objc::runtime::NO];
+    let _: () = msg_send![l, setMaximumNumberOfLines: lines];
+    let cell: Id = msg_send![l, cell];
+    let _: () = msg_send![cell, setWraps: if lines > 1 { YES } else { objc::runtime::NO }];
+    // NSLineBreakByWordWrapping = 0, ByTruncatingTail = 4
+    let _: () = msg_send![cell, setLineBreakMode: if lines > 1 { 0isize } else { 4isize }];
+    let _: () = msg_send![cell, setTruncatesLastVisibleLine: YES];
+    let _: () = msg_send![parent, addSubview: l];
+    l
+}
+
+fn symbol(name: &str, points: f64, weight: f64) -> Id {
+    unsafe {
+        let img: Id = msg_send![class!(NSImage), imageWithSystemSymbolName: ns_string(name) accessibilityDescription: std::ptr::null_mut::<Object>()];
+        if img.is_null() {
+            return img;
+        }
+        let conf: Id = msg_send![class!(NSImageSymbolConfiguration), configurationWithPointSize: points weight: weight];
+        msg_send![img, imageWithSymbolConfiguration: conf]
+    }
+}
+
+/// Borderless SF Symbol button that sends `tag`'s command.
+unsafe fn symbol_button(parent: Id, target: Id, tag: isize, name: &str, points: f64, frame: NSRect, tip: &str) -> Id {
+    let b: Id = msg_send![class!(NSButton), alloc];
+    let b: Id = msg_send![b, initWithFrame: frame];
+    let _: () = msg_send![b, setBordered: objc::runtime::NO];
+    // NSImageOnly = 1
+    let _: () = msg_send![b, setImagePosition: 1isize];
+    let _: () = msg_send![b, setImage: symbol(name, points, 0.)];
+    let _: () = msg_send![b, setTarget: target];
+    let _: () = msg_send![b, setAction: sel!(musicMenuItem:)];
+    let _: () = msg_send![b, setTag: tag];
+    let _: () = msg_send![b, setToolTip: ns_string(tip)];
+    let _: () = msg_send![parent, addSubview: b];
+    b
+}
+
+/// Menu bar item for the player: its menu is a mini player (artwork, title, progress and
+/// controls, like the browsers' media popover) plus "Buscar…" and "Cerrar reproductor".
 pub fn install_status_item(tx: UnboundedSender<MenuCommand>) {
     if let Ok(mut t) = MENU_TX.lock() {
         *t = Some(tx);
@@ -385,43 +530,69 @@ fn build_status_item() -> StatusItem {
         let menu: Id = msg_send![menu, initWithTitle: ns_string("Música")];
         let _: () = msg_send![menu, setAutoenablesItems: objc::runtime::NO];
         let target = menu_target();
-        let add = |title: &str, tag: Option<isize>| -> Id {
+
+        let view = flipped_view(rect(0., 0., MP_W, MP_H));
+        let art = layer_view(view, rect(MP_PAD, MP_PAD, MP_ART_W, MP_ART_H), msg_send![class!(NSColor), colorWithWhite: 0.5f64 alpha: 0.2f64], 7.);
+        let art_layer: Id = msg_send![art, layer];
+        let _: () = msg_send![art_layer, setContentsGravity: ns_string("resizeAspectFill")];
+        let text_x = MP_PAD + MP_ART_W + 12.;
+        let text_w = MP_W - text_x - MP_PAD;
+        let primary: Id = msg_send![class!(NSColor), labelColor];
+        let secondary: Id = msg_send![class!(NSColor), secondaryLabelColor];
+        // NSFontWeightSemibold ≈ 0.3
+        let title = label(view, rect(text_x, MP_PAD - 1., text_w, 36.), 13., 0.3, primary, 2, false);
+        let artist = label(view, rect(text_x, MP_PAD + 38., text_w, 16.), 11.5, 0., secondary, 1, false);
+
+        let _track = layer_view(view, rect(MP_PAD, MP_TRACK_Y, MP_TRACK_W, 4.), msg_send![class!(NSColor), colorWithWhite: 0.5f64 alpha: 0.3f64], 2.);
+        let fill = layer_view(view, rect(MP_PAD, MP_TRACK_Y, 0., 4.), ns_color(0xf7768e, 1.), 2.);
+        let elapsed = label(view, rect(MP_PAD - 2., MP_TRACK_Y + 7., 80., 14.), 10.5, 0., secondary, 1, true);
+        let total = label(view, rect(MP_W - MP_PAD - 78., MP_TRACK_Y + 7., 80., 14.), 10.5, 0., secondary, 1, true);
+        // NSTextAlignmentRight = 2
+        let _: () = msg_send![total, setAlignment: 2isize];
+
+        let cx = MP_W / 2.;
+        let y = MP_BUTTONS_Y;
+        let toggle = symbol_button(view, target, 0, "pause.fill", 22., rect(cx - 20., y - 4., 40., 40.), "Reproducir / pausa (⌃⌥Space)");
+        symbol_button(view, target, 3, "backward.fill", 15., rect(cx - 64., y, 32., 32.), "Anterior (⌃⌥⇧←)");
+        symbol_button(view, target, 4, "forward.fill", 15., rect(cx + 32., y, 32., 32.), "Siguiente (⌃⌥⇧→)");
+        symbol_button(view, target, 1, "gobackward.15", 15., rect(cx - 106., y, 32., 32.), "−15 s (⌃⌥←)");
+        symbol_button(view, target, 2, "goforward.15", 15., rect(cx + 74., y, 32., 32.), "+15 s (⌃⌥→)");
+        let up = symbol_button(view, target, 7, "hand.thumbsup", 13., rect(MP_PAD - 6., y, 30., 32.), "Me gusta");
+        let down = symbol_button(view, target, 8, "hand.thumbsdown", 13., rect(MP_W - MP_PAD - 24., y, 30., 32.), "No me gusta");
+
+        let player: Id = msg_send![class!(NSMenuItem), new];
+        let _: () = msg_send![player, setView: view];
+        let _: () = msg_send![menu, addItem: player];
+        let sep: Id = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![menu, addItem: sep];
+        let add = |title: &str, tag: isize, key: &str| {
             let mi: Id = msg_send![class!(NSMenuItem), alloc];
-            let action = if tag.is_some() { sel!(musicMenuItem:) } else { Sel::from_ptr(std::ptr::null()) };
-            let mi: Id = msg_send![mi, initWithTitle: ns_string(title) action: action keyEquivalent: ns_string("")];
-            if let Some(tag) = tag {
-                let _: () = msg_send![mi, setTag: tag];
-                let _: () = msg_send![mi, setTarget: target];
-            } else {
-                let _: () = msg_send![mi, setEnabled: objc::runtime::NO];
+            let mi: Id = msg_send![mi, initWithTitle: ns_string(title) action: sel!(musicMenuItem:) keyEquivalent: ns_string(key)];
+            if !key.is_empty() {
+                // ⌘⇧
+                let _: () = msg_send![mi, setKeyEquivalentModifierMask: (1usize << 20) | (1usize << 17)];
             }
+            let _: () = msg_send![mi, setTag: tag];
+            let _: () = msg_send![mi, setTarget: target];
             let _: () = msg_send![menu, addItem: mi];
-            mi
         };
-        let separator = || {
-            let sep: Id = msg_send![class!(NSMenuItem), separatorItem];
-            let _: () = msg_send![menu, addItem: sep];
-        };
-        let header = add("", None);
-        separator();
-        let toggle = add("Pausa", Some(0));
-        add("−15 s", Some(1));
-        add("+15 s", Some(2));
-        add("Anterior", Some(3));
-        add("Siguiente", Some(4));
-        separator();
-        add("Buscar música, podcasts y videos… (⌘⇧M)", Some(5));
-        add("Cerrar reproductor", Some(6));
+        add("Buscar música, podcasts y videos…", 5, "m");
+        add("Cerrar reproductor", 6, "");
         let _: () = msg_send![item, setMenu: menu];
-        StatusItem { item, header, toggle }
+        StatusItem { item, art, art_path: None, title, artist, fill, elapsed, total, toggle, up, down }
     }
 }
 
-/// Show / update the menu bar item (`None` hides it).
-pub fn set_status_item(info: Option<(&str, &str, bool)>) {
+fn fmt_clock(secs: f64) -> String {
+    let s = secs.max(0.) as u64;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+}
+
+/// Show / update the menu bar item and its mini player (`None` hides it).
+pub fn set_status_item(info: Option<StatusInfo>) {
     STATUS.with(|s| {
         let mut s = s.borrow_mut();
-        let Some((title, artist, playing)) = info else {
+        let Some(info) = info else {
             if let Some(st) = s.as_ref() {
                 unsafe { let _: () = msg_send![st.item, setVisible: objc::runtime::NO]; }
             }
@@ -432,20 +603,51 @@ pub fn set_status_item(info: Option<(&str, &str, bool)>) {
             let _: () = msg_send![st.item, setVisible: YES];
             let button: Id = msg_send![st.item, button];
             if !button.is_null() {
-                let symbol = if playing { "music.note" } else { "pause.fill" };
-                let image: Id = msg_send![class!(NSImage), imageWithSystemSymbolName: ns_string(symbol) accessibilityDescription: ns_string("Música")];
+                let image: Id = msg_send![class!(NSImage), imageWithSystemSymbolName: ns_string(if info.playing { "music.note" } else { "pause.fill" }) accessibilityDescription: ns_string("Música")];
                 if !image.is_null() {
                     let _: () = msg_send![image, setTemplate: YES];
                     let _: () = msg_send![button, setImage: image];
                     // NSImageLeft = 2
                     let _: () = msg_send![button, setImagePosition: 2isize];
                 }
-                let short: String = if title.chars().count() > 28 { format!(" {}…", title.chars().take(27).collect::<String>().trim_end()) } else { format!(" {title}") };
+                let t = info.title;
+                let short: String = if t.chars().count() > 28 { format!(" {}…", t.chars().take(27).collect::<String>().trim_end()) } else { format!(" {t}") };
                 let _: () = msg_send![button, setTitle: ns_string(&short)];
             }
-            let header = if artist.is_empty() { title.to_string() } else { format!("{title} — {artist}") };
-            let _: () = msg_send![st.header, setTitle: ns_string(&header)];
-            let _: () = msg_send![st.toggle, setTitle: ns_string(if playing { "Pausa" } else { "Reproducir" })];
+            let _: () = msg_send![st.title, setStringValue: ns_string(info.title)];
+            let _: () = msg_send![st.artist, setStringValue: ns_string(info.artist)];
+
+            let path = info.artwork.map(|p| p.to_string_lossy().into_owned());
+            if path != st.art_path {
+                let layer: Id = msg_send![st.art, layer];
+                let image: Id = match &path {
+                    Some(p) => {
+                        let img: Id = msg_send![class!(NSImage), alloc];
+                        msg_send![img, initWithContentsOfFile: ns_string(p)]
+                    }
+                    None => std::ptr::null_mut(),
+                };
+                let _: () = msg_send![layer, setContents: image];
+                if !image.is_null() {
+                    let _: () = msg_send![image, release];
+                }
+                st.art_path = path;
+            }
+
+            let frac = if info.duration > 0. { (info.elapsed / info.duration).clamp(0., 1.) } else { 0. };
+            let _: () = msg_send![st.fill, setFrame: rect(MP_PAD, MP_TRACK_Y, MP_TRACK_W * frac, 4.)];
+            set_layer_bg(st.fill, ns_color(info.accent, 1.));
+            let _: () = msg_send![st.elapsed, setStringValue: ns_string(&fmt_clock(info.elapsed))];
+            let total = if info.duration > 0. { fmt_clock(info.duration) } else { "--:--".into() };
+            let _: () = msg_send![st.total, setStringValue: ns_string(&total)];
+
+            let _: () = msg_send![st.toggle, setImage: symbol(if info.playing { "pause.fill" } else { "play.fill" }, 22., 0.)];
+            for (b, good, name) in [(st.up, true, "hand.thumbsup"), (st.down, false, "hand.thumbsdown")] {
+                let on = info.rating == Some(good);
+                let _: () = msg_send![b, setImage: symbol(&if on { format!("{name}.fill") } else { name.to_string() }, 13., 0.)];
+                let tint: Id = if on { ns_color(info.accent, 1.) } else { std::ptr::null_mut() };
+                let _: () = msg_send![b, setContentTintColor: tint];
+            }
         }
     });
 }

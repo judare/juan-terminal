@@ -34,10 +34,10 @@ enum PickerTab {
     Stickers,
 }
 
-gpui::actions!(chat_view, [SearchInChat]);
+gpui::actions!(chat_view, [SearchInChat, CopySelection]);
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([gpui::KeyBinding::new("cmd-f", SearchInChat, Some("ChatView"))]);
+    cx.bind_keys([gpui::KeyBinding::new("cmd-f", SearchInChat, Some("ChatView")), gpui::KeyBinding::new("cmd-c", CopySelection, Some("ChatView"))]);
 }
 
 /// Search inside the open conversation (⌘F): matches newest first, Enter goes to older ones.
@@ -52,6 +52,7 @@ struct Search {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InfoTab {
+    Members,
     Media,
     Docs,
     Links,
@@ -63,6 +64,8 @@ struct Info {
     media: Vec<Rc<ChatMessage>>,
     docs: Vec<Rc<ChatMessage>>,
     links: Vec<Rc<ChatMessage>>,
+    /// Group participants (None while they're being fetched).
+    members: Option<Vec<whatsapp::GroupMember>>,
     loaded: bool,
     copied: Option<Instant>,
 }
@@ -130,6 +133,8 @@ pub enum ChatEvent {
     Interacted,
     /// "Pedir a Claude…" from the header: open a Claude Code session about this chat.
     AskClaude { jid: String, instruction: String },
+    /// Open the 1:1 chat with someone (group member in the info sheet).
+    OpenChat { jid: String, name: String },
 }
 
 #[derive(Clone)]
@@ -158,6 +163,34 @@ fn signature(m: &ChatMessage) -> u64 {
 struct Menu {
     position: Point<Pixels>,
     msg: Rc<ChatMessage>,
+    /// "Eliminar…" was picked: the menu shows the delete options instead.
+    confirm_delete: bool,
+}
+
+/// Text selected with the mouse inside one message bubble (byte offsets into `text`).
+struct TextSel {
+    id: String,
+    text: String,
+    layout: gpui::TextLayout,
+    anchor: usize,
+    head: usize,
+}
+
+impl TextSel {
+    fn range(&self) -> std::ops::Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+
+    fn selected(&self) -> Option<&str> {
+        let r = self.range();
+        (!r.is_empty()).then(|| &self.text[r])
+    }
+
+    fn index_at(&self, p: Point<Pixels>) -> usize {
+        char_floor(&self.text, match self.layout.index_for_position(p) {
+            Ok(i) | Err(i) => i,
+        })
+    }
 }
 
 pub struct ChatView {
@@ -197,6 +230,12 @@ pub struct ChatView {
     drafting: Option<Task<()>>,
     /// Message under the mouse (shows its reaction button).
     hovered_msg: Option<String>,
+    /// Media already queued with `WhatsApp::prefetch` (once per message).
+    prefetched: HashSet<String>,
+    /// Text selected in a bubble (⌘C / "Copiar selección").
+    sel: Option<TextSel>,
+    /// The left button is down and dragging extends `sel`.
+    selecting: bool,
     /// Swipe-to-reply in progress: (message id, how far the bubble moved right).
     swipe: Option<(String, f32)>,
     /// Mouse drag that may become a swipe: (message id, x where it started).
@@ -317,6 +356,9 @@ impl ChatView {
             drafting: None,
             interacted: false,
             hovered_msg: None,
+            sel: None,
+            selecting: false,
+            prefetched: HashSet::new(),
             swipe: None,
             drag: None,
             _swipe_end: None,
@@ -349,9 +391,8 @@ impl ChatView {
         match u {
             Update::Messages(c) if c == self.jid => {
                 self.unread_pending = true;
-                if self.info.is_some() {
-                    self.load_info(cx);
-                }
+                // The info sheet refreshes with the (debounced) reload: a prefetch of many photos
+                // would otherwise re-query it once per download.
                 self.schedule_reload(cx);
             }
             Update::SendFailed { chat, error } if chat == self.jid => {
@@ -379,6 +420,12 @@ impl ChatView {
                     self.unread = s.unread;
                     self.avatar = s.avatar;
                     cx.emit(ChatEvent::TitleChanged);
+                    cx.notify();
+                }
+            }
+            Update::Group(c) if c == self.jid => {
+                if let Some(info) = &mut self.info {
+                    info.members = WhatsApp::global().group_members(&self.jid);
                     cx.notify();
                 }
             }
@@ -444,6 +491,10 @@ impl ChatView {
         }
         self.items = items;
         self.sigs = sigs;
+        if self.info.is_some() {
+            self.load_info(cx);
+        }
+        self.prefetch_media();
         // Files the user asked to open as soon as they're downloaded.
         let ready: Vec<PathBuf> = self
             .open_after
@@ -464,6 +515,24 @@ impl ChatView {
             self.toggle_play(&m, cx);
         }
         cx.notify();
+    }
+
+    /// Queue the photos/stickers of the loaded messages that aren't downloaded yet, newest
+    /// first, so they're there before they scroll into view.
+    fn prefetch_media(&mut self) {
+        let ids: Vec<String> = self
+            .items
+            .iter()
+            .rev()
+            .filter_map(|i| match i {
+                Item::Msg(m) if m.media.is_none() && matches!(m.kind, MsgKind::Image | MsgKind::Sticker) => Some(m.id.clone()),
+                _ => None,
+            })
+            .filter(|id| self.prefetched.insert(id.clone()))
+            .collect();
+        if !ids.is_empty() {
+            WhatsApp::global().prefetch(&self.jid, ids);
+        }
     }
 
     fn find(&self, id: &str) -> Option<Rc<ChatMessage>> {
@@ -742,10 +811,16 @@ impl ChatView {
 
     fn toggle_info(&mut self, cx: &mut Context<Self>) {
         if self.info.take().is_none() {
-            self.info = Some(Info { tab: InfoTab::Media, media: Vec::new(), docs: Vec::new(), links: Vec::new(), loaded: false, copied: None });
+            let wa = WhatsApp::global();
+            let members = if self.is_group { wa.group_members(&self.jid) } else { None };
+            let tab = if self.is_group { InfoTab::Members } else { InfoTab::Media };
+            self.info = Some(Info { tab, media: Vec::new(), docs: Vec::new(), links: Vec::new(), members, loaded: false, copied: None });
             self.load_info(cx);
-            if !self.is_group {
-                WhatsApp::global().fetch_full_avatar(&self.jid);
+            if self.is_group {
+                // Refreshed every time (people join/leave); the cached list shows meanwhile.
+                wa.fetch_group_members(&self.jid);
+            } else {
+                wa.fetch_full_avatar(&self.jid);
             }
         }
         cx.notify();
@@ -766,6 +841,10 @@ impl ChatView {
             let wrap = |v: Vec<ChatMessage>| v.into_iter().map(Rc::new).collect::<Vec<_>>();
             let (media, docs, links) = (wrap(media), wrap(docs), wrap(links));
             let _ = this.update(cx, |this, cx| {
+                let missing: Vec<String> = media.iter().filter(|m| m.media.is_none() && m.kind == MsgKind::Image).map(|m| m.id.clone()).filter(|id| this.prefetched.insert(id.clone())).collect();
+                if !missing.is_empty() {
+                    WhatsApp::global().prefetch(&this.jid, missing);
+                }
                 if let Some(info) = &mut this.info {
                     info.media = media;
                     info.docs = docs;
@@ -792,7 +871,10 @@ impl ChatView {
         let tab = info.tab;
         let copied = info.copied.is_some_and(|t| t.elapsed() < Duration::from_millis(1500));
         let (n_media, n_docs, n_links, loaded) = (info.media.len(), info.docs.len(), info.links.len(), info.loaded);
+        let members = info.members.clone();
+        let n_members = members.as_ref().map_or(0, Vec::len);
         let items: Vec<Rc<ChatMessage>> = match tab {
+            InfoTab::Members => Vec::new(),
             InfoTab::Media => info.media.clone(),
             InfoTab::Docs => info.docs.clone(),
             InfoTab::Links => info.links.clone(),
@@ -884,10 +966,61 @@ impl ChatView {
                 }))
         };
         let empty = |text: &'static str| div().py(px(28.)).text_center().text_size(px(12.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(text).into_any_element();
-        let body: AnyElement = if !loaded {
+        let body: AnyElement = if tab == InfoTab::Members {
+            match members {
+                None => empty("Cargando integrantes…"),
+                Some(ms) => div()
+                    .flex()
+                    .flex_col()
+                    .py(px(4.))
+                    .children(ms.into_iter().enumerate().map(|(i, m)| {
+                        let avatar = if m.me { wa.person_avatar(whatsapp::service::ME) } else { wa.person_avatar(&m.jid) };
+                        let title = if m.me { "Tú".to_string() } else { m.name.trim_start_matches('~').to_string() };
+                        let sub = if m.me || m.name == m.phone { None } else { Some(if m.name.starts_with('~') { format!("{} · {}", m.phone, m.name) } else { m.phone.clone() }) };
+                        let (jid, name) = (m.jid.clone(), m.name.clone());
+                        div()
+                            .id(("info-member", i))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(14.))
+                            .py(px(7.))
+                            .when(!m.me, |d| d.cursor_pointer().hover(|s| s.bg(theme::rgb(theme::HOVER))))
+                            .child(wa_ui::avatar(avatar.as_ref(), &title, 36.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().truncate().text_size(px(13.5)).text_color(theme::rgb(theme::TEXT)).child(title))
+                                    .children(sub.map(|s| div().truncate().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(s))),
+                            )
+                            .when(m.admin, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .px(px(6.))
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .text_size(px(10.5))
+                                        .text_color(theme::rgb(wa_ui::GREEN))
+                                        .bg(theme::rgb(wa_ui::GREEN).opacity(0.12))
+                                        .child("Admin"),
+                                )
+                            })
+                            .when(!m.me, |d| {
+                                d.tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Abrir chat")).into())
+                                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.emit(ChatEvent::OpenChat { jid: jid.clone(), name: name.clone() })))
+                            })
+                    }))
+                    .into_any_element(),
+            }
+        } else if !loaded {
             empty("Cargando…")
         } else {
             match tab {
+                InfoTab::Members => unreachable!(),
                 InfoTab::Media if items.is_empty() => empty("No hay fotos ni videos."),
                 InfoTab::Docs if items.is_empty() => empty("No hay documentos."),
                 InfoTab::Links if items.is_empty() => empty("No hay enlaces."),
@@ -1108,6 +1241,7 @@ impl ChatView {
                                 .flex()
                                 .border_b_1()
                                 .border_color(theme::rgb(theme::BORDER))
+                                .when(self.is_group, |d| d.child(tab_btn("info-tab-members", "Integrantes", n_members, InfoTab::Members)))
                                 .child(tab_btn("info-tab-media", "Multimedia", n_media, InfoTab::Media))
                                 .child(tab_btn("info-tab-docs", "Archivos", n_docs, InfoTab::Docs))
                                 .child(tab_btn("info-tab-links", "Enlaces", n_links, InfoTab::Links)),
@@ -1550,7 +1684,7 @@ impl ChatView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                    this.menu = Some(Menu { position: e.position, msg: msg.clone() });
+                    this.menu = Some(Menu { position: e.position, msg: msg.clone(), confirm_delete: false });
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -1699,16 +1833,12 @@ impl ChatView {
             .into_any_element()
     }
 
-    fn render_text(&self, id: &str, text: &str, color: u32) -> AnyElement {
+    fn render_text(&self, id: &str, text: &str, color: u32, cx: &mut Context<Self>) -> AnyElement {
         let links = find_links(text);
         let matches = match &self.search {
             Some(s) if !s.query.is_empty() => find_matches(text, &s.query),
             _ => Vec::new(),
         };
-        let base = div().text_size(px(14.5)).line_height(px(20.)).text_color(theme::rgb(color));
-        if links.is_empty() && matches.is_empty() {
-            return base.child(text.to_string()).into_any_element();
-        }
         let link_style = HighlightStyle { color: Some(theme::rgb(0x53bdeb)), underline: Some(gpui::UnderlineStyle { thickness: px(1.), ..Default::default() }), ..Default::default() };
         let hit_style = HighlightStyle { background_color: Some(theme::rgb(theme::FIND_MATCH_CURRENT)), color: Some(gpui::white()), ..Default::default() };
         let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = links.iter().map(|r| (r.clone(), link_style)).collect();
@@ -1718,7 +1848,36 @@ impl ChatView {
             }
         }
         highlights.sort_by_key(|(r, _)| r.start);
+        let sel_style = HighlightStyle { background_color: Some(theme::rgb(0x53bdeb).opacity(0.38)), ..Default::default() };
+        let sel = self.sel.as_ref().filter(|s| s.id == id && s.text == text).map(|s| (s.range(), sel_style)).filter(|(r, _)| !r.is_empty());
+        let highlights: Vec<_> = gpui::combine_highlights(highlights, sel).collect();
         let styled = StyledText::new(text.to_string()).with_highlights(highlights);
+        let layout = styled.layout().clone();
+        let (sel_id, sel_text) = (id.to_string(), text.to_string());
+        // Click-drag selects, double-click a word, triple-click the whole message.
+        let base = div()
+            .text_size(px(14.5))
+            .line_height(px(20.))
+            .text_color(theme::rgb(color))
+            .cursor(gpui::CursorStyle::IBeam)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    let mut s = TextSel { id: sel_id.clone(), text: sel_text.clone(), layout: layout.clone(), anchor: 0, head: 0 };
+                    let ix = s.index_at(e.position);
+                    (s.anchor, s.head) = match e.click_count {
+                        2 => word_at(&s.text, ix),
+                        n if n >= 3 => (0, s.text.len()),
+                        _ => (ix, ix),
+                    };
+                    this.sel = Some(s);
+                    this.selecting = e.click_count < 2;
+                    window.focus(&this.focus);
+                    // Not a swipe-to-reply drag.
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
         if links.is_empty() {
             return base.child(styled).into_any_element();
         }
@@ -1732,9 +1891,15 @@ impl ChatView {
         .into_any_element()
     }
 
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(t) = self.sel.as_ref().and_then(|s| s.selected()) {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(t.to_string()));
+        }
+    }
+
     fn render_body(&mut self, m: &Rc<ChatMessage>, cx: &mut Context<Self>) -> AnyElement {
         let wa = WhatsApp::global();
-        let caption = (!m.text.is_empty()).then(|| self.render_text(&m.id, &m.text, theme::TEXT));
+        let caption = (!m.text.is_empty()).then(|| self.render_text(&m.id, &m.text, theme::TEXT, cx));
         match m.kind {
             MsgKind::Text | MsgKind::Location | MsgKind::Contact | MsgKind::Poll | MsgKind::Other => {
                 let label = (m.kind != MsgKind::Text).then(|| {
@@ -2283,6 +2448,9 @@ impl ChatView {
     fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.menu.as_ref()?;
         let m = menu.msg.clone();
+        if menu.confirm_delete {
+            return Some(self.render_delete_menu(menu.position, m, cx));
+        }
         let item = |id: &'static str, label: String| {
             div()
                 .id(id)
@@ -2342,6 +2510,14 @@ impl ChatView {
                 w.focus(&this.composer.focus_handle(cx));
                 cx.notify();
             })));
+        let selection = self.sel.as_ref().filter(|s| s.id == m.id).and_then(|s| s.selected()).map(str::to_string);
+        if let Some(t) = selection {
+            list = list.child(item("m-copy-sel", "Copiar selección".into()).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(t.clone()));
+                this.menu = None;
+                cx.notify();
+            })));
+        }
         if !m.text.is_empty() {
             list = list.child(item("m-copy", "Copiar texto".into()).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(m_copy.text.clone()));
@@ -2371,7 +2547,70 @@ impl ChatView {
                 cx.notify();
             })));
         }
+        list = list.child(
+            item("m-delete", "Eliminar…".into()).text_color(theme::rgb(theme::DELETED)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                if let Some(menu) = this.menu.as_mut() {
+                    menu.confirm_delete = true;
+                }
+                cx.notify();
+            })),
+        );
         Some(gpui::deferred(gpui::anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
+    }
+
+    /// Second step of "Eliminar…": for everyone (my messages, like WhatsApp within ~2 days)
+    /// or only for me.
+    fn render_delete_menu(&self, position: Point<Pixels>, m: Rc<ChatMessage>, cx: &mut Context<Self>) -> AnyElement {
+        let item = |id: &'static str, label: &'static str, color: u32| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .text_size(px(13.))
+                .text_color(theme::rgb(color))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+                .child(label)
+        };
+        let for_all = m.from_me && m.kind != MsgKind::Revoked && whatsapp::store::now() - m.ts < 2 * 24 * 3600;
+        let (m_all, m_me) = (m.clone(), m.clone());
+        let list = div()
+            .flex()
+            .flex_col()
+            .min_w(px(190.))
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(theme::rgb(theme::SIDEBAR_BG))
+            .border_1()
+            .border_color(theme::rgb(theme::BORDER))
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }))
+            .child(div().px(px(12.)).pt(px(4.)).pb(px(6.)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)).child("¿Eliminar mensaje?"))
+            .when(for_all, |d| {
+                d.child(item("m-del-all", "Eliminar para todos", theme::DELETED).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    WhatsApp::global().delete_for_everyone(&m_all.chat, &m_all.id);
+                    this.sel = None;
+                    this.menu = None;
+                    this.interacted(cx);
+                    cx.notify();
+                })))
+            })
+            .child(item("m-del-me", "Eliminar para mí", theme::DELETED).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                WhatsApp::global().delete_for_me(&m_me.chat, &m_me.id, m_me.ts);
+                this.sel = None;
+                this.menu = None;
+                this.interacted(cx);
+                cx.notify();
+            })))
+            .child(item("m-del-cancel", "Cancelar", theme::TEXT).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.menu = None;
+                cx.notify();
+            })));
+        gpui::deferred(gpui::anchored().position(position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element()
     }
 
     fn render_stickers(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2795,6 +3034,23 @@ fn sender_color(jid: &str) -> u32 {
 }
 
 /// Byte ranges of URLs (http(s)://… or www.…) in `text`.
+/// Largest char boundary ≤ `i` (clamped to the text).
+fn char_floor(text: &str, mut i: usize) -> usize {
+    i = i.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Byte range of the word (letters, digits, `_`) around `ix`; empty if there's none.
+fn word_at(text: &str, ix: usize) -> (usize, usize) {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let start = text[..ix].char_indices().rev().take_while(|(_, c)| is_word(*c)).last().map_or(ix, |(i, _)| i);
+    let end = text[ix..].char_indices().find(|(_, c)| !is_word(*c)).map_or(text.len(), |(i, _)| ix + i);
+    (start, end)
+}
+
 fn find_links(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -2899,6 +3155,28 @@ impl Render for ChatView {
             .size_full()
             .bg(theme::rgb(wa_ui::CHAT_BG))
             .on_action(cx.listener(|this, _: &SearchInChat, w, cx| this.open_search(w, cx)))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
+            // A click anywhere drops the text selection (a click on text starts a new one).
+            .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                // With the menu open the click is for it ("Copiar selección" needs the selection).
+                if e.button == MouseButton::Left && this.menu.is_none() && this.sel.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                if !this.selecting || e.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
+                if let Some(s) = this.sel.as_mut() {
+                    let h = s.index_at(e.position);
+                    if h != s.head {
+                        s.head = h;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, _| this.selecting = false))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, _| this.selecting = false))
             .drag_over::<gpui::ExternalPaths>(|s, _, _, _| s.opacity(0.85))
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.attachments.extend(paths.paths().iter().cloned());

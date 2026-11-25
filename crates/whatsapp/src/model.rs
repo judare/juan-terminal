@@ -236,6 +236,19 @@ pub enum Update {
     SendFailed { chat: String, error: String },
     /// Claude (through the MCP tool) wants to send something: the app must ask the user.
     ConfirmSend(crate::ipc::SendRequest),
+    /// Group members fetched (see `WhatsApp::group_members`).
+    Group(String),
+}
+
+/// A participant of a group chat.
+#[derive(Clone, Debug)]
+pub struct GroupMember {
+    /// Phone-number JID when known, else the LID.
+    pub jid: String,
+    pub name: String,
+    pub phone: String,
+    pub admin: bool,
+    pub me: bool,
 }
 
 /// Local chat label ("Trabajo", "Clientes"…) to filter the chat list.

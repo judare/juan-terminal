@@ -716,6 +716,8 @@ impl Render for MusicSearch {
                                 let selected = ix == this.selected;
                                 let playing = current_id.as_deref() == Some(t.id.as_str());
                                 let progress = music.progress_of(&t.id).cloned();
+                                let rating = music.rating(&t.id);
+                                let local = music.has_local_copy(&t.id);
                                 let mut meta: Vec<String> = Vec::new();
                                 if let Some(p) = progress.as_ref().filter(|p| !p.finished) {
                                     meta.push(format!("Continuar · quedan {}", fmt_time(p.dur - p.pos)));
@@ -837,6 +839,27 @@ impl Render for MusicSearch {
                                             } else {
                                                 col.into_any_element()
                                             }
+                                        })
+                                        .child({
+                                            // 👍 / 👎 (the chosen one stays visible) and 🗑 for local copies.
+                                            let rate = [true, false].map(|good| {
+                                                let music = this.music.clone();
+                                                let track = t.clone();
+                                                let (path, label) = rate_icon(good, rating);
+                                                let color = if rating == Some(good) { t.mode.color() } else { theme::TEXT_MUTED };
+                                                row_action((if good { "music-row-up" } else { "music-row-down" }, ix), path, label, color, rating == Some(good)).on_click(move |_: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    music.update(cx, |m, cx| m.rate(&track, good, cx));
+                                                })
+                                            });
+                                            let music = this.music.clone();
+                                            let id = t.id.clone();
+                                            div().flex().flex_none().items_center().gap(px(2.)).children(rate).when(local, |d| {
+                                                d.child(row_action(("music-row-trash", ix), "icons/trash.svg", "Borrar la descarga (libera espacio)", theme::TEXT_MUTED, false).on_click(move |_: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    music.update(cx, |m, cx| m.remove_download(&id, cx));
+                                                }))
+                                            })
                                         })
                                         .into_any_element(),
                                 )
@@ -968,7 +991,7 @@ fn grid_cell(this: &MusicSearch, ix: usize, current_id: Option<&str>, cx: &mut C
         .when(playing, |d| d.child(badge("Sonando", "icons/music.svg", theme::rgb(t.mode.color()))))
         .when(!playing && progress.as_ref().is_some_and(|p| p.finished), |d| d.child(badge("Visto", "icons/check.svg", gpui::hsla(0., 0., 0., 0.7))))
         .when_some(offline_badge(music.offline(&t.id)), |d, b| d.child(b))
-        .child(cell_actions(this, t, ix, music.is_later(&t.id), music.offline(&t.id)));
+        .child(cell_actions(this, t, ix, music.is_later(&t.id), music.offline(&t.id), music.rating(&t.id)));
     div()
         .id(("music-cell", ix))
         .group("music-cell")
@@ -1042,7 +1065,7 @@ fn offline_badge(state: music::Offline) -> Option<gpui::Div> {
 
 /// Top-right of a thumbnail: ✕ topic, ⬇ download / remove, 🔖 "Ver después" (shown on hover;
 /// the bookmark stays visible while saved).
-fn cell_actions(this: &MusicSearch, t: &Track, ix: usize, later: bool, offline: music::Offline) -> gpui::Div {
+fn cell_actions(this: &MusicSearch, t: &Track, ix: usize, later: bool, offline: music::Offline, rating: Option<bool>) -> gpui::Div {
     let button = |id: (&'static str, usize), path: &'static str, label: &'static str, always: bool| {
         div()
             .id(id)
@@ -1093,8 +1116,44 @@ fn cell_actions(this: &MusicSearch, t: &Track, ix: usize, later: bool, offline: 
                 music.update(cx, |m, cx| m.drop_topic(mode, &topic, cx));
             }))
         })
+        .children([true, false].map(|good| {
+            let music = this.music.clone();
+            let track = t.clone();
+            let (path, label) = rate_icon(good, rating);
+            button((if good { "music-rate-up" } else { "music-rate-down" }, ix), path, label, rating == Some(good)).on_click(move |_: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                music.update(cx, |m, cx| m.rate(&track, good, cx));
+            })
+        }))
         .child(download_btn)
         .child(later_btn)
+}
+
+/// 👍 / 👎 icon and tooltip given the current rating.
+fn rate_icon(good: bool, rating: Option<bool>) -> (&'static str, &'static str) {
+    match (good, rating == Some(good)) {
+        (true, false) => ("icons/thumb-up.svg", "Me gusta (se anota en personal brain)"),
+        (true, true) => ("icons/thumb-up-fill.svg", "Quitar «me gusta»"),
+        (false, false) => ("icons/thumb-down.svg", "No me gusta (no se vuelve a sugerir)"),
+        (false, true) => ("icons/thumb-down-fill.svg", "Quitar «no me gusta»"),
+    }
+}
+
+/// Small round action at the right of a list row: shown on hover, or always when `always`.
+fn row_action(id: (&'static str, usize), path: &'static str, label: &'static str, color: u32, always: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(22.))
+        .rounded(px(11.))
+        .cursor_pointer()
+        .when(!always, |d| d.invisible().group_hover("music-row", |s| s.visible()))
+        .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+        .child(icon(path, 12., color))
+        .tooltip(tip(label))
 }
 
 fn fmt_bytes(b: u64) -> String {
@@ -1211,6 +1270,24 @@ impl Render for MusicCard {
                             .flex()
                             .items_center()
                             .flex_none()
+                            .children([true, false].map(|good| {
+                                let rating = m.rating(&track.id);
+                                let (path, label) = rate_icon(good, rating);
+                                let music = music.clone();
+                                let t = track.clone();
+                                div()
+                                    .id(if good { "music-card-up" } else { "music-card-down" })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(22.))
+                                    .rounded(px(11.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+                                    .child(icon(path, 12., if rating == Some(good) { track.mode.color() } else { theme::TEXT_MUTED }))
+                                    .tooltip(tip(label))
+                                    .on_click(move |_: &ClickEvent, _, cx| music.update(cx, |m, cx| m.rate(&t, good, cx)))
+                            }))
                             .child(round_button("music-card-search", "icons/search.svg", 22., 12.).tooltip(tip("Buscar (⌘⇧M)")).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(MusicCardEvent::OpenSearch))))
                             .child(round_button("music-card-close", "icons/close.svg", 22., 12.).tooltip(tip("Cerrar reproductor")).on_click(on(|m, cx| m.stop(cx)))),
                     ),
