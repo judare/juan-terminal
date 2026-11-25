@@ -2291,17 +2291,24 @@ impl Workspace {
         }
         self.close_warned = None;
         self.refresh_locks();
+        self.push_brave_rules();
         self.persist(cx);
         cx.notify();
     }
 
     fn schedule_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Website schedules: only the primary window touches /etc/hosts on the tick.
-        let (now, offset) = clock_now();
-        if self.primary && self.applied_hosts.as_ref() != Some(&self.settings.blocked_hosts_at(now, offset).0) {
+        // Only the primary window touches /etc/hosts and the Brave guard on the tick.
+        if self.primary && self.applied_hosts.as_ref() != Some(&self.settings.hosts_file().0) {
             self.apply_blocked_websites(cx);
         }
         let changed = self.refresh_locks();
+        if self.primary {
+            self.push_brave_rules();
+            if crate::brave_guard::take_no_js_warning() {
+                self.error = Some("Brave: turn on View › Developer › Allow JavaScript from Apple Events so juan-terminal can block adult pages and x.com videos.".into());
+                cx.notify();
+            }
+        }
         let Some(active) = self.state.active_project.clone() else {
             if changed {
                 cx.notify();
@@ -2368,9 +2375,19 @@ impl Workspace {
         cx.notify();
     }
 
-    fn apply_blocked_websites(&mut self, cx: &mut Context<Self>) {
+    /// Sites Brave blanks right now (schedules and locked projects change with the clock).
+    fn push_brave_rules(&self) {
         let (now, offset) = clock_now();
-        let (hosts, release) = self.settings.blocked_hosts_at(now, offset);
+        let locked: Vec<String> = self.locked.iter().cloned().collect();
+        crate::brave_guard::set_rules(crate::brave_guard::Rules {
+            blocked: self.settings.brave_blocked_at(now, offset, &locked),
+            no_video: self.settings.brave_no_video(),
+        });
+    }
+
+    fn apply_blocked_websites(&mut self, cx: &mut Context<Self>) {
+        self.push_brave_rules();
+        let (hosts, release) = self.settings.hosts_file();
         self.applied_hosts = Some(hosts.clone());
         cx.spawn(async move |this, cx| {
             let res = cx.background_executor().spawn(async move { crate::website_block::apply(&hosts, &release) }).await;

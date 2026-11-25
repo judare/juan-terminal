@@ -3,10 +3,13 @@
 //! Unlike `state.toml` (rewritten by the app all the time), this file is only written once
 //! (a commented template) and then edited by the user, in the app (⌘,) or any editor.
 //!
-//! * `blocked_websites`: domains blocked system-wide through a managed block in `/etc/hosts`.
-//! * `[[website_schedules]]`: domains blocked except during their `allowed` hours.
+//! * `blocked_websites`: domains blocked system-wide through a managed block in `/etc/hosts`
+//!   (and blanked in Brave).
+//! * `brave_blocked_websites`: blanked in Brave only (DNS untouched).
+//! * `brave_no_video_websites`: Brave hides and stops their videos (images stay).
+//! * `[[website_schedules]]`: domains blanked in Brave except during their `allowed` hours.
 //! * `[projects.<id>] schedule`: hours a project may be opened. Outside them the project is
-//!   locked in the sidebar and closed if it is open.
+//!   locked in the sidebar and closed if it is open, and its `websites` are blanked in Brave.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -20,7 +23,12 @@ pub const DEFAULT_SETTINGS: &str = include_str!("../default-settings.toml");
 #[serde(default)]
 pub struct Settings {
     pub blocked_websites: Vec<String>,
-    /// Sites blocked outside their allowed hours (e.g. social networks only on Sundays).
+    /// Blanked in Brave only: DNS is untouched, so other apps (juan-terminal's YouTube music)
+    /// keep working.
+    pub brave_blocked_websites: Vec<String>,
+    /// Brave hides and stops the videos of these sites (images stay).
+    pub brave_no_video_websites: Vec<String>,
+    /// Sites blanked in Brave outside their allowed hours (e.g. social networks only on Sundays).
     pub website_schedules: Vec<WebsiteSchedule>,
     /// Keyed by project id (`id` in state.toml; the folder name for most projects).
     pub projects: BTreeMap<String, ProjectSettings>,
@@ -34,6 +42,8 @@ pub struct ProjectSettings {
     /// Fixed UTC offset the schedule is written in, e.g. "-05:00" (Colombia, no DST).
     /// Absent = the Mac's local time.
     pub utc_offset: Option<String>,
+    /// Blanked in Brave while the project is locked (outside its hours, no override).
+    pub websites: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -203,21 +213,42 @@ impl Settings {
         (!p.is_open(day, minute)).then(|| p.describe())
     }
 
-    /// Hosts to block at Unix time `epoch`: `blocked_websites` plus every website schedule
-    /// outside its allowed hours. Second list: scheduled hosts allowed right now (released
-    /// at once, without the 24 h removal delay).
-    pub fn blocked_hosts_at(&self, epoch: i64, local_offset: i64) -> (Vec<String>, Vec<String>) {
-        let mut blocked: std::collections::BTreeSet<String> = self.blocked_hosts().into_iter().collect();
-        let mut allowed = std::collections::BTreeSet::new();
+    /// `/etc/hosts` entries: `blocked_websites` only. Second list: hosts now handled in Brave
+    /// only (schedules, Brave lists, project sites), released from /etc/hosts at once without
+    /// the 24 h removal delay: they stay blocked, just not in DNS.
+    pub fn hosts_file(&self) -> (Vec<String>, Vec<String>) {
+        let blocked = self.blocked_hosts();
+        let mut moved: Vec<String> = self.website_schedules.iter().flat_map(|g| normalize_hosts(&g.websites)).collect();
+        moved.extend(normalize_hosts(&self.brave_blocked_websites));
+        moved.extend(self.projects.values().flat_map(|p| normalize_hosts(&p.websites)));
+        moved.retain(|h| !blocked.contains(h));
+        moved.sort();
+        moved.dedup();
+        (blocked, moved)
+    }
+
+    /// Domains Brave blanks at Unix time `epoch`: `blocked_websites`, `brave_blocked_websites`,
+    /// schedules outside their allowed hours and the `websites` of `locked_projects`.
+    pub fn brave_blocked_at(&self, epoch: i64, local_offset: i64, locked_projects: &[String]) -> Vec<String> {
+        let mut out: std::collections::BTreeSet<String> = self.blocked_hosts().into_iter().collect();
+        out.extend(normalize_hosts(&self.brave_blocked_websites));
         for g in &self.website_schedules {
             let offset = g.utc_offset.as_deref().and_then(parse_offset).unwrap_or(local_offset);
             let (day, minute) = weekday_minute(epoch, offset);
-            let open = g.allowed.is_empty() || g.allowed.iter().any(|w| w.contains(day, minute));
-            let hosts = normalize_hosts(&g.websites);
-            if open { allowed.extend(hosts) } else { blocked.extend(hosts) }
+            if !(g.allowed.is_empty() || g.allowed.iter().any(|w| w.contains(day, minute))) {
+                out.extend(normalize_hosts(&g.websites));
+            }
         }
-        let allowed = allowed.into_iter().filter(|h| !blocked.contains(h)).collect();
-        (blocked.into_iter().collect(), allowed)
+        for id in locked_projects {
+            if let Some(p) = self.projects.get(id) {
+                out.extend(normalize_hosts(&p.websites));
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    pub fn brave_no_video(&self) -> Vec<String> {
+        normalize_hosts(&self.brave_no_video_websites)
     }
 
     /// Normalized hosts entries: lowercase, no scheme/path/port, each with its `www.` twin.
@@ -287,19 +318,22 @@ mod tests {
 
     #[test]
     fn website_schedules_block_outside_allowed_hours() {
-        let s: Settings = toml::from_str(
-            "blocked_websites = [\"a.com\"]\n[[website_schedules]]\nname = \"social\"\nutc_offset = \"-05:00\"\nwebsites = [\"instagram.com\"]\nallowed = [{ days = [\"sun\"], start = \"00:00\", end = \"00:00\" }]\n",
+        let st: Settings = toml::from_str(
+            "blocked_websites = [\"a.com\"]\nbrave_blocked_websites = [\"youtube.com\"]\n[[website_schedules]]\nname = \"social\"\nutc_offset = \"-05:00\"\nwebsites = [\"instagram.com\"]\nallowed = [{ days = [\"sun\"], start = \"00:00\", end = \"00:00\" }]\n[projects.bemovil]\nwebsites = [\"bemovil.net\"]\n",
         )
         .unwrap();
-        // 2026-11-23 (Monday) 08:00 in Colombia: blocked.
+        // /etc/hosts only gets blocked_websites; everything else is released (Brave handles it).
+        assert_eq!(st.hosts_file(), (v(&["a.com", "www.a.com"]), v(&["bemovil.net", "instagram.com", "www.bemovil.net", "www.instagram.com", "www.youtube.com", "youtube.com"])));
+        // 2026-11-23 (Monday) 08:00 in Colombia: instagram blanked; bemovil.net only when locked.
         let mon = 1_795_438_800;
-        let (b, a) = s.blocked_hosts_at(mon, 0);
-        assert_eq!(b, ["a.com", "instagram.com", "www.a.com", "www.instagram.com"]);
-        assert!(a.is_empty());
-        // Sunday 08:00 Colombia: allowed.
-        let (b, a) = s.blocked_hosts_at(mon - 86_400, 0);
-        assert_eq!(b, ["a.com", "www.a.com"]);
-        assert_eq!(a, ["instagram.com", "www.instagram.com"]);
+        assert_eq!(st.brave_blocked_at(mon, 0, &[]), v(&["a.com", "instagram.com", "www.a.com", "www.instagram.com", "www.youtube.com", "youtube.com"]));
+        assert!(st.brave_blocked_at(mon, 0, &["bemovil".into()]).contains(&"bemovil.net".to_string()));
+        // Sunday 08:00 Colombia: instagram allowed.
+        assert_eq!(st.brave_blocked_at(mon - 86_400, 0, &[]), v(&["a.com", "www.a.com", "www.youtube.com", "youtube.com"]));
+
+        fn v(v: &[&str]) -> Vec<String> {
+            v.iter().map(|x| x.to_string()).collect()
+        }
     }
 
     #[test]

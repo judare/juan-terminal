@@ -43,7 +43,11 @@ Click a repository in the sidebar to open (or jump to) a terminal in it.
   5-minute warning). Folders on disk are never touched.
 * `blocked_websites = [...]`: blocked system-wide via a managed block in `/etc/hosts` (macOS asks
   for the admin password when the list changes). Additions apply at once; removals only after
-  24 h.
+  24 h. They are also blanked in Brave.
+* Brave guard (DNS untouched; needs Brave › View › Developer › Allow JavaScript from Apple
+  Events): `brave_blocked_websites` (e.g. YouTube) are always blank, `[[website_schedules]]`
+  outside their hours, a project's `websites` while it is locked; `brave_no_video_websites`
+  (e.g. x.com) lose their videos; any page with many adult keywords is blanked.
 * Emergencies: opening a locked project offers "Open for 1 hour / 4 hours"; ⌘⇧P → “Keep Project
   Open 1 More Hour” extends the open one.
 

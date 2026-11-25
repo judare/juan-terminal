@@ -89,6 +89,19 @@ repeating `used`. Podcasts/videos keep progress (`progress.json`): finished ones
 suggested again, unfinished ones resume. Media keys / Now Playing via MediaPlayer.framework;
 global ⌃⌥Space / ⌃⌥←→ / ⌃⌥⇧←→ via Carbon hotkeys. `ureq` is reused from the WhatsApp crate's tree.
 
+## D15 — Site blocking in Brave instead of DNS (except adult/gambling)
+DNS blocking breaks everything on the Mac: YouTube in /etc/hosts would kill juan-terminal's
+music (yt-dlp), and bemovil.net would break work tools. So only `blocked_websites` (adult,
+gambling) stays in /etc/hosts; schedules, `brave_blocked_websites` and project `websites` are
+enforced only in Brave: a `brave-guard` thread lists Brave's tabs through AppleScript (1 s while
+Brave is frontmost, 3 s otherwise, nothing while it isn't running, checked in-process) and sets
+blocked tabs to `about:blank`. A guard script injected into each window's active tab blanks pages
+with ≥ 6 adult-keyword hits of ≥ 3 different words (or an adult rating meta) and hides videos on
+`brave_no_video_websites`. Trade-offs: a page can show for up to ~1 s, it only works while
+juan-terminal runs, and Brave tab ids overflow AppleScript integers, so tabs are matched by id
+as text. Moving a host from /etc/hosts to Brave releases it from the hosts file at once (it stays
+blocked); Brave lists have no 24 h removal delay.
+
 ## Dependency policy
 Only crates that are already pulled by GPUI or are essential: `alacritty_terminal`, `ropey`,
 `tree-sitter` + grammars, `serde`, `serde_json`, `toml`, `anyhow`, `futures`, `libc`,
