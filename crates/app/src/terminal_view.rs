@@ -859,6 +859,10 @@ impl TerminalView {
             let wrapped: Vec<bool> = (0..self.snapshot.rows)
                 .map(|r| self.snapshot.row(r).last().is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE)))
                 .collect();
+            if let Some(url) = url_at(&rows, &wrapped, row, col) {
+                cx.open_url(&url);
+                return;
+            }
             let cwd = self.current_cwd();
             if let Some((path, line, column)) = path_at(&rows, &wrapped, row, col, cwd.as_deref()) {
                 cx.emit(TerminalViewEvent::OpenPath { path, line, column });
@@ -1265,7 +1269,7 @@ fn hsla(c: Rgb) -> Hsla {
 const PATH_STOP: &[char] = &['"', '\'', '`', '(', ')', '<', '>', '[', ']', '{', '}', '|', ',', ';'];
 
 /// Token (non-space, non-quote run) around char index `col` of `line`, with its char range.
-fn token_at(line: &[char], col: usize) -> Option<(usize, usize)> {
+pub(crate) fn token_at(line: &[char], col: usize) -> Option<(usize, usize)> {
     let ok = |c: char| !c.is_whitespace() && !PATH_STOP.contains(&c);
     if col >= line.len() || !ok(line[col]) {
         return None;
@@ -1301,7 +1305,7 @@ fn split_line_col(t: &str) -> (&str, Option<usize>, Option<usize>) {
     }
 }
 
-fn resolve_path(t: &str, cwd: Option<&Path>) -> Option<(PathBuf, Option<usize>, Option<usize>)> {
+pub(crate) fn resolve_path(t: &str, cwd: Option<&Path>) -> Option<(PathBuf, Option<usize>, Option<usize>)> {
     let t = t.strip_prefix("file://").unwrap_or(t);
     // Trailing sentence punctuation is not part of the path ("…/a.png.").
     for cand in [t, t.trim_end_matches(['.', ':', '!', '?'])] {
@@ -1318,6 +1322,87 @@ fn resolve_path(t: &str, cwd: Option<&Path>) -> Option<(PathBuf, Option<usize>, 
         };
         if path.exists() {
             return Some((path, line, col));
+        }
+    }
+    None
+}
+
+fn url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&*+,;=%()'".contains(c) || (!c.is_ascii() && !c.is_whitespace())
+}
+
+/// Find an http(s) URL under (row, col). Follows URLs broken across rows, either by the
+/// terminal (wrap flag) or by a TUI that hard-wraps them onto an indented next line. A URL
+/// written as `(https://…)` ends at its closing parenthesis.
+pub fn url_at(rows: &[String], wrapped: &[bool], row: usize, col: usize) -> Option<String> {
+    let chars: Vec<Vec<char>> = rows.iter().map(|r| r.chars().collect()).collect();
+    let indent = |r: usize| chars[r].iter().position(|c| !c.is_whitespace()).unwrap_or(0);
+    let first = row.saturating_sub(4);
+    for start_row in (first..=row).rev() {
+        let line = &chars[start_row];
+        let text: String = line.iter().collect();
+        // Every scheme occurrence in this row (char offsets).
+        let mut starts = Vec::new();
+        for (bi, _) in text.match_indices("http") {
+            let rest = &text[bi..];
+            if rest.starts_with("https://") || rest.starts_with("http://") {
+                starts.push(text[..bi].chars().count());
+            }
+        }
+        for a in starts {
+            let in_parens = a > 0 && line[a - 1] == '(';
+            let group_indent = indent(start_row);
+            let mut url = String::new();
+            let mut depth = 0i32;
+            let mut hit = false;
+            let (mut r, mut i) = (start_row, a);
+            'walk: loop {
+                let cur = &chars[r];
+                while i < cur.len() && url_char(cur[i]) {
+                    let c = cur[i];
+                    if c == '(' {
+                        depth += 1;
+                    } else if c == ')' {
+                        if depth == 0 && in_parens {
+                            break 'walk;
+                        }
+                        depth -= 1;
+                    }
+                    if r == row && i == col {
+                        hit = true;
+                    }
+                    url.push(c);
+                    i += 1;
+                }
+                // Continue onto the next row only when the URL runs to the end of this one.
+                let at_end = cur[i..].iter().all(|c| c.is_whitespace());
+                if !at_end || r + 1 >= chars.len() {
+                    break;
+                }
+                let next = &chars[r + 1];
+                let ni = if wrapped[r] {
+                    0
+                } else {
+                    let ni = indent(r + 1);
+                    if ni <= group_indent || ni >= next.len() || next[ni..].iter().all(|c| c.is_whitespace()) {
+                        break;
+                    }
+                    ni
+                };
+                if ni >= next.len() || !url_char(next[ni]) {
+                    break;
+                }
+                r += 1;
+                i = ni;
+                if r > row + 4 {
+                    break;
+                }
+            }
+            if hit {
+                let url = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '\'']);
+                let url = if !in_parens && url.ends_with(')') && url.matches('(').count() < url.matches(')').count() { &url[..url.len() - 1] } else { url };
+                return (url.len() > "https://".len()).then(|| url.to_string());
+            }
         }
     }
     None
@@ -1952,6 +2037,33 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tone_tests {
     use super::*;
+
+    #[test]
+    fn urls_across_hard_wrapped_rows() {
+        let rows: Vec<String> = [
+            "  - Servo 0.4 — Phoronix",
+            "    (https://www.phoronix.com/news/Servo-0.4-Released)",
+            "  - The Register — Servo (https://www.theregister.com/202",
+            "    5/11/18/servo_002_arrives/)",
+            "  - Ladybird — Wikipedia (https://en.wikipedia.org/wiki/L",
+            "    adybird_(web_browser))",
+            "  - Moli — GitHub (https://github.com/ldm0/moli). Done",
+        ]
+        .map(String::from)
+        .to_vec();
+        let w = vec![false; rows.len()];
+        assert_eq!(url_at(&rows, &w, 1, 10).as_deref(), Some("https://www.phoronix.com/news/Servo-0.4-Released"));
+        assert_eq!(url_at(&rows, &w, 0, 10), None);
+        let reg = Some("https://www.theregister.com/2025/11/18/servo_002_arrives/");
+        assert_eq!(url_at(&rows, &w, 2, 30).as_deref(), reg);
+        assert_eq!(url_at(&rows, &w, 3, 8).as_deref(), reg);
+        let wiki = Some("https://en.wikipedia.org/wiki/Ladybird_(web_browser)");
+        assert_eq!(url_at(&rows, &w, 5, 6).as_deref(), wiki);
+        assert_eq!(url_at(&rows, &w, 4, 40).as_deref(), wiki);
+        assert_eq!(url_at(&rows, &w, 6, 30).as_deref(), Some("https://github.com/ldm0/moli"));
+        let single = vec!["see https://example.com/a.".to_string()];
+        assert_eq!(url_at(&single, &[false], 0, 10).as_deref(), Some("https://example.com/a"));
+    }
 
     #[test]
     fn claude_chrome_rows_and_status_parsing() {
