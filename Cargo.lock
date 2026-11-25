@@ -3518,6 +3518,7 @@ dependencies = [
  "sha2 0.10.9",
  "ssh_remote",
  "terminal_engine",
+ "ureq",
  "whatsapp",
  "workspace_state",
  "zip",

@@ -88,6 +88,11 @@ impl TextInput {
         cx.notify();
     }
 
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     /// Caret at the end, nothing selected.
     pub fn move_end(&mut self, cx: &mut Context<Self>) {
         self.selected_range = self.content.len()..self.content.len();

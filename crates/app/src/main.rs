@@ -23,6 +23,10 @@ mod language_servers;
 mod launcher;
 mod markdown_live;
 mod moli;
+mod music;
+mod music_engine;
+mod music_proxy;
+mod music_ui;
 mod ports;
 mod power;
 mod quick_open;
@@ -169,6 +173,8 @@ fn main() {
         bind_keys(cx);
         wa_bridge::init(cx);
         net::init(cx);
+        music::init(cx);
+        music_ui::bind_keys(cx);
         text_input::bind_keys(cx);
         chat_view::bind_keys(cx);
         text_area::bind_keys(cx);
@@ -235,6 +241,7 @@ fn main() {
                     MenuItem::action("Toggle Terminal", workspace::ToggleTerminalPanel),
                     MenuItem::action("Toggle Light / Dark Theme", workspace::ToggleTheme),
                     MenuItem::action("Agent Usage", workspace::ShowUsage),
+                    MenuItem::action("Música, podcasts y videos…", workspace::ToggleMusic),
                     MenuItem::action("Command Palette…", workspace::ToggleCommandPalette),
                     MenuItem::action("Go to File…", workspace::ToggleQuickOpen),
                     MenuItem::action("Search in Project", workspace::SearchInProject),
@@ -371,6 +378,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-p", w::ToggleCommandPalette, Some("Workspace")),
         KeyBinding::new("cmd-alt-t", w::ToggleTheme, Some("Workspace")),
         KeyBinding::new("cmd-shift-u", w::ShowUsage, Some("Workspace")),
+        KeyBinding::new("cmd-shift-m", w::ToggleMusic, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", w::SearchInProject, Some("Workspace")),
         KeyBinding::new("cmd-shift-e", w::ShowFiles, Some("Workspace")),
         KeyBinding::new("cmd-shift-c", w::OpenClaude, Some("Workspace")),
