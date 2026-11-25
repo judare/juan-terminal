@@ -173,6 +173,10 @@ fn light(hex: u32) -> u32 {
         0x1d2b22 => 0xe1f3e4, // success
         0x23402a => 0xcbeacf,
         0x3a3220 => 0xfbf0d4, // warning
+        0x0e4429 => 0x9be9a8, // commit heat map
+        0x006d32 => 0x40c463,
+        0x26a641 => 0x30a14e,
+        0x39d353 => 0x216e39,
         0x1e2a3d => 0xe2ebfa, // info
         0x1f2a40 => 0xdde8fb,
         0x2b4a7a => 0xc7daf7, // primary button / hover

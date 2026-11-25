@@ -491,9 +491,37 @@ pub fn show_commit(repo: &Path, hash: &str) -> Result<String> {
     run_text(cmd)
 }
 
+/// Commits by the repo's `user.email` (every branch) in the last `days` days, as
+/// `(hash, local YYYY-MM-DD)`. All authors when no email is configured.
+pub fn activity(repo: &Path, days: u32) -> Result<Vec<(String, String)>> {
+    let mut cfg = git(repo);
+    cfg.args(["config", "user.email"]);
+    let email = run_text(cfg).map(|s| s.trim().to_string()).unwrap_or_default();
+    let mut cmd = git(repo);
+    cmd.args(["log", "--all", "-F", &format!("--since={days}.days"), "--date=format-local:%Y-%m-%d", "--format=%H %ad"]);
+    if !email.is_empty() {
+        cmd.arg(format!("--author={email}"));
+    }
+    let text = match run_text(cmd) {
+        Ok(t) => t,
+        Err(_) if !has_head(repo) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(parse_activity(&text))
+}
+
+fn parse_activity(text: &str) -> Vec<(String, String)> {
+    text.lines().filter_map(|l| l.split_once(' ')).map(|(h, d)| (h.to_string(), d.trim().to_string())).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_activity_lines() {
+        assert_eq!(parse_activity("abc 2026-11-24\ndef 2026-11-20\n\n"), vec![("abc".into(), "2026-11-24".into()), ("def".into(), "2026-11-20".into())]);
+    }
 
     #[test]
     fn diff_contents_produces_parseable_hunks() {

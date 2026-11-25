@@ -59,13 +59,28 @@ pub struct GitPanel {
     deleted: std::rc::Rc<std::collections::HashMap<PathBuf, Vec<(PathBuf, bool)>>>,
     /// Repos with a status query in flight (polling never stacks up).
     refreshing: std::collections::HashSet<PathBuf>,
+    /// Commits per day over the last `ACTIVITY_DAYS` days (oldest first), across every repo.
+    activity: Option<Vec<u32>>,
+    /// Local day number (days since 1970-01-01) of the last entry of `activity`.
+    activity_today: i64,
+    activity_loading: bool,
 }
+
+const ACTIVITY_DAYS: usize = 90;
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
 
 impl GitPanel {
     pub fn new() -> Self {
-        Self { repos: Vec::new(), tree_marks: Default::default(), deleted: Default::default(), refreshing: Default::default() }
+        Self {
+            repos: Vec::new(),
+            tree_marks: Default::default(),
+            deleted: Default::default(),
+            refreshing: Default::default(),
+            activity: None,
+            activity_today: 0,
+            activity_loading: false,
+        }
     }
 
     /// Set repositories for the active project and refresh their status.
@@ -112,8 +127,105 @@ impl GitPanel {
                 })
                 .collect();
             self.rebuild_tree_marks();
+            self.activity = None;
+            self.load_activity(cx);
         }
         self.refresh_all(cx);
+    }
+
+    /// Recount the commits per day (all branches, current user) for the heat map.
+    fn load_activity(&mut self, cx: &mut Context<Self>) {
+        if self.activity_loading {
+            return;
+        }
+        self.activity_loading = true;
+        let paths: Vec<PathBuf> = self.repos.iter().map(|r| r.path.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            let (today, counts) = cx
+                .background_executor()
+                .spawn(async move {
+                    let today = local_day();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut counts = vec![0u32; ACTIVITY_DAYS];
+                    for p in &paths {
+                        for (hash, date) in git_engine::activity(p, ACTIVITY_DAYS as u32).unwrap_or_default() {
+                            let Some(day) = parse_day(&date) else { continue };
+                            let back = today - day;
+                            if (0..ACTIVITY_DAYS as i64).contains(&back) && seen.insert(hash) {
+                                counts[ACTIVITY_DAYS - 1 - back as usize] += 1;
+                            }
+                        }
+                    }
+                    (today, counts)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.activity_loading = false;
+                this.activity_today = today;
+                this.activity = Some(counts);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// GitHub-style contribution grid: one column per week, one row per weekday.
+    fn render_activity(&self) -> Option<gpui::Div> {
+        let counts = self.activity.as_ref()?;
+        let total: u32 = counts.iter().sum();
+        let max = counts.iter().copied().max().unwrap_or(0);
+        let first = self.activity_today - (ACTIVITY_DAYS as i64 - 1);
+        let lead = weekday(first) as usize; // empty cells before the first day (week starts Sunday)
+        let weeks = (lead + ACTIVITY_DAYS).div_ceil(7);
+        const CELL: f32 = 11.;
+        const GAP: f32 = 3.;
+        let label = |t: &'static str| div().h(px(CELL)).flex().items_center().text_size(px(9.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(t);
+        let mut grid = div().flex().gap(px(GAP)).child(
+            div().flex().flex_col().gap(px(GAP)).pr(px(2.)).children(["", "Mon", "", "Wed", "", "Fri", ""].map(label)),
+        );
+        for w in 0..weeks {
+            let mut col = div().flex().flex_col().gap(px(GAP));
+            for d in 0..7 {
+                let slot = w * 7 + d;
+                let cell = div().size(px(CELL)).rounded(px(2.));
+                col = col.child(match slot.checked_sub(lead).filter(|&i| i < ACTIVITY_DAYS) {
+                    None => cell.into_any_element(),
+                    Some(i) => {
+                        let n = counts[i];
+                        let (_, m, day) = crate::usage_stats::civil_from_days(first + i as i64);
+                        let tip: SharedString = format!("{} {} on {} {day}", n, if n == 1 { "commit" } else { "commits" }, MONTHS[m as usize - 1]).into();
+                        cell.id(SharedString::from(format!("act-{i}")))
+                            .bg(theme::rgb(heat_color(level(n, max))))
+                            .tooltip(move |_, cx| cx.new(|_| DynTooltip(tip.clone())).into())
+                            .into_any_element()
+                    }
+                });
+            }
+            grid = grid.child(col);
+        }
+        let legend = div()
+            .flex()
+            .items_center()
+            .gap(px(GAP))
+            .text_size(px(9.5))
+            .text_color(theme::rgb(theme::TEXT_FAINT))
+            .child("Less")
+            .children((0..5).map(|l| div().size(px(CELL - 2.)).rounded(px(2.)).bg(theme::rgb(heat_color(l)))))
+            .child("More");
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .px(px(12.))
+                .pt(px(10.))
+                .pb(px(10.))
+                .border_b_1()
+                .border_color(theme::rgb(theme::BORDER))
+                .child(div().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(format!("{total} {} in the last {ACTIVITY_DAYS} days", if total == 1 { "commit" } else { "commits" })))
+                .child(grid)
+                .child(legend),
+        )
     }
 
     /// Total changed files across all repositories (for the sidebar badge).
@@ -280,6 +392,7 @@ impl GitPanel {
                     };
                     this.refresh(ix, cx);
                 }
+                this.load_activity(cx);
                 cx.notify();
             });
         })
@@ -549,6 +662,45 @@ fn mini_button(id: impl Into<gpui::ElementId>, icon: &'static str) -> gpui::Stat
         .child(gpui::svg().path(icon).size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)))
 }
 
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Heat level 0–4 relative to the busiest day (like GitHub's quartiles).
+fn level(n: u32, max: u32) -> u32 {
+    if n == 0 || max == 0 { 0 } else { (n * 4).div_ceil(max).clamp(1, 4) }
+}
+
+fn heat_color(level: u32) -> u32 {
+    match level {
+        0 => theme::SELECTED,
+        1 => 0x0e4429,
+        2 => 0x006d32,
+        3 => 0x26a641,
+        _ => 0x39d353,
+    }
+}
+
+/// 0 = Sunday. 1970-01-01 was a Thursday.
+fn weekday(day: i64) -> i64 {
+    (day + 4).rem_euclid(7)
+}
+
+fn parse_day(s: &str) -> Option<i64> {
+    let mut it = s.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    Some(crate::usage_stats::days_from_civil(it.next()??, it.next()??, it.next()??))
+}
+
+/// Today's local day number (days since 1970-01-01).
+fn local_day() -> i64 {
+    // SAFETY: localtime_r only writes into the struct we pass.
+    let tm = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        tm
+    };
+    crate::usage_stats::days_from_civil(tm.tm_year as i64 + 1900, tm.tm_mon as i64 + 1, tm.tm_mday as i64)
+}
+
 fn count_pill(n: usize) -> gpui::Div {
     div()
         .flex_none()
@@ -581,6 +733,9 @@ fn section_header(label: String) -> gpui::Div {
 impl Render for GitPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div().id("git-panel").flex().flex_col().size_full().overflow_y_scroll().pb(px(16.));
+        if let Some(heat) = self.render_activity() {
+            list = list.child(heat);
+        }
         if self.repos.is_empty() {
             list = list.child(div().px(px(16.)).py(px(8.)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("This project has no Git repositories."));
         }
