@@ -1,0 +1,4 @@
+# Leave half the cores free: full-speed builds made the Mac sluggish, hot and loud.
+# (Rebuilds use the incremental `fastrelease` profile, so they stay fast anyway.)
+[build]
+jobs = 4

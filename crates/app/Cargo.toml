@@ -21,11 +21,18 @@ code_quality = { path = "../code_quality" }
 lsp_client = { path = "../lsp_client" }
 claude_ide = { path = "../claude_ide" }
 ssh_remote = { path = "../ssh_remote" }
+whatsapp = { path = "../whatsapp" }
+opus = "=0.4.0"
+audiopus_sys = { version = "0.2", features = ["static"] }
+ogg = "=0.9.2"
+qrcode = { version = "=0.14.1", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde.workspace = true
 serde_json = "=1.0.154"
 base64 = "=0.22.1"
 imagesize = "=0.13.0"
 objc = "=0.2.7"
+block = "=0.1.6"
 raw-window-handle = "=0.6.2"
 terminal_engine = { path = "../terminal_engine" }
 workspace_state = { path = "../workspace_state" }

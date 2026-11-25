@@ -10,11 +10,13 @@ DEST="/Applications/$APP_NAME.app"
 WORK="target/bundle/$APP_NAME.app"
 VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 
-cargo build --release -p juan-terminal
+# `fastrelease`: optimized without LTO, incremental — a rebuild after a change takes seconds.
+# Utility QoS: lower priority than what the user is doing, so the Mac stays responsive.
+/usr/sbin/taskpolicy -c utility cargo build --profile fastrelease -p juan-terminal
 
 rm -rf "$WORK"
 mkdir -p "$WORK/Contents/MacOS" "$WORK/Contents/Resources"
-cp target/release/juan-terminal "$WORK/Contents/MacOS/juan-terminal"
+cp target/fastrelease/juan-terminal "$WORK/Contents/MacOS/juan-terminal"
 
 # Icon: 1024 PNG (rounded photo) -> iconset -> icns.
 ICONSET=target/bundle/AppIcon.iconset
@@ -43,6 +45,7 @@ cat > "$WORK/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Grabar notas de voz para WhatsApp.</string>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>

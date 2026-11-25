@@ -179,7 +179,7 @@ impl PptxView {
                 window.focus(&this.focus);
                 cx.notify();
             }
-            TextAreaEvent::Changed => {}
+            TextAreaEvent::Changed | TextAreaEvent::PastedImage(_) => {}
         })
         .detach();
         window.focus(&area.focus_handle(cx));
