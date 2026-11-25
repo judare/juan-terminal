@@ -58,6 +58,10 @@ pub struct WhatsAppPanel {
     filter: Filter,
     /// Label chip, combined (AND) with the kind chip.
     label: Option<i64>,
+    /// Workspace's active project.
+    project: Option<String>,
+    /// Default filter: chats with any label linked to [`Self::project`] (until another chip is picked).
+    by_project: bool,
     /// Search box non-empty at the last reload (filtering → show every chat).
     searching: bool,
     /// "Ver más" clicked: show chats older than [`RECENT_SECS`] in the unfiltered list.
@@ -179,6 +183,8 @@ impl WhatsAppPanel {
             chats: Rc::new(Vec::new()),
             filter: Filter::All,
             label: None,
+            project: None,
+            by_project: false,
             searching: false,
             show_old: false,
             hidden_old: 0,
@@ -315,11 +321,39 @@ impl WhatsAppPanel {
         .detach();
     }
 
+    /// Labels linked to the active project, when the project filter applies (empty: it doesn't).
+    fn project_labels(&self) -> Vec<i64> {
+        if !self.by_project || self.label.is_some() || self.archived_view {
+            return Vec::new();
+        }
+        let Some(pid) = self.project.as_deref() else { return Vec::new() };
+        self.labels.iter().filter(|l| l.project.as_deref() == Some(pid)).map(|l| l.id).collect()
+    }
+
+    /// The workspace tells us its active project: switching to another one resets the list
+    /// to that project's labelled chats.
+    pub fn set_project(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.project != id {
+            self.project = id;
+            self.by_project = true;
+            self.label = None;
+            self.apply_filter();
+            self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
     fn apply_filter(&mut self) {
         let (f, label) = (self.filter, self.label);
-        let mut chats: Vec<ChatSummary> = self.all.iter().filter(|c| f.keep(c) && label.is_none_or(|l| if l == NO_LABEL { c.labels.is_empty() } else { c.labels.contains(&l) })).cloned().collect();
+        let proj = self.project_labels();
+        let mut chats: Vec<ChatSummary> = self
+            .all
+            .iter()
+            .filter(|c| f.keep(c) && label.is_none_or(|l| if l == NO_LABEL { c.labels.is_empty() } else { c.labels.contains(&l) }) && (proj.is_empty() || c.labels.iter().any(|l| proj.contains(l))))
+            .cloned()
+            .collect();
         self.hidden_old = 0;
-        if f == Filter::All && label.is_none() && !self.searching && !self.show_old && !self.archived_view {
+        if f == Filter::All && label.is_none() && proj.is_empty() && !self.searching && !self.show_old && !self.archived_view {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
             let before = chats.len();
             chats.retain(|c| c.pinned || c.unread > 0 || c.last_ts >= now - RECENT_SECS);
@@ -477,6 +511,7 @@ impl WhatsAppPanel {
         let none = (!self.labels.is_empty()).then(|| (Filter::Label(NO_LABEL), SharedString::from("Sin etiqueta"), None));
         let custom = self.labels.iter().map(|l| (Filter::Label(l.id), SharedString::from(l.name.clone()), Some(l.color)));
         let all: Vec<(Filter, SharedString, Option<u32>)> = fixed.chain(none).chain(custom).collect();
+        let proj = self.project_labels();
         // One row that scrolls sideways (trackpad / shift+wheel) instead of wrapping.
         div()
             .id("wa-chips")
@@ -489,8 +524,8 @@ impl WhatsAppPanel {
             .overflow_x_scroll()
             .children(all.into_iter().enumerate().map(|(i, (f, label, color))| {
                 let active = match f {
-                    Filter::All => self.filter == Filter::All && self.label.is_none(),
-                    Filter::Label(id) => self.label == Some(id),
+                    Filter::All => self.filter == Filter::All && self.label.is_none() && proj.is_empty(),
+                    Filter::Label(id) => self.label == Some(id) || proj.contains(&id),
                     _ => self.filter == f,
                 };
                 let count = match f {
@@ -516,12 +551,17 @@ impl WhatsAppPanel {
                     .when(count > 0, |d| d.child(div().text_size(px(10.5)).opacity(0.8).child(count.to_string())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         // Kind and label chips combine; clicking an active one turns it off.
+                        // Picking any label (or Todos) leaves the project's default filter.
                         match f {
                             Filter::All => {
                                 this.filter = Filter::All;
                                 this.label = None;
+                                this.by_project = false;
                             }
-                            Filter::Label(id) => this.label = if active { None } else { Some(id) },
+                            Filter::Label(id) => {
+                                this.label = if active { None } else { Some(id) };
+                                this.by_project = false;
+                            }
                             _ => this.filter = if active { Filter::All } else { f },
                         }
                         this.apply_filter();
@@ -956,7 +996,7 @@ impl WhatsAppPanel {
     }
 }
 
-fn menu_box(on_out: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static) -> gpui::Div {
+pub(crate) fn menu_box(on_out: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -970,11 +1010,11 @@ fn menu_box(on_out: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) 
         .on_mouse_down_out(on_out)
 }
 
-fn menu_item(id: impl Into<gpui::ElementId>, label: String) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn menu_item(id: impl Into<gpui::ElementId>, label: String) -> gpui::Stateful<gpui::Div> {
     menu_row(id).child(label)
 }
 
-fn menu_row(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn menu_row(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -1010,6 +1050,7 @@ impl Render for WhatsAppPanel {
         let linked = matches!(self.status, Status::Connected | Status::Connecting | Status::Error(_)) || !self.all.is_empty();
         let full_card = status.is_some() && (self.all.is_empty() || (!self.offline_banner() && !matches!(self.status, Status::Connecting | Status::Error(_))));
         let count = self.chats.len();
+        let by_project = !self.project_labels().is_empty();
         let rows = count + (self.hidden_old > 0) as usize;
         let hits = self.hits.clone();
         let searching = !self.query.read(cx).content.trim().is_empty();
@@ -1046,9 +1087,11 @@ impl Render for WhatsAppPanel {
                 .children(self.render_selection_bar(cx))
             })
             .children(status)
-            .when(!full_card && count == 0 && (self.filter != Filter::All || self.label.is_some()) && !self.all.is_empty(), |d| {
+            .when(!full_card && count == 0 && (self.filter != Filter::All || self.label.is_some() || by_project) && !self.all.is_empty(), |d| {
                 d.child(
                     div().px(px(16.)).py(px(18.)).text_center().text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(match (self.filter, self.label) {
+                        (Filter::All, None) if by_project => "Ningún chat tiene las etiquetas de este proyecto.",
+                        (_, None) if by_project => "Ningún chat del proyecto cumple el filtro.",
                         (Filter::All, Some(NO_LABEL)) => "Todos los chats tienen alguna etiqueta.",
                         (Filter::All, Some(_)) => "Ningún chat tiene esta etiqueta. Clic derecho en un chat → Etiquetas.",
                         (_, Some(_)) => "Ningún chat cumple los dos filtros.",

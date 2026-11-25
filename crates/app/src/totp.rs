@@ -46,6 +46,8 @@ pub struct Account {
     pub digits: u32,
     pub period: u64,
     pub algorithm: Algorithm,
+    /// juan-terminal project id it belongs to (groups the 2FA list).
+    pub project: Option<String>,
 }
 
 /// Parsed from user input (a base32 secret or an `otpauth://totp/...` URI).
@@ -255,13 +257,14 @@ pub fn load_accounts() -> Vec<Account> {
                 digits: v.get("digits").and_then(|x| x.as_u64()).unwrap_or(6) as u32,
                 period: v.get("period").and_then(|x| x.as_u64()).filter(|p| *p > 0).unwrap_or(30),
                 algorithm: v.get("algorithm").and_then(|x| x.as_str()).and_then(Algorithm::parse).unwrap_or(Algorithm::Sha1),
+                project: v.get("project").and_then(|x| x.as_str()).filter(|p| !p.is_empty()).map(str::to_string),
             })
         })
         .collect()
 }
 
 pub fn save_accounts(accounts: &[Account]) -> Result<()> {
-    let arr: Vec<Value> = accounts.iter().map(|a| json!({"id": a.id, "label": a.label, "issuer": a.issuer, "digits": a.digits, "period": a.period, "algorithm": a.algorithm.name()})).collect();
+    let arr: Vec<Value> = accounts.iter().map(|a| json!({"id": a.id, "label": a.label, "issuer": a.issuer, "digits": a.digits, "period": a.period, "algorithm": a.algorithm.name(), "project": a.project})).collect();
     let path = meta_path();
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;

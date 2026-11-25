@@ -66,6 +66,7 @@ actions!(
         OpenSettings,
         ExtendProjectHours,
         ShowUsage,
+        ToggleMusic,
     ]
 );
 
@@ -197,6 +198,11 @@ pub struct Workspace {
     palette: Option<(Entity<crate::command_palette::CommandPalette>, Subscription, Option<FocusHandle>)>,
     /// Agent usage dashboard (full-window overlay) and the focus to restore when it closes.
     usage: Option<(Entity<crate::usage_view::UsageView>, Subscription, Option<FocusHandle>)>,
+    /// Music / podcast / video search overlay (⌘⇧M) and the focus to restore when it closes.
+    music_search: Option<(Entity<crate::music_ui::MusicSearch>, Subscription, Option<FocusHandle>)>,
+    /// "Now playing" card at the bottom of the sidebar, and the large video view.
+    music_card: Option<Entity<crate::music_ui::MusicCard>>,
+    music_theater: Option<Entity<crate::music_ui::MusicTheater>>,
     search_panel: Option<Entity<SearchPanel>>,
     git_panel: Option<Entity<GitPanel>>,
     /// Created on first visit; dropped (stops polling) when hidden is not needed: it only
@@ -285,7 +291,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(store: StateStore, state: WorkspaceState, primary: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let dock_owner = cx.entity_id().as_u64();
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.on_app_quit(|this, cx| {
                 this.save_scrollback(cx);
                 this.persist(cx);
@@ -317,6 +323,20 @@ impl Workspace {
                 }
             }),
         ];
+        let (music_card, music_theater) = match crate::music::global(cx) {
+            Some(music) => {
+                use crate::music_ui::{MusicCard, MusicCardEvent, MusicTheater, TheaterEvent};
+                let card = cx.new(|cx| MusicCard::new(music.clone(), cx));
+                let theater = cx.new(|cx| MusicTheater::new(music, cx));
+                subscriptions.push(cx.subscribe_in(&card, window, |this, _, event, window, cx| match event {
+                    MusicCardEvent::OpenSearch => this.toggle_music(&ToggleMusic, window, cx),
+                    MusicCardEvent::OpenTheater => this.open_theater(window, cx),
+                }));
+                subscriptions.push(cx.subscribe_in(&theater, window, |this, _, _: &TheaterEvent, window, cx| this.focus_main(window, cx)));
+                (Some(card), Some(theater))
+            }
+            None => (None, None),
+        };
         let sidebar_width = state.sidebar_width.unwrap_or(260.).clamp(MIN_SIDEBAR, MAX_SIDEBAR);
         let terminal_width = state.terminal_panel_width.unwrap_or(520.).max(240.);
         let font_size = state.font_size.unwrap_or(theme::DEFAULT_FONT_SIZE);
@@ -329,6 +349,9 @@ impl Workspace {
             quick_open: None,
             palette: None,
             usage: None,
+            music_search: None,
+            music_card,
+            music_theater,
             search_panel: None,
             git_panel: None,
             ports_panel: None,
@@ -455,6 +478,10 @@ impl Workspace {
         // Linked WhatsApp: the panel exists from the start so the mode tab shows unread chats.
         if whatsapp::data_dir().join("session.db").exists() {
             this.ensure_whatsapp_panel(cx);
+        }
+        // Manual testing: open the music search at launch.
+        if primary && std::env::var_os("JT_MUSIC_AT_START").is_some() {
+            this.toggle_music(&ToggleMusic, window, cx);
         }
         this
     }
@@ -968,6 +995,58 @@ impl Workspace {
         });
         self.usage = Some((view, sub, prev));
         cx.notify();
+    }
+
+    fn toggle_music(&mut self, _: &ToggleMusic, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::music_ui::{MusicSearch, MusicSearchEvent};
+        if let Some((_, _, prev)) = self.music_search.take() {
+            match prev {
+                Some(p) => window.focus(&p),
+                None => self.focus_main(window, cx),
+            }
+            cx.notify();
+            return;
+        }
+        let Some(music) = crate::music::global(cx) else { return };
+        let prev = window.focused(cx);
+        let view = cx.new(|cx| MusicSearch::new(music.clone(), window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+            let prev = this.music_search.take().and_then(|(_, _, p)| p);
+            let theater = matches!(event, MusicSearchEvent::Played) && this.music_theater.as_ref().is_some_and(|t| t.read(cx).is_open(cx));
+            if let MusicSearchEvent::OpenFile(path) = event {
+                this.open_file(path, true, window, cx);
+            } else if theater {
+                this.open_theater(window, cx);
+            } else {
+                match prev {
+                    Some(p) => window.focus(&p),
+                    None => this.focus_main(window, cx),
+                }
+            }
+            cx.notify();
+        });
+        self.music_search = Some((view, sub, prev));
+        cx.notify();
+    }
+
+    /// Global ⌘⇧M from another app: bring up the music search (never closes it).
+    pub(crate) fn show_music(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.music_search {
+            Some((view, _, _)) => window.focus(&view.focus_handle(cx)),
+            None => self.toggle_music(&ToggleMusic, window, cx),
+        }
+    }
+
+    pub(crate) fn toggle_music_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_music(&ToggleMusic, window, cx);
+    }
+
+    fn open_theater(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(theater), Some(music)) = (self.music_theater.clone(), crate::music::global(cx)) {
+            music.update(cx, |m, cx| m.set_theater(true, cx));
+            window.focus(&theater.focus_handle(cx));
+            cx.notify();
+        }
     }
 
     fn toggle_palette(&mut self, _: &ToggleCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -3424,6 +3503,13 @@ impl Workspace {
         let tags_flex = tags_panel.as_ref().is_some_and(|t| t.read(cx).expanded);
         let actions_height = self.actions_height;
         let count = self.rows.len();
+        let music_card = self.music_card.clone();
+        if let Some(card) = &music_card {
+            let w = self.sidebar_width;
+            if card.read(cx).width != w {
+                card.update(cx, |c, _| c.width = w);
+            }
+        }
         div()
             .flex()
             .flex_col()
@@ -3446,6 +3532,11 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap(px(4.))
+                            .child(
+                                icon_button("music", "icons/music.svg")
+                                    .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Música, podcasts y videos (⌘⇧M)")).into())
+                                    .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.toggle_music(&ToggleMusic, w, cx))),
+                            )
                             .child(
                                 icon_button("usage-stats", "icons/chart.svg")
                                     .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Agent usage (⌘⇧U)")).into())
@@ -3505,6 +3596,7 @@ impl Workspace {
                 .w_full()
                 .pb(px(8.)),
             ))
+            .children(music_card)
             .when(bottom_panels, |d| {
                 d.child(
                     div()
@@ -3954,7 +4046,11 @@ impl Render for Workspace {
         }
         if let Some(panel) = self.whatsapp_panel.clone() {
             let fg = if self.diff_active { None } else { self.active_editor().and_then(|e| e.read(cx).chat_jid(cx).map(str::to_string)) };
-            panel.update(cx, |p, cx| p.set_active_chat(fg, cx));
+            let project = self.state.active_project.clone();
+            panel.update(cx, |p, cx| {
+                p.set_active_chat(fg, cx);
+                p.set_project(project, cx);
+            });
         }
         let title = self.active_project().map(|p| p.name.clone()).unwrap_or_else(|| "juan-terminal".into());
         if title != self.window_title {
@@ -3969,7 +4065,7 @@ impl Render for Workspace {
         let right = self.terminal_visible.then(|| self.render_terminal_panel(cx));
         let resizing = self.resizing_sidebar || self.resizing_terminal || self.resizing_actions;
         // Native video players sit above GPUI content: hide them while an overlay is open.
-        let overlay = self.palette.is_some() || self.quick_open.is_some() || self.usage.is_some() || context_menu.is_some() || new_tab_menu.is_some() || name_prompt.is_some();
+        let overlay = self.palette.is_some() || self.quick_open.is_some() || self.usage.is_some() || self.music_search.is_some() || context_menu.is_some() || new_tab_menu.is_some() || name_prompt.is_some();
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -3998,6 +4094,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_quick_open))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::toggle_usage))
+            .on_action(cx.listener(Self::toggle_music))
             .on_action(cx.listener(Self::close_diff))
             .on_action(cx.listener(|this, _: &ShowGit, w, cx| this.show_git(w, cx)))
             .on_action(cx.listener(|this, _: &ShowTools, w, cx| this.show_tools(w, cx)))
@@ -4217,6 +4314,24 @@ impl Render for Workspace {
             })
             .when_some(self.usage.as_ref().map(|(u, _, _)| u.clone()), |d, u| {
                 d.child(div().id("usage-overlay").occlude().absolute().top_0().left_0().size_full().child(u))
+            })
+            .children(self.music_theater.clone())
+            .when_some(self.music_search.as_ref().map(|(m, _, _)| m.clone()), |d, ms| {
+                d.child(
+                    div()
+                        .id("music-search-backdrop")
+                        .occlude()
+                        .bg(gpui::hsla(0., 0., 0., 0.35))
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .justify_center()
+                        .pt(px(70.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.toggle_music(&ToggleMusic, w, cx)))
+                        .child(div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(ms)),
+                )
             })
             // Last child: paints after every player slot in this window.
             .child(crate::video_player::frame_end(overlay))

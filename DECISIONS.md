@@ -69,6 +69,26 @@ Friction is asymmetric on purpose: a site removed from the list stays blocked fo
 (`unblock-pending.json` records when the removal was first seen), while a locked project can be
 opened at once for 1 or 4 hours, or extended by an hour (`unlocked_until` in state.toml).
 
+## D14 — Music, podcasts and videos (YouTube via yt-dlp)
+Search uses `yt-dlp --flat-playlist -J` (gives view counts for the automatic filters: music ≥ 1M
+views, podcasts ≥ 5k and ≥ 10 min, videos unfiltered). Playback favors instant start over
+quality: `yt-dlp -g` (android_vr client, fallback default) resolves 128 kb/s AAC, already done in
+the background for the top results and the next track, and plays in a native `AVPlayer` that
+doesn't wait for a buffer. googlevideo refuses ranges over 1 MiB, so AVPlayer reads through a
+loopback proxy (`music_proxy.rs`) that fetches chunks on demand (256 KiB first): streaming,
+nothing written to disk. Video (≤480p) is only resolved and streamed when asked, in a second
+muted `AVPlayer` synced to the audio clock. No browser cookies or scraping (anonymous, so the
+user's account is never at risk). YouTube only enables a stream URL ~5 s after issuing it, so
+playback waits out that warm-up (usually already elapsed thanks to prefetching). Songs ≤ 15 min
+are kept in `music/cache/` and replayed offline; unplayed for 30 days → deleted.
+Suggestions come from `music/preferences.json` (search topics per mode, `avoid`, `used`): a few
+topics a day, searched in parallel; each result shows its topic with ✕ to drop it (→ `avoid`).
+A LaunchAgent (`com.juan-terminal.music-preferences`, Mondays 09:00) runs
+`update-preferences.sh`, where `claude -p` rewrites the topics from history/progress without
+repeating `used`. Podcasts/videos keep progress (`progress.json`): finished ones are never
+suggested again, unfinished ones resume. Media keys / Now Playing via MediaPlayer.framework;
+global ⌃⌥Space / ⌃⌥←→ / ⌃⌥⇧←→ via Carbon hotkeys. `ureq` is reused from the WhatsApp crate's tree.
+
 ## Dependency policy
 Only crates that are already pulled by GPUI or are essential: `alacritty_terminal`, `ropey`,
 `tree-sitter` + grammars, `serde`, `serde_json`, `toml`, `anyhow`, `futures`, `libc`,

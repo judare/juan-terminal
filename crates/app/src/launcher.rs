@@ -1107,6 +1107,18 @@ pub fn init(workspace: WindowHandle<Workspace>, cx: &mut App) {
         }
         Err(e) => crate::startup_log(&format!("launcher hotkey: {e}")),
     }
+    // ⌘⇧M system-wide: music / podcasts / videos search, also from other apps.
+    match crate::hotkey::register(crate::hotkey::KVK_M, crate::hotkey::CMD_KEY | crate::hotkey::SHIFT_KEY, "⌘⇧M") {
+        Ok(mut rx) => {
+            cx.spawn(async move |cx| {
+                while rx.next().await.is_some() {
+                    let _ = cx.update(toggle_music);
+                }
+            })
+            .detach();
+        }
+        Err(e) => crate::startup_log(&format!("music search hotkey: {e}")),
+    }
     // Manual testing without the hotkey.
     if std::env::var_os("JT_LAUNCHER_AT_START").is_some() {
         toggle(cx);
@@ -1218,6 +1230,31 @@ pub fn toggle(cx: &mut App) {
         }
         Err(e) => crate::startup_log(&format!("launcher window: {e:#}")),
     }
+}
+
+/// ⌘⇧M: inside the app it toggles the search on the focused window, like the local binding;
+/// from another app it brings juan-terminal to the front with the search open.
+fn toggle_music(cx: &mut App) {
+    if let Some(ws) = cx.active_window().and_then(|w| w.downcast::<Workspace>()) {
+        let _ = ws.update(cx, |w, window, cx| w.toggle_music_action(window, cx));
+        return;
+    }
+    open_music(cx);
+}
+
+/// Bring juan-terminal to the front with the music search open (menu bar item, ⌘⇧M from
+/// another app).
+pub fn open_music(cx: &mut App) {
+    if !cx.has_global::<LauncherGlobal>() {
+        return;
+    }
+    close(cx);
+    let Some(ws) = last_workspace(cx) else { return };
+    cx.activate(true);
+    let _ = ws.update(cx, |w, window, cx| {
+        window.activate_window();
+        w.show_music(window, cx);
+    });
 }
 
 fn run(pick: Pick, cx: &mut App) {

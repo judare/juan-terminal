@@ -21,6 +21,15 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/mic.svg", include_bytes!("../assets/icons/mic.svg")),
     ("icons/smile.svg", include_bytes!("../assets/icons/smile.svg")),
     ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
+    ("icons/music.svg", include_bytes!("../assets/icons/music.svg")),
+    ("icons/podcast.svg", include_bytes!("../assets/icons/podcast.svg")),
+    ("icons/video.svg", include_bytes!("../assets/icons/video.svg")),
+    ("icons/skip-next.svg", include_bytes!("../assets/icons/skip-next.svg")),
+    ("icons/skip-prev.svg", include_bytes!("../assets/icons/skip-prev.svg")),
+    ("icons/back-15.svg", include_bytes!("../assets/icons/back-15.svg")),
+    ("icons/fwd-15.svg", include_bytes!("../assets/icons/fwd-15.svg")),
+    ("icons/expand.svg", include_bytes!("../assets/icons/expand.svg")),
+    ("icons/sparkle.svg", include_bytes!("../assets/icons/sparkle.svg")),
     ("icons/pause.svg", include_bytes!("../assets/icons/pause.svg")),
     ("icons/doc-file.svg", include_bytes!("../assets/icons/doc-file.svg")),
     ("icons/braces.svg", include_bytes!("../assets/icons/braces.svg")),
@@ -80,6 +89,8 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/package.svg", include_bytes!("../assets/icons/package.svg")),
     ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
     ("icons/pull.svg", include_bytes!("../assets/icons/pull.svg")),
+    ("icons/bookmark.svg", include_bytes!("../assets/icons/bookmark.svg")),
+    ("icons/bookmark-fill.svg", include_bytes!("../assets/icons/bookmark-fill.svg")),
     ("icons/push.svg", include_bytes!("../assets/icons/push.svg")),
     ("icons/react.svg", include_bytes!("../assets/icons/react.svg")),
     ("icons/repo.svg", include_bytes!("../assets/icons/repo.svg")),
@@ -108,6 +119,13 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/wa-video.svg", include_bytes!("../assets/icons/wa-video.svg")),
     ("icons/ts.svg", include_bytes!("../assets/icons/ts.svg")),
     ("icons/vue.svg", include_bytes!("../assets/icons/vue.svg")),
+    ("icons/word.svg", include_bytes!("../assets/icons/word.svg")),
+    ("icons/pptx.svg", include_bytes!("../assets/icons/pptx.svg")),
+    ("icons/xlsx.svg", include_bytes!("../assets/icons/xlsx.svg")),
+    ("icons/pdf.svg", include_bytes!("../assets/icons/pdf.svg")),
+    ("icons/table.svg", include_bytes!("../assets/icons/table.svg")),
+    ("icons/font.svg", include_bytes!("../assets/icons/font.svg")),
+    ("icons/database.svg", include_bytes!("../assets/icons/database.svg")),
 ];
 
 pub struct Assets;
@@ -141,22 +159,40 @@ pub fn file_icon(name: &str) -> (&'static str, u32) {
     }
     let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     match ext {
-        "ts" | "mts" | "cts" => ("icons/ts.svg", 0x4f9ee8),
+        "ts" | "mts" | "cts" => ("icons/ts.svg", 0x3178c6),
         "js" | "mjs" | "cjs" => ("icons/js.svg", 0xe8c547),
         "tsx" | "jsx" => ("icons/react.svg", 0x61dafb),
         "vue" => ("icons/vue.svg", 0x42b883),
+        "svelte" => ("icons/code.svg", 0xff3e00),
         "rs" => ("icons/rust.svg", 0xde7a4a),
         "json" | "jsonc" | "json5" => ("icons/braces.svg", 0xcbcb41),
         "md" | "mdx" | "markdown" => ("icons/markdown.svg", 0x7aa2f7),
-        "txt" | "log" => ("icons/doc.svg", 0x8a8f98),
+        "txt" | "log" | "rtf" => ("icons/doc.svg", 0x8a8f98),
+        "pdf" => ("icons/pdf.svg", 0xe5534b),
+        "doc" | "docx" | "odt" | "pages" => ("icons/word.svg", 0x2b7cd3),
+        "xls" | "xlsx" | "ods" | "numbers" => ("icons/xlsx.svg", 0x21a366),
+        "ppt" | "pptx" | "odp" => ("icons/pptx.svg", 0xe86a3a),
+        "csv" | "tsv" => ("icons/table.svg", 0x21a366),
         "toml" | "yaml" | "yml" | "ini" | "conf" | "config" | "editorconfig" | "prettierrc" | "eslintrc" | "npmrc" | "nvmrc" => ("icons/gear.svg", 0x9aa3b0),
-        "sh" | "bash" | "zsh" | "fish" => ("icons/terminal.svg", 0x98c379),
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" => ("icons/terminal.svg", 0x98c379),
         "css" | "scss" | "sass" | "less" | "postcss" => ("icons/css.svg", 0x56b6c2),
-        "html" | "htm" | "xml" | "svg" => ("icons/html.svg", 0xe07a5f),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" => ("icons/image.svg", 0xc678dd),
-        "pem" | "key" | "crt" | "pub" => ("icons/key.svg", 0xe5c07b),
+        "html" | "htm" | "xml" => ("icons/html.svg", 0xe07a5f),
+        "svg" => ("icons/image.svg", 0xffb13b),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "icns" | "bmp" | "tiff" | "tif" | "heic" | "avif" | "psd" | "fig" | "sketch" => ("icons/image.svg", 0xc678dd),
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" => ("icons/video.svg", 0xe06c9f),
+        "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" => ("icons/music.svg", 0xd19a66),
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "dmg" | "pkg" | "jar" | "whl" => ("icons/archive.svg", 0xb5a46a),
+        "ttf" | "otf" | "woff" | "woff2" | "eot" => ("icons/font.svg", 0xe5786d),
+        "sql" | "db" | "sqlite" | "sqlite3" | "prisma" => ("icons/database.svg", 0xe5a93d),
+        "pem" | "key" | "crt" | "pub" | "p12" | "cer" => ("icons/key.svg", 0xe5c07b),
         "lock" => ("icons/lock.svg", 0x8a8f98),
-        "py" | "go" | "rb" | "php" | "java" | "kt" | "swift" | "c" | "h" | "cpp" | "sql" | "graphql" | "prisma" => ("icons/code.svg", 0xa9b1d6),
+        "py" | "pyi" | "ipynb" => ("icons/code.svg", 0x4b8bbe),
+        "go" => ("icons/code.svg", 0x00add8),
+        "rb" => ("icons/code.svg", 0xcc342d),
+        "php" => ("icons/code.svg", 0x8892bf),
+        "java" | "kt" | "kts" | "scala" => ("icons/code.svg", 0xe76f00),
+        "swift" => ("icons/code.svg", 0xf05138),
+        "c" | "h" | "cpp" | "cc" | "hpp" | "cs" | "zig" | "lua" | "dart" | "ex" | "exs" | "graphql" | "gql" => ("icons/code.svg", 0xa9b1d6),
         _ => ("icons/file.svg", 0x8a8f98),
     }
 }
@@ -167,7 +203,7 @@ mod tests {
 
     #[test]
     fn every_icon_used_by_mapping_exists() {
-        for name in ["a.ts", "a.tsx", "a.vue", "a.rs", "a.json", "a.md", "x.toml", "x.sh", "x.css", "x.html", "x.png", ".env.local", "package.json", "Cargo.lock", ".gitignore", "x.pem", "x.py", "noext"] {
+        for name in ["a.ts", "a.tsx", "a.vue", "a.rs", "a.json", "a.md", "x.toml", "x.sh", "x.css", "x.html", "x.png", ".env.local", "package.json", "Cargo.lock", ".gitignore", "x.pem", "x.py", "noext", "a.pdf", "a.docx", "a.xlsx", "a.pptx", "a.csv", "a.mp4", "a.mp3", "a.zip", "a.woff2", "a.sql", "a.svg", "a.js"] {
             let (path, _) = file_icon(name);
             assert!(Assets.load(path).unwrap().is_some(), "{path} missing");
         }

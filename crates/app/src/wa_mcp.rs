@@ -15,9 +15,10 @@ pub fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "whatsapp_list_chats",
-            "description": "List the user's WhatsApp chats (newest first, archived excluded): name, JID, unread count and last message.",
+            "description": "List the user's WhatsApp chats (newest first, archived excluded): name, JID, labels, unread count and last message.",
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "Filter by chat name, phone or JID"},
+                "label": {"type": "string", "description": "Only chats with this label (name, case-insensitive)"},
                 "unread_only": {"type": "boolean", "description": "Only chats with unread messages"},
                 "limit": {"type": "integer", "description": "Default 30, max 200"},
             }},
@@ -138,11 +139,21 @@ fn list_chats(args: &Value) -> Result<Vec<Value>, String> {
     let st = store()?;
     let q = arg_str(args, "query").map(|q| q.to_lowercase());
     let unread_only = args.get("unread_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let labels = st.labels();
+    let label_name = |id: i64| labels.iter().find(|l| l.id == id).map(|l| l.name.clone());
+    let label_filter = match arg_str(args, "label") {
+        Some(name) => Some(labels.iter().find(|l| l.name.to_lowercase() == name.to_lowercase()).map(|l| l.id).ok_or_else(|| {
+            let all: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+            format!("No existe la etiqueta \"{name}\". Etiquetas: {}", if all.is_empty() { "(ninguna)".to_string() } else { all.join(", ") })
+        })?),
+        None => None,
+    };
     let chats: Vec<_> = st
         .chats()
         .into_iter()
         .filter(|c| q.as_ref().is_none_or(|q| c.name.to_lowercase().contains(q) || c.jid.contains(q.as_str())))
         .filter(|c| !unread_only || c.unread > 0)
+        .filter(|c| label_filter.is_none_or(|id| c.labels.contains(&id)))
         .take(limit(args, 30, 200))
         .collect();
     if chats.is_empty() {
@@ -154,6 +165,7 @@ fn list_chats(args: &Value) -> Result<Vec<Value>, String> {
             let flags = [(c.unread > 0).then(|| format!("{} sin leer", c.unread)), c.pinned.then(|| "fijado".into()), c.important.then(|| "importante".into()), c.muted.then(|| "silenciado".into()), c.is_group.then(|| "grupo".into())]
                 .into_iter()
                 .flatten()
+                .chain(c.labels.iter().filter_map(|&id| label_name(id)).map(|n| format!("#{n}")))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("- {} <{}>{} — {} {}\"{}\"", c.name, c.jid, if flags.is_empty() { String::new() } else { format!(" ({flags})") }, when(c.last_ts), if c.last_from_me { "Yo: ".to_string() } else if c.last_sender.is_empty() { String::new() } else { format!("{}: ", c.last_sender) }, if c.last_kind != MsgKind::Text && c.last_text != c.last_kind.label() { format!("[{}] {}", c.last_kind.label(), c.last_text) } else { c.last_text.clone() })

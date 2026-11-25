@@ -85,6 +85,10 @@ struct Totp {
     /// Account id whose code was just copied, and when.
     copied: Option<(String, std::time::Instant)>,
     tick: Option<gpui::Task<()>>,
+    /// Workspace projects (id, name), in sidebar order: group headers and the right-click menu.
+    projects: Vec<(String, String)>,
+    /// Right-click menu on an account: (position, account id).
+    menu: Option<(gpui::Point<gpui::Pixels>, String)>,
 }
 
 struct TotpForm {
@@ -632,16 +636,17 @@ impl ServersPanel {
         }
         self.totp.loaded = true;
         cx.spawn(async move |this, cx| {
-            let (accounts, secrets) = cx
+            let (accounts, secrets, projects) = cx
                 .background_executor()
                 .spawn(async move {
                     let accounts = crate::totp::load_accounts();
                     let secrets: Vec<(String, anyhow::Result<Vec<u8>>)> = accounts.iter().map(|a| (a.id.clone(), crate::totp::load_secret(&a.id))).collect();
-                    (accounts, secrets)
+                    (accounts, secrets, load_projects())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.totp.accounts = accounts;
+                this.totp.projects = projects;
                 for (id, r) in secrets {
                     match r {
                         Ok(s) => {
@@ -733,6 +738,7 @@ impl ServersPanel {
             digits: parsed.digits,
             period: parsed.period,
             algorithm: parsed.algorithm,
+            project: None,
         };
         if let Some(f) = &mut self.totp.form {
             f.busy = Some("Saving to Keychain…".into());
@@ -850,6 +856,44 @@ impl ServersPanel {
         .detach();
     }
 
+    fn set_totp_project(&mut self, id: &str, project: Option<String>, cx: &mut Context<Self>) {
+        let Some(a) = self.totp.accounts.iter_mut().find(|a| a.id == id) else { return };
+        a.project = project;
+        let accounts = self.totp.accounts.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = crate::totp::save_accounts(&accounts);
+            })
+            .detach();
+        cx.notify();
+    }
+
+    fn render_totp_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use crate::whatsapp_panel::{menu_box, menu_row};
+        let (pos, id) = self.totp.menu.clone()?;
+        let current = self.totp.accounts.iter().find(|a| a.id == id)?.project.clone();
+        let mut list = menu_box(cx.listener(|this, _, _, cx| {
+            this.totp.menu = None;
+            cx.notify();
+        }))
+        .child(div().px(px(12.)).py(px(2.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("PROYECTO"));
+        let options = std::iter::once((None, "Ninguno".to_string())).chain(self.totp.projects.iter().map(|(pid, name)| (Some(pid.clone()), name.clone())));
+        for (i, (pid, name)) in options.enumerate() {
+            let on = pid == current;
+            let id = id.clone();
+            list = list.child(
+                menu_row(("totp-project", i))
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .child(div().w(px(14.)).flex_none().text_color(theme::rgb(theme::ADDED)).when(on, |d| d.child("✓")))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.totp.menu = None;
+                        this.set_totp_project(&id, pid.clone(), cx);
+                    })),
+            );
+        }
+        Some(gpui::deferred(gpui::anchored().position(pos).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
+    }
+
     fn render_totp(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut col = div().flex().flex_col().mt(px(6.)).pt(px(2.)).border_t_1().border_color(theme::rgb(theme::BORDER)).child(
             div()
@@ -934,8 +978,21 @@ impl ServersPanel {
             col = col.child(div().px(px(16.)).py(px(6.)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("No 2FA accounts. Add one with + (secret key or QR code); click a code to copy it."));
         }
         let now = crate::totp::now_secs();
-        for a in &self.totp.accounts {
+        // Grouped by project (sidebar order), then the unassigned ones; headers only once
+        // some account has a project.
+        let project_ix = |a: &crate::totp::Account| a.project.as_deref().and_then(|p| self.totp.projects.iter().position(|(id, _)| id == p));
+        let mut ordered: Vec<(Option<usize>, &crate::totp::Account)> = self.totp.accounts.iter().map(|a| (project_ix(a), a)).collect();
+        ordered.sort_by_key(|(ix, _)| ix.unwrap_or(usize::MAX));
+        let grouped = ordered.iter().any(|(ix, _)| ix.is_some());
+        let mut last_group: Option<Option<usize>> = None;
+        for (ix, a) in ordered {
+            if grouped && last_group != Some(ix) {
+                last_group = Some(ix);
+                let title = ix.map(|i| self.totp.projects[i].1.clone()).unwrap_or_else(|| "Sin proyecto".into());
+                col = col.child(div().pl(px(14.)).pr(px(8.)).pt(px(8.)).pb(px(2.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_FAINT)).child(title.to_uppercase()));
+            }
             let id = a.id.clone();
+            let i3 = id.clone();
             let group: SharedString = format!("totp-{id}").into();
             let (i1, i2) = (id.clone(), id.clone());
             let left = crate::totp::remaining(a.period, now);
@@ -962,8 +1019,16 @@ impl ServersPanel {
                     .rounded(px(5.))
                     .cursor_pointer()
                     .hover(|st| st.bg(theme::rgb(theme::HOVER)))
-                    .tooltip(|_, cx| cx.new(|_| Tooltip("Click to copy the code")).into())
+                    .tooltip(|_, cx| cx.new(|_| Tooltip("Click to copy the code · right-click: project")).into())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.copy_totp(&i1, cx)))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                            this.totp.projects = load_projects();
+                            this.totp.menu = Some((e.position, i3.clone()));
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
                             .flex()
@@ -1002,7 +1067,7 @@ impl ServersPanel {
                     .child(div().mt(px(3.)).h(px(2.)).w_full().rounded_full().bg(theme::rgb(0x2a2d33)).child(div().h_full().rounded_full().bg(theme::rgb(bar_color)).w(gpui::relative(frac)))),
             );
         }
-        col.into_any_element()
+        col.children(self.render_totp_menu(cx)).into_any_element()
     }
 
     // ---- rendering ---------------------------------------------------------------------
@@ -1161,6 +1226,10 @@ fn prompt_row(input: &Entity<TextInput>, depth: usize) -> gpui::AnyElement {
         .border_color(theme::rgb(theme::ACCENT))
         .child(input.clone())
         .into_any_element()
+}
+
+fn load_projects() -> Vec<(String, String)> {
+    workspace_state::StateStore::default_location().load().projects.into_iter().map(|p| (p.id, p.name)).collect()
 }
 
 fn totp_title(a: &crate::totp::Account) -> String {
