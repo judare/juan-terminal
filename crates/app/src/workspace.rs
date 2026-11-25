@@ -1261,10 +1261,13 @@ impl Workspace {
             tabs.active = ix;
             tabs.tabs[ix].clone()
         } else {
-            // Preview tab (like single-click files): replaces the previous untouched preview.
-            let old = tabs.tabs.iter().position(|e| {
-                let e = e.read(cx);
-                e.preview && !e.is_dirty()
+            // A single chat tab: a new conversation replaces the open one (or, failing that, the
+            // untouched preview tab).
+            let old = tabs.tabs.iter().position(|e| e.read(cx).chat_jid(cx).is_some()).or_else(|| {
+                tabs.tabs.iter().position(|e| {
+                    let e = e.read(cx);
+                    e.preview && !e.is_dirty()
+                })
             });
             let font_size = self.font_size;
             let (j, n) = (jid.to_string(), name.to_string());
@@ -1291,7 +1294,7 @@ impl Workspace {
             let focus = chat.read(cx).composer_focus(cx);
             window.focus(&focus);
         }
-        cx.notify();
+        self.show_whatsapp(cx);
     }
 
     fn on_servers_event(&mut self, event: &crate::servers_panel::ServersPanelEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1986,6 +1989,11 @@ impl Workspace {
             }
         }
         self.focus_main(window, cx);
+        // A conversation tab brings up the WhatsApp sidebar.
+        let is_chat = self.editors.get(&self.active_key()).and_then(|t| t.tabs.get(t.active)).is_some_and(|e| e.read(cx).chat_jid(cx).is_some());
+        if is_chat {
+            self.show_whatsapp(cx);
+        }
         cx.notify();
     }
 

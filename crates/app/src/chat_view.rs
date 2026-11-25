@@ -70,8 +70,48 @@ struct Info {
 /// Swipe-to-reply: how far the bubble follows (px) and the distance that triggers the reply.
 const SWIPE_MAX: f32 = 90.;
 const SWIPE_REPLY: f32 = 60.;
+/// Bubble-sized preview of a PDF's first page (top part), above its file card.
+const DOC_PREVIEW_W: f32 = 280.;
+const DOC_PREVIEW_H: f32 = 150.;
 
 const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+fn recent_reactions_path() -> PathBuf {
+    whatsapp::data_dir().join("recent-reactions.txt")
+}
+
+/// Reactions offered first: the last ones used (newest first), topped up with the defaults.
+fn quick_reactions() -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_to_string(recent_reactions_path())
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    for e in QUICK_REACTIONS {
+        if !out.iter().any(|x| x == e) {
+            out.push(e.to_string());
+        }
+    }
+    out.truncate(QUICK_REACTIONS.len());
+    out
+}
+
+/// Moves `emoji` to the front of the recent reactions.
+fn note_reaction(emoji: &str) {
+    if emoji.is_empty() {
+        return;
+    }
+    let mut list = quick_reactions();
+    list.retain(|e| e != emoji);
+    list.insert(0, emoji.to_string());
+    list.truncate(QUICK_REACTIONS.len());
+    let path = recent_reactions_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, list.join("\n"));
+}
 
 /// Chats open in a tab somewhere (notifications for them are skipped while the app is active).
 static OPEN_CHATS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -165,6 +205,8 @@ pub struct ChatView {
     _swipe_end: Option<Task<()>>,
     /// Quick-reactions bar opened from a message's reaction button.
     react_bar: Option<(Rc<ChatMessage>, Point<Pixels>)>,
+    /// The quick-reactions bar shows the full emoji grid ("+").
+    react_more: bool,
     /// Acted on (see `ChatEvent::Interacted`).
     interacted: bool,
     thumbs: HashMap<String, Option<PathBuf>>,
@@ -279,6 +321,7 @@ impl ChatView {
             drag: None,
             _swipe_end: None,
             react_bar: None,
+            react_more: false,
             thumbs: HashMap::new(),
             previews: HashMap::new(),
             images: gpui::RetainAllImageCache::new(cx),
@@ -1267,7 +1310,35 @@ impl ChatView {
         None
     }
 
-    /// JPEG preview embedded in an image/video message, cached as a file.
+    /// First page of a downloaded PDF (top part, bubble-sized), rendered once in the background
+    /// and cached in `thumbs/`. None while it's being made or if it can't be rendered.
+    fn doc_preview(&mut self, m: &ChatMessage, cx: &mut Context<Self>) -> Option<PathBuf> {
+        let media = m.media.clone()?;
+        if let Some(p) = self.previews.get(&m.id) {
+            return p.clone();
+        }
+        let dest = WhatsApp::global().dir().join("thumbs").join(format!("{}-pdf.jpg", m.id.replace(['/', ':'], "_")));
+        if dest.exists() {
+            self.previews.insert(m.id.clone(), Some(dest.clone()));
+            return Some(dest);
+        }
+        self.previews.insert(m.id.clone(), None);
+        let id = m.id.clone();
+        let task = cx.background_executor().spawn(async move {
+            crate::pdf_view::first_page_jpeg(&media, &dest, (DOC_PREVIEW_W * 2.) as u32, DOC_PREVIEW_H / DOC_PREVIEW_W).map(|_| dest)
+        });
+        cx.spawn(async move |this, cx| {
+            let made = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.previews.insert(id, made);
+                cx.notify();
+            });
+        })
+        .detach();
+        None
+    }
+
+    /// JPEG preview embedded in an image/video/document message, cached as a file.
     fn thumb(&mut self, m: &ChatMessage) -> Option<PathBuf> {
         if let Some(t) = self.thumbs.get(&m.id) {
             return t.clone();
@@ -1281,7 +1352,13 @@ impl ChatView {
             wa.store()
                 .proto(&m.chat, &m.id)
                 .and_then(|p| whatsapp::convert::decode(&p))
-                .and_then(|msg| msg.image_message.as_option().and_then(|i| i.jpeg_thumbnail.clone()).or_else(|| msg.video_message.as_option().and_then(|v| v.jpeg_thumbnail.clone())))
+                .and_then(|msg| {
+                    msg.image_message
+                        .as_option()
+                        .and_then(|i| i.jpeg_thumbnail.clone())
+                        .or_else(|| msg.video_message.as_option().and_then(|v| v.jpeg_thumbnail.clone()))
+                        .or_else(|| msg.document_message.as_option().and_then(|d| d.jpeg_thumbnail.clone()))
+                })
                 .filter(|b| !b.is_empty())
                 .and_then(|bytes| {
                     let _ = std::fs::create_dir_all(&dir);
@@ -1497,6 +1574,7 @@ impl ChatView {
                 .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                     let p = e.position();
                     this.react_bar = Some((m.clone(), gpui::point(p.x - px(120.), p.y - px(56.))));
+                    this.react_more = false;
                     cx.notify();
                 }))
         });
@@ -1758,6 +1836,10 @@ impl ChatView {
                 };
                 let ext = std::path::Path::new(&name).extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
                 let has_caption = m.text != name;
+                let is_pdf = ext == "PDF";
+                // PDFs: first page once downloaded, else the thumbnail WhatsApp embeds (if any).
+                let preview = if is_pdf { self.doc_preview(m, cx) } else { None }.or_else(|| self.thumb(m));
+                let show_preview = preview.is_some() || (is_pdf && m.media.is_some());
                 div()
                     .flex()
                     .flex_col()
@@ -1766,21 +1848,38 @@ impl ChatView {
                         div()
                             .id(SharedString::from(format!("doc-{}", m.id)))
                             .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .p(px(8.))
-                            .min_w(px(220.))
+                            .flex_col()
+                            .when(show_preview, |d| d.w(px(DOC_PREVIEW_W)))
+                            .when(!show_preview, |d| d.min_w(px(220.)))
                             .rounded(px(6.))
+                            .overflow_hidden()
                             .bg(gpui::black().opacity(0.18))
                             .cursor_pointer()
-                            .child(gpui::svg().path("icons/doc-file.svg").size(px(26.)).flex_none().text_color(theme::rgb(theme::TEXT_MUTED)))
+                            .when(show_preview, |d| {
+                                d.child(
+                                    div()
+                                        .w_full()
+                                        .h(px(DOC_PREVIEW_H))
+                                        .flex_none()
+                                        .bg(theme::rgb(0xffffff).opacity(if preview.is_some() { 1. } else { 0.06 }))
+                                        .children(preview.map(|p| gpui::img(p).size_full().object_fit(gpui::ObjectFit::Cover))),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
-                                    .flex_col()
-                                    .min_w_0()
-                                    .child(div().text_size(px(13.)).text_color(theme::rgb(theme::TEXT)).truncate().child(name))
-                                    .child(div().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(if ext.is_empty() { detail } else { format!("{ext} · {detail}") })),
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .p(px(8.))
+                                    .child(gpui::svg().path("icons/doc-file.svg").size(px(26.)).flex_none().text_color(theme::rgb(theme::TEXT_MUTED)))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .min_w_0()
+                                            .child(div().text_size(px(13.)).text_color(theme::rgb(theme::TEXT)).truncate().child(name))
+                                            .child(div().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(if ext.is_empty() { detail } else { format!("{ext} · {detail}") })),
+                                    ),
                             )
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_media(&msg, cx))),
                     )
@@ -2078,22 +2177,24 @@ impl ChatView {
     fn render_react_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (m, pos) = self.react_bar.clone()?;
         let mine = m.reactions.iter().find(|r| r.from_me).map(|r| r.emoji.clone());
-        let bar = div()
-            .flex()
-            .gap(px(2.))
-            .p(px(4.))
-            .rounded_full()
-            .bg(theme::rgb(theme::SIDEBAR_BG))
-            .border_1()
-            .border_color(theme::rgb(theme::BORDER))
-            .shadow_lg()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+        let react = |m: &Rc<ChatMessage>, e: String, selected: bool| {
+            let m = m.clone();
+            cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx: &mut Context<Self>| {
+                let emoji = if selected { "" } else { e.as_str() };
+                WhatsApp::global().react(&m.chat, &m.id, emoji);
+                note_reaction(emoji);
+                this.interacted(cx);
                 this.react_bar = None;
+                this.react_more = false;
                 cx.notify();
-            }))
-            .children(QUICK_REACTIONS.iter().enumerate().map(|(i, e)| {
-                let selected = mine.as_deref() == Some(*e);
-                let (m, e) = (m.clone(), e.to_string());
+            })
+        };
+        let row = div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .children(quick_reactions().into_iter().enumerate().map(|(i, e)| {
+                let selected = mine.as_deref() == Some(e.as_str());
                 div()
                     .id(("quick-react", i))
                     .size(px(36.))
@@ -2106,13 +2207,76 @@ impl ChatView {
                     .when(selected, |d| d.bg(theme::rgb(theme::SELECTED)))
                     .hover(|s| s.bg(theme::rgb(theme::HOVER)))
                     .child(e.clone())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        WhatsApp::global().react(&m.chat, &m.id, if selected { "" } else { e.as_str() });
-                        this.interacted(cx);
-                        this.react_bar = None;
+                    .on_click(react(&m, e, selected))
+            }))
+            .child(
+                div()
+                    .id("quick-react-more")
+                    .size(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .when(self.react_more, |d| d.bg(theme::rgb(theme::SELECTED)))
+                    .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                    .child(gpui::svg().path("icons/plus.svg").size(px(18.)).text_color(theme::rgb(theme::TEXT_MUTED)))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.react_more = !this.react_more;
                         cx.notify();
-                    }))
-            }));
+                    })),
+            );
+        let grid = self.react_more.then(|| {
+            let mut n = 0usize;
+            div()
+                .id("react-emoji-grid")
+                .flex()
+                .flex_col()
+                .w(px(300.))
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .children(EMOJIS.iter().map(|(cat, list)| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().px(px(4.)).pt(px(4.)).pb(px(2.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(*cat))
+                        .child(div().flex().flex_wrap().children(list.split(' ').map(|e| {
+                            n += 1;
+                            let selected = mine.as_deref() == Some(e);
+                            div()
+                                .id(("react-emoji", n))
+                                .size(px(34.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .text_size(px(20.))
+                                .when(selected, |d| d.bg(theme::rgb(theme::SELECTED)))
+                                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                                .child(e.to_string())
+                                .on_click(react(&m, e.to_string(), selected))
+                        })))
+                }))
+        });
+        let bar = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .p(px(4.))
+            .when(self.react_more, |d| d.rounded(px(14.)))
+            .when(!self.react_more, |d| d.rounded_full())
+            .bg(theme::rgb(theme::SIDEBAR_BG))
+            .border_1()
+            .border_color(theme::rgb(theme::BORDER))
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.react_bar = None;
+                this.react_more = false;
+                cx.notify();
+            }))
+            .child(row)
+            .children(grid);
         Some(gpui::deferred(gpui::anchored().position(pos).snap_to_window_with_margin(px(8.)).child(bar)).with_priority(1).into_any_element())
     }
 
@@ -2132,9 +2296,9 @@ impl ChatView {
                 .child(label)
         };
         let my_reaction = m.reactions.iter().find(|r| r.from_me).map(|r| r.emoji.clone());
-        let emojis = div().flex().gap(px(2.)).px(px(6.)).pb(px(4.)).children(QUICK_REACTIONS.iter().enumerate().map(|(i, e)| {
-            let (m2, e2) = (m.clone(), e.to_string());
-            let selected = my_reaction.as_deref() == Some(*e);
+        let emojis = div().flex().gap(px(2.)).px(px(6.)).pb(px(4.)).children(quick_reactions().into_iter().enumerate().map(|(i, e)| {
+            let (m2, e2) = (m.clone(), e.clone());
+            let selected = my_reaction.as_deref() == Some(e.as_str());
             div()
                 .id(("react", i))
                 .size(px(30.))
@@ -2150,6 +2314,7 @@ impl ChatView {
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     let emoji = if selected { "" } else { e2.as_str() };
                     WhatsApp::global().react(&m2.chat, &m2.id, emoji);
+                    note_reaction(emoji);
                     this.interacted(cx);
                     this.menu = None;
                     cx.notify();
