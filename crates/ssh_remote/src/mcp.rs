@@ -31,11 +31,13 @@ pub struct Extra<'a> {
     pub call: &'a dyn Fn(&str, &Value) -> Option<(Vec<Value>, bool)>,
     /// Appended to the server instructions.
     pub instructions: &'a str,
+    /// Built-in tool names switched off by the user: not listed, not callable.
+    pub hidden: &'a [String],
 }
 
 impl Extra<'static> {
     pub fn none() -> Self {
-        Extra { dev_servers: &|| String::from("Dev server listing is not available."), tools: Vec::new(), call: &|_, _| None, instructions: "" }
+        Extra { dev_servers: &|| String::from("Dev server listing is not available."), tools: Vec::new(), call: &|_, _| None, instructions: "", hidden: &[] }
     }
 }
 
@@ -48,7 +50,18 @@ pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServ
             "protocolVersion": params.get("protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "juan-terminal", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": format!("{}{}", "You are running inside juan-terminal, the user's development workspace. When the user asks to see, screenshot, open or test their app/page (e.g. with Moli: `moli fetch --layout --dump screenshot URL > shot.png`, or any browser tool), first call list_dev_servers and use this project's local dev server URL (http://localhost:PORT) rather than the production site, unless they explicitly ask for production. If none is running, start it yourself in the background (list_dev_servers gives the repo's start command), wait until the URL responds, and then take the screenshot — don't fall back to production. For the project's remote machines use list_servers and ssh_exec.", extra.instructions),
+            "instructions": ({
+                let shown = |t: &str| !extra.hidden.iter().any(|h| h == t);
+                let mut s = String::from("You are running inside juan-terminal, the user's development workspace.");
+                if shown("list_dev_servers") {
+                    s.push_str(" When the user asks to see, screenshot, open or test their app/page (e.g. with Moli: `moli fetch --layout --dump screenshot URL > shot.png`, or any browser tool), first call list_dev_servers and use this project's local dev server URL (http://localhost:PORT) rather than the production site, unless they explicitly ask for production. If none is running, start it yourself in the background (list_dev_servers gives the repo's start command), wait until the URL responds, and then take the screenshot — don't fall back to production.");
+                }
+                if shown("ssh_exec") {
+                    s.push_str(" For the project's remote machines use list_servers and ssh_exec.");
+                }
+                s.push_str(extra.instructions);
+                s
+            }),
         }),
         "ping" => json!({}),
         "tools/list" => {
@@ -75,13 +88,17 @@ pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServ
                 }, "required": ["server", "command"]},
             },
         ]);
-            tools.as_array_mut().expect("array").extend(extra.tools.iter().cloned());
+            let list = tools.as_array_mut().expect("array");
+            list.extend(extra.tools.iter().cloned());
+            list.retain(|t| !t.get("name").and_then(|n| n.as_str()).is_some_and(|n| extra.hidden.iter().any(|h| h == n)));
             json!({"tools": tools})
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            if let Some((content, is_error)) = (extra.call)(name, &args) {
+            if extra.hidden.iter().any(|h| h == name) {
+                json!({"content": [{"type": "text", "text": format!("{name} is switched off in juan-terminal (Tools tab).")}], "isError": true})
+            } else if let Some((content, is_error)) = (extra.call)(name, &args) {
                 json!({"content": content, "isError": is_error})
             } else {
                 let (text, is_error) = if name == "list_dev_servers" { ((extra.dev_servers)(), false) } else { call(project_id, name, &args, &list) };

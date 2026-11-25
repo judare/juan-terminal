@@ -93,12 +93,6 @@ fn set_dock_badge(label: String) {
     }
 }
 
-fn osascript_notify(title: &str, subtitle: &str, message: &str) {
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("display notification \"{}\" with title \"{}\" subtitle \"{}\" sound name \"Glass\"", esc(message), esc(title), esc(subtitle));
-    let _ = std::process::Command::new("/usr/bin/osascript").args(["-e", &script]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
-}
-
 impl Workspace {
     /// Environment that lets `claude` in this terminal find us and report hook events.
     pub(crate) fn claude_terminal_env(&self, terminal_id: &str) -> Vec<(String, String)> {
@@ -284,7 +278,7 @@ impl Workspace {
                 Attention::Done => ("Claude terminó", "Listo para tu siguiente mensaje".to_string()),
                 Attention::NeedsInput => ("Claude te necesita", message.unwrap_or_else(|| "Esperando tu respuesta".into())),
             };
-            osascript_notify(title, &place, &body);
+            crate::notify::notify(crate::notify::Source::Claude, title, &place, &body);
         }
         cx.notify();
     }

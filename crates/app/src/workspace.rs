@@ -182,6 +182,7 @@ enum SidebarMode {
     Tools,
     Ports,
     Servers,
+    WhatsApp,
 }
 
 pub struct Workspace {
@@ -204,6 +205,7 @@ pub struct Workspace {
     /// Claude Code IDE integration server (selection, diagnostics, diffs, hook events).
     pub(crate) ide: Option<claude_ide::IdeServer>,
     servers_panel: Option<Entity<crate::servers_panel::ServersPanel>>,
+    whatsapp_panel: Option<Entity<crate::whatsapp_panel::WhatsAppPanel>>,
     /// GitHub Actions section under the file tree (hidden when no repo has workflows).
     actions_panel: Option<Entity<crate::actions_panel::ActionsPanel>>,
     /// Release tags section under GitHub Actions.
@@ -214,6 +216,11 @@ pub struct Workspace {
     remote_files: HashMap<PathBuf, (workspace_state::SshServer, String)>,
     pub(crate) claude_pending: Option<crate::claude_bridge::PendingDiff>,
     pub(crate) claude_sessions: usize,
+    /// Chat picked in the WhatsApp panel, opened on the next render (needs the window).
+    pending_chat: Option<(String, String)>,
+    /// "Pedir a Claude…" on a chat, prepared and waiting for the window to open its terminal.
+    pending_ask: Option<crate::wa_reply::AskPlan>,
+    _ask_task: Option<Task<()>>,
     next_terminal_id: u64,
     /// Saved output for the next terminal spawned (restoring a project's tabs).
     pending_restore: Option<String>,
@@ -327,6 +334,7 @@ impl Workspace {
             ports_panel: None,
             ide: None,
             servers_panel: None,
+            whatsapp_panel: None,
             actions_panel: None,
             tags_panel: None,
             actions_height: 300.,
@@ -334,6 +342,9 @@ impl Workspace {
             remote_files: HashMap::new(),
             claude_pending: None,
             claude_sessions: 0,
+            pending_chat: None,
+            pending_ask: None,
+            _ask_task: None,
             next_terminal_id: 1,
             pending_restore: None,
             pending_git_repos: None,
@@ -441,6 +452,10 @@ impl Workspace {
             }
         })
         .detach();
+        // Linked WhatsApp: the panel exists from the start so the mode tab shows unread chats.
+        if whatsapp::data_dir().join("session.db").exists() {
+            this.ensure_whatsapp_panel(cx);
+        }
         this
     }
 
@@ -648,6 +663,47 @@ impl Workspace {
                 t.label = Some("Claude".into());
                 // Typed ahead: the shell reads it once its startup files are loaded.
                 t.send_input("claude\r");
+                cx.notify();
+            });
+            self.persist(cx);
+        }
+    }
+
+    /// "Pedir a Claude…" on a WhatsApp chat: gather the chat (and its linked project) in the
+    /// background, then open a Claude Code terminal with it and the instruction.
+    pub(crate) fn ask_claude_about_chat(&mut self, jid: &str, instruction: &str, cx: &mut Context<Self>) {
+        let (jid, instruction) = (jid.to_string(), instruction.to_string());
+        let task = cx.background_executor().spawn(async move { crate::wa_reply::ask_plan(&jid, &instruction) });
+        self._ask_task = Some(cx.spawn(async move |this, cx| {
+            let plan = task.await;
+            let _ = this.update(cx, |this, cx| {
+                match plan {
+                    Ok(plan) => this.pending_ask = Some(plan),
+                    Err(e) => this.error = Some(format!("Pedir a Claude: {e}").into()),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn open_claude_ask(&mut self, plan: crate::wa_reply::AskPlan, window: &mut Window, cx: &mut Context<Self>) {
+        let q = |p: &std::path::Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        let mut line = String::new();
+        if let Some(cfg) = &plan.mcp_config {
+            line.push_str(&format!("JT_MCP_CONFIG={} ", q(cfg)));
+        }
+        line.push_str("claude");
+        for d in &plan.add_dirs {
+            line.push_str(&format!(" --add-dir {}", q(d)));
+        }
+        line.push_str(&format!(" \"$(<{})\"\r", q(&plan.prompt_file)));
+        if let Some(view) = self.spawn_terminal(Some(plan.cwd), None, window, cx) {
+            view.update(cx, |t, cx| {
+                t.label = Some(match &plan.project_name {
+                    Some(p) => format!("Claude · WhatsApp · {p}"),
+                    None => "Claude · WhatsApp".into(),
+                });
+                t.send_input(&line);
                 cx.notify();
             });
             self.persist(cx);
@@ -1088,6 +1144,75 @@ impl Workspace {
             .map(|t| t.tabs.iter().filter_map(|v| v.read(cx).dev_dir.clone().filter(|_| !v.read(cx).has_exited())).collect())
             .unwrap_or_default();
         sp.update(cx, |p, cx| p.set_dev(dev, running, cx));
+    }
+
+    fn show_whatsapp(&mut self, cx: &mut Context<Self>) {
+        self.ensure_whatsapp_panel(cx);
+        self.sidebar_mode = SidebarMode::WhatsApp;
+        self.sidebar_visible = true;
+        cx.notify();
+    }
+
+    fn ensure_whatsapp_panel(&mut self, cx: &mut Context<Self>) -> Entity<crate::whatsapp_panel::WhatsAppPanel> {
+        if let Some(p) = &self.whatsapp_panel {
+            return p.clone();
+        }
+        let panel = cx.new(crate::whatsapp_panel::WhatsAppPanel::new);
+        let sub = cx.subscribe(&panel, |this, _, e: &crate::whatsapp_panel::WhatsAppPanelEvent, cx| match e {
+            crate::whatsapp_panel::WhatsAppPanelEvent::OpenChat { jid, name } => {
+                this.pending_chat = Some((jid.clone(), name.clone()));
+                cx.notify();
+            }
+            crate::whatsapp_panel::WhatsAppPanelEvent::AskClaude { jid, instruction } => this.ask_claude_about_chat(jid, instruction, cx),
+        });
+        // The unread badge on the mode tab follows the panel.
+        let obs = cx.observe(&panel, |_, _, cx| cx.notify());
+        self._subscriptions.push(sub);
+        self._subscriptions.push(obs);
+        self.whatsapp_panel = Some(panel.clone());
+        panel
+    }
+
+    /// Open (or focus) a WhatsApp conversation as an editor tab.
+    pub(crate) fn open_chat(&mut self, jid: &str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff_active = false;
+        let key = self.active_key();
+        let tabs = self.editors.entry(key.clone()).or_default();
+        let view = if let Some(ix) = tabs.tabs.iter().position(|e| e.read(cx).chat_jid(cx) == Some(jid)) {
+            tabs.active = ix;
+            tabs.tabs[ix].clone()
+        } else {
+            // Preview tab (like single-click files): replaces the previous untouched preview.
+            let old = tabs.tabs.iter().position(|e| {
+                let e = e.read(cx);
+                e.preview && !e.is_dirty()
+            });
+            let font_size = self.font_size;
+            let (j, n) = (jid.to_string(), name.to_string());
+            let view = cx.new(|cx| {
+                let mut e = EditorView::new_chat(j, n, font_size, cx);
+                e.preview = true;
+                e
+            });
+            self.subscribe_editor(&view, window, cx);
+            let tabs = self.editors.entry(key).or_default();
+            match old {
+                Some(i) => {
+                    tabs.tabs[i] = view.clone();
+                    tabs.active = i;
+                }
+                None => {
+                    tabs.tabs.push(view.clone());
+                    tabs.active = tabs.tabs.len() - 1;
+                }
+            }
+            view
+        };
+        if let Some(chat) = view.read(cx).chat.clone() {
+            let focus = chat.read(cx).composer_focus(cx);
+            window.focus(&focus);
+        }
+        cx.notify();
     }
 
     fn on_servers_event(&mut self, event: &crate::servers_panel::ServersPanelEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1571,6 +1696,11 @@ impl Workspace {
                 this.error = Some(e.clone().into());
                 cx.notify();
             }
+            EditorEvent::OpenFile(path) => {
+                let path = path.clone();
+                this.open_file(&path, true, window, cx);
+            }
+            EditorEvent::AskClaude { jid, instruction } => this.ask_claude_about_chat(jid, instruction, cx),
         });
         self._subscriptions.push(sub);
     }
@@ -3272,6 +3402,8 @@ impl Workspace {
         let tools_panel = (self.sidebar_mode == SidebarMode::Tools).then(|| self.tools_panel.clone()).flatten();
         let ports_panel = (self.sidebar_mode == SidebarMode::Ports).then(|| self.ports_panel.clone()).flatten();
         let servers_panel = (self.sidebar_mode == SidebarMode::Servers).then(|| self.servers_panel.clone()).flatten();
+        let whatsapp_panel = (self.sidebar_mode == SidebarMode::WhatsApp).then(|| self.whatsapp_panel.clone()).flatten();
+        let wa_unread = self.whatsapp_panel.as_ref().map(|p| p.read(cx).total_unread()).unwrap_or(0);
         // The ports list polls only while it's on screen.
         if let Some(pp) = self.ports_panel.clone() {
             let on = self.sidebar_mode == SidebarMode::Ports && self.sidebar_visible;
@@ -3348,13 +3480,17 @@ impl Workspace {
                         this.show_git(w, cx);
                     })))
                     .child(mode_tab("mode-ports", "icons/ports.svg", "Ports", self.sidebar_mode == SidebarMode::Ports).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_ports(cx))))
-                    .child(mode_tab("mode-servers", "icons/server.svg", "Servers", self.sidebar_mode == SidebarMode::Servers).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_servers(w, cx)))),
+                    .child(mode_tab("mode-servers", "icons/server.svg", "Servers", self.sidebar_mode == SidebarMode::Servers).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_servers(w, cx))))
+                    .child(mode_tab("mode-whatsapp", "icons/whatsapp.svg", "WhatsApp", self.sidebar_mode == SidebarMode::WhatsApp).when(wa_unread > 0, |d| d.child(
+                        mode_badge(wa_unread, 0x1f9d55, 0xffffff),
+                    )).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_whatsapp(cx)))),
             )
             .when_some(search_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when_some(git_panel, |d, gp| d.child(div().flex_1().min_h_0().child(gp)))
             .when_some(tools_panel, |d, tp| d.child(div().flex_1().min_h_0().child(tp)))
             .when_some(ports_panel, |d, pp| d.child(div().flex_1().min_h_0().child(pp)))
             .when_some(servers_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
+            .when_some(whatsapp_panel, |d, wp| d.child(div().flex_1().min_h_0().child(wp)))
             .when(self.sidebar_mode == SidebarMode::Files, |d| d.child(
                 uniform_list(
                     "sidebar-rows",
@@ -3500,9 +3636,33 @@ impl Workspace {
             let (errors, warnings) = e.problem_counts();
             let (icon_path, icon_color) = crate::assets::file_icon(&title);
             let full_path: Option<SharedString> = e.path().map(|p| p.display().to_string().into());
+            let chat = e.chat_badge(cx);
             let tab_ref = tab.clone();
+            let lead = match &chat {
+                Some((avatar, _)) => crate::wa_ui::avatar(avatar.as_ref(), &title, 18.),
+                None => icon(icon_path, icon_color),
+            };
+            let unread = chat.map(|(_, n)| n).unwrap_or(0);
             bar = bar.child(
-                tab_chip(("editor-tab", ix), icon_path, icon_color, title, is_active, false, dirty)
+                tab_chip_with(("editor-tab", ix), lead, title, is_active, false, dirty)
+                    .when(unread > 0, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .min_w(px(16.))
+                                .h(px(16.))
+                                .px(px(4.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(theme::rgb(crate::wa_ui::GREEN))
+                                .text_size(px(10.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(theme::rgb(0x0b141a))
+                                .child(if unread > 99 { "99+".to_string() } else { unread.to_string() }),
+                        )
+                    })
                     .when(preview, |d| d.italic())
                     .when_some(full_path, |d, p| d.tooltip(move |_, cx| cx.new(|_| crate::git_panel::DynTooltip(p.clone())).into()))
                     .when(errors + warnings > 0, |d| {
@@ -3727,6 +3887,11 @@ fn tab_chip(
     exited: bool,
     dirty: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    tab_chip_with(id, icon(icon_path, if exited { theme::TEXT_FAINT } else { icon_color }), title, active, exited, dirty)
+}
+
+/// Tab with any leading element (file icon, chat picture…).
+fn tab_chip_with(id: impl Into<gpui::ElementId>, lead: gpui::AnyElement, title: SharedString, active: bool, exited: bool, dirty: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -3741,7 +3906,7 @@ fn tab_chip(
         .cursor_pointer()
         .when(active, |d| d.bg(theme::rgb(theme::EDITOR_BG)))
         .when(!active, |d| d.hover(|s| s.bg(theme::rgb(theme::HOVER))))
-        .child(icon(icon_path, if exited { theme::TEXT_FAINT } else { icon_color }))
+        .child(lead)
         .child(
             div()
                 .overflow_hidden()
@@ -3781,6 +3946,16 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let waiting = self.terminals.values().flat_map(|t| t.tabs.iter()).filter(|t| t.read(cx).attention.is_some()).count();
         crate::claude_bridge::set_dock_count(cx.entity_id().as_u64(), waiting);
+        if let Some((jid, name)) = self.pending_chat.take() {
+            self.open_chat(&jid, &name, window, cx);
+        }
+        if let Some(plan) = self.pending_ask.take() {
+            self.open_claude_ask(plan, window, cx);
+        }
+        if let Some(panel) = self.whatsapp_panel.clone() {
+            let fg = if self.diff_active { None } else { self.active_editor().and_then(|e| e.read(cx).chat_jid(cx).map(str::to_string)) };
+            panel.update(cx, |p, cx| p.set_active_chat(fg, cx));
+        }
         let title = self.active_project().map(|p| p.name.clone()).unwrap_or_else(|| "juan-terminal".into());
         if title != self.window_title {
             window.set_window_title(&title);
@@ -3972,6 +4147,29 @@ impl Render for Workspace {
                 )
             })
             .children(right)
+            // Offline notice: informative only (no handlers, so it never takes clicks).
+            .when(!crate::net::online(), |d| {
+                d.child(
+                    div().absolute().bottom(px(12.)).left_0().right_0().flex().justify_center().child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(12.))
+                            .py(px(6.))
+                            .rounded(px(16.))
+                            .bg(theme::rgb(theme::SIDEBAR_BG))
+                            .border_1()
+                            .border_color(theme::rgb(theme::DELETED))
+                            .text_size(px(12.))
+                            .text_color(theme::rgb(theme::TEXT))
+                            .shadow_md()
+                            .child(gpui::svg().path("icons/offline.svg").size(px(14.)).text_color(theme::rgb(theme::DELETED)))
+                            .child("Sin conexión a internet")
+                            .child(div().text_color(theme::rgb(theme::TEXT_MUTED)).child("· puedes seguir trabajando")),
+                    ),
+                )
+            })
             .when_some(self.palette.as_ref().map(|(p, _, _)| p.clone()), |d, p| {
                 d.child(
                     div()

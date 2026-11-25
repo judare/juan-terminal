@@ -15,7 +15,7 @@ use crate::theme;
 
 actions!(
     text_area,
-    [Backspace, Delete, Left, Right, Up, Down, SelectLeft, SelectRight, SelectUp, SelectDown, SelectAll, Home, End, Paste, Cut, Copy, Newline, Submit, Cancel, DeleteWordLeft, WordLeft, WordRight]
+    [Backspace, Delete, Left, Right, Up, Down, SelectLeft, SelectRight, SelectUp, SelectDown, SelectAll, Home, End, Paste, Cut, Copy, Newline, ForceNewline, Submit, Cancel, DeleteWordLeft, WordLeft, WordRight]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -41,6 +41,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-left", Home, c),
         KeyBinding::new("cmd-right", End, c),
         KeyBinding::new("enter", Newline, c),
+        KeyBinding::new("shift-enter", ForceNewline, c),
+        KeyBinding::new("alt-enter", ForceNewline, c),
         KeyBinding::new("cmd-enter", Submit, c),
         KeyBinding::new("escape", Cancel, c),
     ]);
@@ -50,6 +52,8 @@ pub enum TextAreaEvent {
     Changed,
     Submit,
     Cancel,
+    /// An image was pasted (chat composers): saved to this PNG/JPEG file.
+    PastedImage(std::path::PathBuf),
 }
 
 pub struct TextArea {
@@ -66,6 +70,9 @@ pub struct TextArea {
     layout: Option<AreaLayout>,
     selecting: bool,
     scroll_y: Pixels,
+    /// Chat composer: Enter sends, Shift/Option+Enter inserts a newline, pasted images are
+    /// reported instead of ignored.
+    pub submit_on_enter: bool,
 }
 
 #[derive(Clone)]
@@ -93,6 +100,7 @@ impl TextArea {
             layout: None,
             selecting: false,
             scroll_y: px(0.),
+            submit_on_enter: false,
         }
     }
 
@@ -102,6 +110,11 @@ impl TextArea {
         self.head = self.content.len();
         cx.emit(TextAreaEvent::Changed);
         cx.notify();
+    }
+
+    /// Insert at the caret (replacing the selection).
+    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.replace(self.sel(), text, cx);
     }
 
     fn sel(&self) -> Range<usize> {
@@ -356,12 +369,38 @@ impl Render for TextArea {
                 }
             }))
             .on_action(cx.listener(|this, _: &Paste, _, cx| {
+                if this.submit_on_enter
+                    && let Some(item) = cx.read_from_clipboard()
+                    && item.text().is_none()
+                    && let Some(img) = item.entries().iter().find_map(|e| match e {
+                        gpui::ClipboardEntry::Image(i) => Some(i.clone()),
+                        _ => None,
+                    })
+                {
+                    let ext = match img.format {
+                        gpui::ImageFormat::Jpeg => "jpg",
+                        _ => "png",
+                    };
+                    let path = std::env::temp_dir().join(format!("pegado-{}.{ext}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)));
+                    if std::fs::write(&path, &img.bytes).is_ok() {
+                        cx.emit(TextAreaEvent::PastedImage(path));
+                    }
+                    return;
+                }
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
                     let r = this.sel();
                     this.replace(r, &t.replace("\r\n", "\n"), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &Newline, _, cx| {
+                if this.submit_on_enter {
+                    cx.emit(TextAreaEvent::Submit);
+                    return;
+                }
+                let r = this.sel();
+                this.replace(r, "\n", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ForceNewline, _, cx| {
                 let r = this.sel();
                 this.replace(r, "\n", cx);
             }))

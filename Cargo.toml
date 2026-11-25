@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 exclude = ["vendor/gpui"]
-members = ["crates/app", "crates/workspace_state", "crates/terminal_engine", "crates/editor", "crates/project_search", "crates/git_engine", "crates/code_quality", "crates/lsp_client", "crates/claude_ide", "crates/ssh_remote"]
+members = ["crates/app", "crates/workspace_state", "crates/terminal_engine", "crates/editor", "crates/project_search", "crates/git_engine", "crates/code_quality", "crates/lsp_client", "crates/claude_ide", "crates/ssh_remote", "crates/whatsapp"]
 
 [workspace.package]
 edition = "2024"
@@ -38,6 +38,14 @@ codegen-units = 1
 debug = false
 strip = true
 opt-level = 3
+
+# Local installs (packaging/build-app.sh): optimized but without LTO and with parallel,
+# incremental codegen, so rebuilding after a change takes a fraction of `release`.
+[profile.fastrelease]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
 
 [profile.dev]
 debug = 1

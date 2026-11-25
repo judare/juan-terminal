@@ -33,7 +33,7 @@ pub fn env_for_shell() -> HashMap<String, String> {
     }
     // Claude hook settings (see claude_ide::hook_settings_json), used by the `claude` wrapper.
     let settings = workspace_state::state_dir().join("claude-hooks.json");
-    let body = claude_ide::hook_settings_json();
+    let body = crate::claude_tools::settings_json();
     if std::fs::read_to_string(&settings).ok().as_deref() != Some(body.as_str()) {
         let _ = std::fs::write(&settings, &body);
     }

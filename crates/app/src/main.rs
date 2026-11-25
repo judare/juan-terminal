@@ -8,8 +8,10 @@ mod office;
 mod pdf_view;
 mod pptx_view;
 mod brave;
+mod chat_view;
 mod claude_bridge;
 mod claude_sessions;
+mod claude_tools;
 mod assets;
 mod command_palette;
 mod diff_view;
@@ -39,7 +41,16 @@ mod totp;
 mod usage_stats;
 mod usage_view;
 mod video_player;
+mod voice;
+mod wa_bridge;
+mod wa_gate;
+mod wa_mcp;
+mod wa_reply;
+mod net;
+mod notify;
+mod wa_ui;
 mod website_block;
+mod whatsapp_panel;
 mod workspace;
 
 use std::time::Instant;
@@ -94,6 +105,11 @@ fn main() {
         }
         return;
     }
+    // PreToolUse hook of the read-only WhatsApp reply drafts.
+    if args.get(1).map(|s| s.as_str()) == Some("--wa-tool-gate") {
+        wa_gate::run();
+        return;
+    }
     // Stdio MCP server for Claude (spawned by `claude`, not a GUI launch).
     if std::env::args().any(|a| a == "--mcp-servers") {
         let project_id = std::env::var("JT_PROJECT_ID").unwrap_or_default();
@@ -108,7 +124,12 @@ fn main() {
                 .unwrap_or_default();
             ports::dev_servers_report(app_pid, &roots)
         };
-        ssh_remote::mcp::serve_stdio_with(&ssh_remote::mcp::Extra { dev_servers: &dev_servers, tools: brave::tools(), call: &brave::call, instructions: brave::INSTRUCTIONS });
+        let tools = brave::tools().into_iter().chain(wa_mcp::tools()).collect();
+        let call = |name: &str, args: &serde_json::Value| brave::call(name, args).or_else(|| wa_mcp::call(name, args));
+        let hidden = claude_tools::hidden_builtin_tools();
+        let off = claude_tools::disabled();
+        let instructions = format!("{}{}", if off.contains("brave") { "" } else { brave::INSTRUCTIONS }, if off.contains("whatsapp") { "" } else { wa_mcp::INSTRUCTIONS });
+        ssh_remote::mcp::serve_stdio_with(&ssh_remote::mcp::Extra { dev_servers: &dev_servers, tools, call: &call, instructions: &instructions, hidden: &hidden });
         return;
     }
     let started = Instant::now();
@@ -146,7 +167,10 @@ fn main() {
         })
         .detach();
         bind_keys(cx);
+        wa_bridge::init(cx);
+        net::init(cx);
         text_input::bind_keys(cx);
+        chat_view::bind_keys(cx);
         text_area::bind_keys(cx);
         editor_view::bind_keys(cx);
         search_panel::bind_keys(cx);
@@ -357,6 +381,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-`", w::ToggleTerminalPanel, Some("Workspace")),
         KeyBinding::new("cmd-alt-s", w::SaveAll, Some("Workspace")),
         KeyBinding::new("cmd-w", w::CloseEditor, Some("Editor")),
+        // WhatsApp chat tabs (their focus is in the chat, not an "Editor" context).
+        KeyBinding::new("cmd-w", w::CloseEditor, Some("ChatView")),
+        KeyBinding::new("ctrl-w", w::CloseEditor, Some("ChatView")),
+        KeyBinding::new("ctrl-tab", w::NextEditor, Some("ChatView")),
+        KeyBinding::new("ctrl-shift-tab", w::PreviousEditor, Some("ChatView")),
+        KeyBinding::new("cmd-shift-]", w::NextEditor, Some("ChatView")),
+        KeyBinding::new("cmd-shift-[", w::PreviousEditor, Some("ChatView")),
         KeyBinding::new("cmd-shift-]", w::NextEditor, Some("Editor")),
         KeyBinding::new("cmd-shift-[", w::PreviousEditor, Some("Editor")),
         KeyBinding::new("ctrl-tab", w::NextEditor, Some("Editor")),

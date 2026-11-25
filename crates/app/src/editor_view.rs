@@ -107,6 +107,10 @@ pub enum EditorEvent {
     SelectionChanged,
     /// Save requested on an untitled buffer: the workspace asks where to put it.
     SaveAs,
+    /// Open a file in its own tab (WhatsApp media).
+    OpenFile(PathBuf),
+    /// "Pedir a Claude…" on a WhatsApp chat tab.
+    AskClaude { jid: String, instruction: String },
 }
 
 /// Oxfmt/Oxlint found for the repository containing this file.
@@ -243,6 +247,10 @@ pub struct EditorView {
     pub doc: Document,
     /// Non-text files (images, CSV, media) are shown by an asset viewer instead.
     pub asset: Option<Entity<crate::asset_view::AssetView>>,
+    /// WhatsApp conversation shown in this tab instead of a file.
+    pub chat: Option<Entity<crate::chat_view::ChatView>>,
+    chat_title: Option<SharedString>,
+    _chat_sub: Option<Subscription>,
     /// CSV/TSV: `asset` is the table view of `doc` (Table/Edit toggle).
     csv_source: bool,
     /// CSV showing the table (vs. the text editor).
@@ -325,6 +333,9 @@ impl EditorView {
         let mut this = Self {
             doc,
             asset: None,
+            chat: None,
+            chat_title: None,
+            _chat_sub: None,
             csv_source: false,
             table_mode: false,
             _asset_sub: None,
@@ -397,6 +408,41 @@ impl EditorView {
         }));
         this.asset = Some(asset);
         this
+    }
+
+    /// WhatsApp conversation tab.
+    pub fn new_chat(jid: String, name: String, font_size: f32, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(Document::from_str("", Language::PlainText), font_size, cx);
+        let chat = cx.new(|cx| crate::chat_view::ChatView::new(jid, name, cx));
+        this._chat_sub = Some(cx.subscribe(&chat, |this, chat, e: &crate::chat_view::ChatEvent, cx| match e {
+            crate::chat_view::ChatEvent::OpenFile(p) => cx.emit(EditorEvent::OpenFile(p.clone())),
+            crate::chat_view::ChatEvent::AskClaude { jid, instruction } => cx.emit(EditorEvent::AskClaude { jid: jid.clone(), instruction: instruction.clone() }),
+            crate::chat_view::ChatEvent::TitleChanged => {
+                this.chat_title = Some(chat.read(cx).name.clone().into());
+                cx.emit(EditorEvent::Changed);
+            }
+            crate::chat_view::ChatEvent::Interacted => {
+                if this.preview {
+                    this.preview = false;
+                    cx.emit(EditorEvent::Changed);
+                }
+            }
+        }));
+        this.chat_title = Some(chat.read(cx).name.clone().into());
+        this.chat = Some(chat);
+        this
+    }
+
+    /// WhatsApp tab: (picture, unread count).
+    pub fn chat_badge(&self, cx: &App) -> Option<(Option<PathBuf>, u32)> {
+        self.chat.as_ref().map(|c| {
+            let c = c.read(cx);
+            (c.avatar.clone(), c.unread)
+        })
+    }
+
+    pub fn chat_jid<'a>(&self, cx: &'a App) -> Option<&'a str> {
+        self.chat.as_ref().map(|c| c.read(cx).jid.as_str())
     }
 
     /// Word document: shown and edited as live Markdown, saved back into the .docx (⌘S).
@@ -750,6 +796,9 @@ impl EditorView {
     }
 
     pub fn title(&self) -> SharedString {
+        if let Some(name) = &self.chat_title {
+            return name.clone();
+        }
         self.doc
             .path
             .as_ref()
@@ -765,7 +814,7 @@ impl EditorView {
 
     /// New buffer (⌘N) that has never been saved.
     pub fn is_untitled(&self) -> bool {
-        self.doc.path.is_none() && self.asset.is_none()
+        self.doc.path.is_none() && self.asset.is_none() && self.chat.is_none()
     }
 
     /// Give an untitled buffer its file: the language follows the new extension.
@@ -1693,6 +1742,11 @@ impl Render for EditorView {
         }
         let table_toolbar = self.render_table_toolbar(cx);
         let slash_menu = if self.markdown_live { self.render_slash_menu(cx) } else { None };
+        if let Some(chat) = self.chat.clone() {
+            let name: SharedString = chat.read(cx).name.clone().into();
+            self.chat_title = Some(name);
+            return div().id("editor").size_full().child(chat);
+        }
         if let Some(asset) = self.asset.clone().filter(|_| !self.csv_source || self.table_mode) {
             // The asset view tracks this editor's focus handle itself (keyboard selection).
             return div()

@@ -118,7 +118,8 @@ if [[ -n $JT_CLAUDE_SETTINGS && -f $JT_CLAUDE_SETTINGS ]] && (( ! $+aliases[clau
         command claude "$@" ;;
       *)
         if [[ -n $JT_MCP_CONFIG && -f $JT_MCP_CONFIG ]]; then
-          command claude --settings "$JT_CLAUDE_SETTINGS" --mcp-config "$JT_MCP_CONFIG" "$@"
+          # --mcp-config is variadic: keep --settings after it so it doesn't swallow the prompt.
+          command claude --mcp-config "$JT_MCP_CONFIG" --settings "$JT_CLAUDE_SETTINGS" "$@"
         else
           command claude --settings "$JT_CLAUDE_SETTINGS" "$@"
         fi ;;

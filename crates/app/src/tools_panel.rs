@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use code_quality::{Diagnostic, Located, Severity, Tool};
 use gpui::{ClickEvent, Context, EventEmitter, PromptLevel, Render, SharedString, Window, div, prelude::*, px};
 
+use crate::claude_tools::{self, Group, Kind};
 use crate::git_panel::icon_action;
 use crate::moli;
 use crate::theme;
@@ -48,6 +49,11 @@ pub struct ToolsPanel {
     tsgo_busy: bool,
     tsgo_message: Option<(String, bool)>,
     mcp_tools_open: bool,
+    /// What Claude gets, by group, and which are switched off.
+    claude: Vec<Group>,
+    claude_off: std::collections::BTreeSet<String>,
+    claude_open: Option<String>,
+    claude_message: Option<(String, bool)>,
 }
 
 impl EventEmitter<ToolsPanelEvent> for ToolsPanel {}
@@ -62,7 +68,31 @@ impl ToolsPanel {
             tsgo_busy: false,
             tsgo_message: None,
             mcp_tools_open: false,
+            claude: Vec::new(),
+            claude_off: Default::default(),
+            claude_open: None,
+            claude_message: None,
         }
+    }
+
+    fn refresh_claude(&mut self) {
+        let repos: Vec<PathBuf> = self.repos.iter().map(|r| r.path.clone()).collect();
+        self.claude = claude_tools::groups(&repos);
+        self.claude_off = claude_tools::disabled();
+    }
+
+    fn toggle_claude(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(g) = self.claude.get(ix).cloned() else { return };
+        let on = claude_tools::is_enabled(&g, &self.claude_off);
+        self.claude_message = Some(match claude_tools::set_enabled(&g, !on) {
+            Ok(()) => (format!("{} {}. Applies to Claude sessions you start from now on.", g.name, if on { "off" } else { "on" }), false),
+            Err(e) => (format!("{}: {e}", g.name), true),
+        });
+        self.refresh_claude();
+        if g.kind == Kind::Skill {
+            self.check_moli(cx);
+        }
+        cx.notify();
     }
 
     /// Detect tools for the active project's repositories (cheap: file checks + `--version`).
@@ -71,12 +101,16 @@ impl ToolsPanel {
             if !self.moli.checked {
                 self.check_moli(cx);
             }
+            if self.claude.is_empty() {
+                self.refresh_claude();
+            }
             return;
         }
         self.repos = repos
             .iter()
             .map(|(name, path)| RepoTools { name: name.clone(), path: path.clone(), oxlint: None, oxfmt: None, diagnostics: Vec::new(), linted: false, busy: Some("Detecting"), message: None })
             .collect();
+        self.refresh_claude();
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
@@ -251,6 +285,7 @@ impl ToolsPanel {
                 this.moli.skills = skills;
                 this.moli.obscura_leftovers = leftovers;
                 this.moli.busy = None;
+                this.refresh_claude();
                 cx.notify();
             });
         })
@@ -347,6 +382,105 @@ impl Default for ToolsPanel {
     }
 }
 
+/// iOS-style on/off switch.
+fn switch(on: bool) -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(26.))
+        .h(px(15.))
+        .p(px(2.))
+        .rounded_full()
+        .flex()
+        .when(on, |d| d.justify_end().bg(theme::rgb(0x2f7d4f)))
+        .when(!on, |d| d.bg(theme::rgb(0x3a3d44)))
+        .child(div().size(px(11.)).rounded_full().bg(theme::rgb(if on { 0xffffff } else { 0x9a9ea6 })))
+}
+
+impl ToolsPanel {
+    /// "CLAUDE" section: every group of tools/skills Claude gets here, with a switch.
+    fn render_claude(&mut self, mut list: gpui::Stateful<gpui::Div>, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let on_count = self.claude.iter().filter(|g| claude_tools::is_enabled(g, &self.claude_off)).count();
+        list = list.child(
+            header("CLAUDE", "tools & context", true)
+                .child(div().flex_1())
+                .child(div().flex_none().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("{on_count}/{}", self.claude.len())))
+                .child(icon_action("claude-tools-refresh", "icons/fetch.svg", "Re-check").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.refresh_claude();
+                    cx.notify();
+                }))),
+        );
+        let mut last_kind = None;
+        for (ix, g) in self.claude.iter().enumerate() {
+            if last_kind != Some(g.kind) {
+                last_kind = Some(g.kind);
+                let label = match g.kind {
+                    Kind::Builtin => "juan-terminal",
+                    Kind::Mcp => "MCP servers",
+                    Kind::Skill => "Skills",
+                };
+                list = list.child(div().pl(px(16.)).pt(px(6.)).pb(px(2.)).text_size(px(10.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(label));
+            }
+            let on = claude_tools::is_enabled(g, &self.claude_off);
+            let open = self.claude_open.as_deref() == Some(g.id.as_str());
+            let id = g.id.clone();
+            let detail = match g.kind {
+                Kind::Builtin => format!("{} tools", g.items.len()),
+                Kind::Mcp => "server".to_string(),
+                Kind::Skill if g.items.len() > 1 => format!("{} skills", g.items.len()),
+                Kind::Skill => "skill".to_string(),
+            };
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("ct-{}", g.id)))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .pl(px(16.))
+                    .pr(px(12.))
+                    .h(px(26.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.claude_open = if this.claude_open.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) };
+                        cx.notify();
+                    }))
+                    .child(gpui::svg().path(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" }).size(px(8.)).flex_none().text_color(theme::rgb(theme::TEXT_FAINT)))
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.)).text_color(theme::rgb(if on { theme::TEXT } else { theme::TEXT_FAINT })).child(g.name.clone()))
+                    .child(div().flex_none().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(detail))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("ct-sw-{}", g.id)))
+                            .cursor_pointer()
+                            .child(switch(on))
+                            .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(if on { "Switch off for new Claude sessions" } else { "Switch on" })).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_claude(ix, cx);
+                            })),
+                    ),
+            );
+            if open {
+                let mut body = div().flex().flex_col().gap(px(2.)).pl(px(32.)).pr(px(12.)).pb(px(6.));
+                if !g.desc.is_empty() {
+                    body = body.child(div().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(g.desc.clone()));
+                }
+                let names: Vec<String> = match g.kind {
+                    Kind::Mcp => vec![format!("mcp__{}__*", g.items[0])],
+                    _ => g.items.clone(),
+                };
+                for n in names {
+                    body = body.child(div().text_size(px(11.)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_FAINT)).child(n));
+                }
+                list = list.child(body);
+            }
+        }
+        if let Some(m) = &self.claude_message {
+            list = list.child(message("claude-tools-msg".into(), m));
+        }
+        list
+    }
+}
+
 fn header(label: &'static str, sub: &'static str, first: bool) -> gpui::Div {
     div()
         .flex()
@@ -428,7 +562,8 @@ impl Render for ToolsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div().id("tools-panel").flex().flex_col().size_full().overflow_y_scroll().pb(px(16.));
 
-        list = list.child(header("CODE QUALITY", "oxlint · oxfmt", true));
+        list = self.render_claude(list, cx);
+        list = list.child(header("CODE QUALITY", "oxlint · oxfmt", false));
         if self.repos.is_empty() {
             list = list.child(div().px(px(16.)).text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("No repositories in this project."));
         }
