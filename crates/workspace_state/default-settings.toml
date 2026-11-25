@@ -1,14 +1,22 @@
 # juan-terminal settings (edit and save; ⌘, opens this file in the app).
 #
 # blocked_websites: blocked system-wide through a managed block in /etc/hosts (macOS asks for
-#   your password when the list changes). Domains only; "www." is added automatically. No
-#   wildcards: list each subdomain you need. Browsers with their own "Secure DNS" (DoH) ignore
-#   /etc/hosts: turn it off there. Adding a site blocks it right away; a removed site stays
-#   blocked for 24 hours first (no impulse unblocking).
+#   your password when the list changes) and also blanked in Brave. Domains only; "www." is
+#   added automatically. No wildcards in /etc/hosts: list each subdomain you need. Browsers with
+#   their own "Secure DNS" (DoH) ignore /etc/hosts: turn it off there. Adding a site blocks it
+#   right away; a removed site stays blocked for 24 hours first (no impulse unblocking).
+#
+# Brave (DNS untouched: juan-terminal watches Brave's tabs and sends blocked ones to a blank
+#   page; subdomains included). Needs Brave › View › Developer › Allow JavaScript from Apple
+#   Events for the last two points:
+#   * brave_blocked_websites: always blank in Brave (other apps still reach them).
+#   * brave_no_video_websites: videos hidden and stopped; images stay.
+#   * any page whose text has many adult keywords is blanked, whatever its URL.
 #
 # [projects.<id>] schedule: hours the project can be opened in juan-terminal (<id> is the
 #   project's id in state.toml, usually its folder name). Outside them the project is locked in
 #   the sidebar and closed if it is open. Folders on disk are never moved or hidden.
+#   "websites" (optional): blanked in Brave while the project is locked.
 #   start > end crosses midnight ("days" = day the window starts); start == end = all day;
 #   no "days" = every day. Times are the Mac's local time unless the project sets utc_offset
 #   (fixed offset, e.g. "-05:00" for Colombia, which has no daylight saving). Example:
@@ -18,15 +26,19 @@
 #   schedule = [
 #     { days = ["mon", "tue", "wed", "thu", "fri"], start = "09:00", end = "18:00" },
 #   ]
+#   websites = ["my-project.com"]
 #
-# [[website_schedules]]: sites blocked except during their "allowed" hours (same format as a
-#   project schedule; utc_offset optional). Switches on its own when the hours start/end.
+# [[website_schedules]]: sites blanked in Brave except during their "allowed" hours (same format
+#   as a project schedule; utc_offset optional). Switches on its own when the hours start/end.
 #
 #   [[website_schedules]]
 #   name = "social"
 #   utc_offset = "-05:00"
 #   websites = ["instagram.com", "x.com"]
 #   allowed = [{ days = ["sun"], start = "00:00", end = "00:00" }]   # Sundays only
+
+brave_blocked_websites = ["youtube.com", "youtu.be"]
+brave_no_video_websites = ["x.com", "twitter.com"]
 
 blocked_websites = [
   # Adult content

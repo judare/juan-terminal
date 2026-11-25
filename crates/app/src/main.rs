@@ -55,6 +55,7 @@ mod net;
 mod notify;
 mod wa_ui;
 mod website_block;
+mod brave_guard;
 mod whatsapp_panel;
 mod workspace;
 
