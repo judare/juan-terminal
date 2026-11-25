@@ -48,26 +48,66 @@ unsafe impl objc::Encode for NSPoint {
     }
 }
 
-/// Hover controls drawn natively over the picture (GPUI can't paint above the player). The
-/// view lets clicks through, so GPUI handles them with invisible targets at the same spots.
-pub const OVERLAY_PLAY: f32 = 44.;
-pub const OVERLAY_BUTTON: f32 = 28.;
+/// Controls drawn natively over the picture (GPUI can't paint above the player). The view lets
+/// clicks through, so GPUI handles them with invisible targets at the same spots (see
+/// `overlay_layout`).
+pub const OVERLAY_PLAY: f32 = 40.;
+pub const OVERLAY_SKIP: f32 = 30.;
+pub const OVERLAY_SKIP_GAP: f32 = 14.;
+pub const OVERLAY_BUTTON: f32 = 24.;
 pub const OVERLAY_MARGIN: f32 = 6.;
-pub const OVERLAY_GAP: f32 = 6.;
+pub const OVERLAY_GAP: f32 = 4.;
+/// Side inset of the timeline and the text.
+pub const OVERLAY_PAD: f32 = 10.;
+/// Distance from the bottom edge to the timeline's center while hovered.
+pub const OVERLAY_BAR_BOTTOM: f32 = 10.;
+const TOP_SHADE: f64 = 54.;
+const BOTTOM_SHADE: f64 = 46.;
+
+/// What the overlay shows. `hover` false: only a thin timeline along the bottom edge.
+#[derive(Clone, PartialEq)]
+pub struct OverlayInfo {
+    pub hover: bool,
+    pub playing: bool,
+    pub title: String,
+    pub channel: String,
+    /// 0…1
+    pub progress: f32,
+    /// "4:56 / 7:22" (or a status like "Cargando…").
+    pub time: String,
+    /// Timeline color (sRGB 0…1).
+    pub accent: (f32, f32, f32),
+}
 
 struct Overlay {
+    top_shade: Id,
+    bottom_shade: Id,
+    title: Id,
+    channel: Id,
+    time: Id,
+    track: Id,
+    fill: Id,
     play: Id,
     play_icon: Id,
+    prev: Id,
+    next: Id,
     expand: Id,
     audio: Id,
+    close: Id,
+}
+
+impl Overlay {
+    fn hover_views(&self) -> [Id; 11] {
+        [self.top_shade, self.bottom_shade, self.title, self.channel, self.time, self.play, self.prev, self.next, self.expand, self.audio, self.close]
+    }
 }
 
 pub struct NativePlayer {
     view: Id,
     overlay: RefCell<Option<Overlay>>,
-    /// None: hidden; Some(playing).
-    overlay_state: Cell<Option<bool>>,
-    overlay_size: Cell<Option<(f64, f64)>>,
+    overlay_info: RefCell<Option<OverlayInfo>>,
+    /// Last laid-out (w, h, fill width): skips relayout when nothing moved.
+    overlay_size: Cell<Option<(f64, f64, f64)>>,
     /// GPUI's NSView of the window the player was attached to (null until first paint).
     host: Cell<Id>,
     painted_gen: Cell<u64>,
@@ -101,7 +141,7 @@ impl NativePlayer {
             let _: () = msg_send![view, setHidden: YES];
             view
         };
-        let p = Rc::new(Self { view, overlay: RefCell::new(None), overlay_state: Cell::new(None), overlay_size: Cell::new(None), host: Cell::new(std::ptr::null_mut()), painted_gen: Cell::new(0), last: Cell::new(None), hidden: Cell::new(true) });
+        let p = Rc::new(Self { view, overlay: RefCell::new(None), overlay_info: RefCell::new(None), overlay_size: Cell::new(None), host: Cell::new(std::ptr::null_mut()), painted_gen: Cell::new(0), last: Cell::new(None), hidden: Cell::new(true) });
         PLAYERS.with(|l| {
             let mut l = l.borrow_mut();
             l.retain(|w| w.strong_count() > 0);
@@ -122,7 +162,7 @@ impl NativePlayer {
             let _: () = msg_send![view, setHidden: YES];
             view
         };
-        let p = Rc::new(Self { view, overlay: RefCell::new(None), overlay_state: Cell::new(None), overlay_size: Cell::new(None), host: Cell::new(std::ptr::null_mut()), painted_gen: Cell::new(0), last: Cell::new(None), hidden: Cell::new(true) });
+        let p = Rc::new(Self { view, overlay: RefCell::new(None), overlay_info: RefCell::new(None), overlay_size: Cell::new(None), host: Cell::new(std::ptr::null_mut()), painted_gen: Cell::new(0), last: Cell::new(None), hidden: Cell::new(true) });
         PLAYERS.with(|l| {
             let mut l = l.borrow_mut();
             l.retain(|w| w.strong_count() > 0);
@@ -131,47 +171,108 @@ impl NativePlayer {
         p
     }
 
-    /// Show the hover controls (`Some(playing)`) or hide them. Cheap when unchanged.
-    pub fn set_overlay(&self, state: Option<bool>) {
-        if self.overlay_state.replace(state) == state && (state.is_none() || self.overlay.borrow().is_some()) {
-            return;
-        }
-        if state.is_some() && self.overlay.borrow().is_none() {
-            unsafe {
-                let (play, play_icon) = circle(self.view, OVERLAY_PLAY as f64, "play.fill", 17.);
-                let (expand, _) = circle(self.view, OVERLAY_BUTTON as f64, "arrow.up.left.and.arrow.down.right", 11.);
-                let (audio, _) = circle(self.view, OVERLAY_BUTTON as f64, "video.slash", 11.);
-                *self.overlay.borrow_mut() = Some(Overlay { play, play_icon, expand, audio });
-            }
-            self.overlay_size.set(None);
-            if let Some((_, _, w, h)) = self.last.get() {
-                self.layout_overlay(w, h);
-            }
-        }
-        let Some(o) = &*self.overlay.borrow() else { return };
+    /// Rounded corners for the picture (the native view ignores GPUI's clipping).
+    pub fn set_corner_radius(&self, r: f64) {
         unsafe {
-            let hide: BOOL = if state.is_some() { NO } else { YES };
-            for v in [o.play, o.expand, o.audio] {
-                let _: () = msg_send![v, setHidden: hide];
-            }
-            if let Some(playing) = state {
-                let _: () = msg_send![o.play_icon, setImage: symbol(if playing { "pause.fill" } else { "play.fill" }, 17.)];
+            let _: () = msg_send![self.view, setWantsLayer: YES];
+            let layer: Id = msg_send![self.view, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![layer, setCornerRadius: r];
+                let _: () = msg_send![layer, setMasksToBounds: if r > 0. { YES } else { NO }];
             }
         }
     }
 
-    fn layout_overlay(&self, w: f64, h: f64) {
-        if self.overlay_size.replace(Some((w, h))) == Some((w, h)) {
+    /// Show the overlay (`Some`) or hide it. Cheap when unchanged.
+    pub fn set_overlay(&self, info: Option<OverlayInfo>) {
+        if *self.overlay_info.borrow() == info && (info.is_none() || self.overlay.borrow().is_some()) {
             return;
         }
+        let hover_changed = self.overlay_info.borrow().as_ref().map(|i| i.hover) != info.as_ref().map(|i| i.hover);
+        *self.overlay_info.borrow_mut() = info.clone();
+        if info.is_some() && self.overlay.borrow().is_none() {
+            unsafe {
+                let top_shade = shade(self.view, true);
+                let bottom_shade = shade(self.view, false);
+                let title = label(self.view, 12., 0.3, 1.);
+                let channel = label(self.view, 10.5, 0., 0.75);
+                let time = label(self.view, 10.5, 0.2, 0.9);
+                let track = bar(self.view, (1., 1., 1.), 0.3);
+                let fill = bar(self.view, (1., 1., 1.), 1.);
+                let (prev, _) = circle(self.view, OVERLAY_SKIP as f64, "backward.fill", 11., 0.);
+                let (play, play_icon) = circle(self.view, OVERLAY_PLAY as f64, "play.fill", 15., 0.45);
+                let (next, _) = circle(self.view, OVERLAY_SKIP as f64, "forward.fill", 11., 0.);
+                let (expand, _) = circle(self.view, OVERLAY_BUTTON as f64, "arrow.up.left.and.arrow.down.right", 10., 0.45);
+                let (audio, _) = circle(self.view, OVERLAY_BUTTON as f64, "video.slash", 10., 0.45);
+                let (close, _) = circle(self.view, OVERLAY_BUTTON as f64, "xmark", 10., 0.45);
+                *self.overlay.borrow_mut() = Some(Overlay { top_shade, bottom_shade, title, channel, time, track, fill, play, play_icon, prev, next, expand, audio, close });
+            }
+            self.overlay_size.set(None);
+        }
+        {
+            let Some(o) = &*self.overlay.borrow() else { return };
+            unsafe {
+                let hide: BOOL = if info.as_ref().is_some_and(|i| i.hover) { NO } else { YES };
+                for v in o.hover_views() {
+                    let _: () = msg_send![v, setHidden: hide];
+                }
+                let bars: BOOL = if info.is_some() { NO } else { YES };
+                let _: () = msg_send![o.track, setHidden: bars];
+                let _: () = msg_send![o.fill, setHidden: bars];
+                if let Some(i) = &info {
+                    let _: () = msg_send![o.play_icon, setImage: symbol(if i.playing { "pause.fill" } else { "play.fill" }, 15.)];
+                    let _: () = msg_send![o.title, setStringValue: ns_string(&i.title)];
+                    let _: () = msg_send![o.channel, setStringValue: ns_string(&i.channel)];
+                    let _: () = msg_send![o.time, setStringValue: ns_string(&i.time)];
+                    set_layer_color(o.fill, i.accent, 1.);
+                }
+            }
+        }
+        if hover_changed {
+            self.overlay_size.set(None);
+        }
+        if let Some((_, _, w, h)) = self.last.get() {
+            self.layout_overlay(w, h);
+        }
+    }
+
+    fn layout_overlay(&self, w: f64, h: f64) {
+        let info = self.overlay_info.borrow();
+        let Some(info) = &*info else { return };
         let Some(o) = &*self.overlay.borrow() else { return };
+        let progress = info.progress.clamp(0., 1.) as f64;
+        let key = (w, h, (progress * w).round());
+        if self.overlay_size.replace(Some(key)) == Some(key) {
+            return;
+        }
         unsafe {
             let flipped: BOOL = msg_send![self.view, isFlipped];
-            let top = |y: f64, size: f64| if flipped != NO { y } else { h - y - size };
-            let (p, b, m, g) = (OVERLAY_PLAY as f64, OVERLAY_BUTTON as f64, OVERLAY_MARGIN as f64, OVERLAY_GAP as f64);
-            let _: () = msg_send![o.play, setFrame: NSRect { x: (w - p) / 2., y: (h - p) / 2., w: p, h: p }];
-            let _: () = msg_send![o.audio, setFrame: NSRect { x: w - m - b, y: top(m, b), w: b, h: b }];
-            let _: () = msg_send![o.expand, setFrame: NSRect { x: w - m - 2. * b - g, y: top(m, b), w: b, h: b }];
+            // Rect from top-left coordinates.
+            let r = |x: f64, y: f64, rw: f64, rh: f64| NSRect { x, y: if flipped != NO { y } else { h - y - rh }, w: rw.max(0.), h: rh.max(0.) };
+            let (p, s, sg, b, m, g, pad) = (OVERLAY_PLAY as f64, OVERLAY_SKIP as f64, OVERLAY_SKIP_GAP as f64, OVERLAY_BUTTON as f64, OVERLAY_MARGIN as f64, OVERLAY_GAP as f64, OVERLAY_PAD as f64);
+            let _: () = msg_send![o.top_shade, setFrame: r(0., 0., w, TOP_SHADE)];
+            let _: () = msg_send![o.bottom_shade, setFrame: r(0., h - BOTTOM_SHADE, w, BOTTOM_SHADE)];
+            // Top-right: expand, audio only, close.
+            let _: () = msg_send![o.close, setFrame: r(w - m - b, m, b, b)];
+            let _: () = msg_send![o.audio, setFrame: r(w - m - 2. * b - g, m, b, b)];
+            let _: () = msg_send![o.expand, setFrame: r(w - m - 3. * b - 2. * g, m, b, b)];
+            let text_w = w - pad - (3. * b + 2. * g + m + 6.);
+            let _: () = msg_send![o.title, setFrame: r(pad, 7., text_w, 16.)];
+            let _: () = msg_send![o.channel, setFrame: r(pad, 23., text_w, 14.)];
+            // Center: prev, play, next.
+            let cy = h / 2.;
+            let _: () = msg_send![o.play, setFrame: r((w - p) / 2., cy - p / 2., p, p)];
+            let _: () = msg_send![o.prev, setFrame: r((w - p) / 2. - sg - s, cy - s / 2., s, s)];
+            let _: () = msg_send![o.next, setFrame: r((w + p) / 2. + sg, cy - s / 2., s, s)];
+            // Timeline: inset with the time while hovered, a hairline on the bottom edge otherwise.
+            let (bx, bw, by, bh) = if info.hover { (pad, w - 2. * pad, h - OVERLAY_BAR_BOTTOM as f64 - 1.5, 3.) } else { (0., w, h - 2., 2.) };
+            let _: () = msg_send![o.track, setFrame: r(bx, by, bw, bh)];
+            let _: () = msg_send![o.fill, setFrame: r(bx, by, bw * progress, bh)];
+            for v in [o.track, o.fill] {
+                let layer: Id = msg_send![v, layer];
+                let _: () = msg_send![layer, setCornerRadius: if info.hover { 1.5f64 } else { 0f64 }];
+            }
+            let _: () = msg_send![o.time, setFrame: r(pad, by - 17., w - 2. * pad, 14.)];
         }
     }
 
@@ -267,17 +368,23 @@ unsafe fn symbol(name: &str, points: f64) -> Id {
     }
 }
 
-/// A dark translucent circle with a white SF Symbol, added (hidden) to `parent`.
-unsafe fn circle(parent: Id, size: f64, name: &str, points: f64) -> (Id, Id) {
+/// A circle (dark translucent, or bare with `alpha` 0) with a white SF Symbol, added hidden.
+unsafe fn circle(parent: Id, size: f64, name: &str, points: f64, alpha: f64) -> (Id, Id) {
     unsafe {
         let v: Id = msg_send![class!(NSView), alloc];
         let v: Id = msg_send![v, initWithFrame: NSRect { x: 0., y: 0., w: size, h: size }];
         let _: () = msg_send![v, setWantsLayer: YES];
         let layer: Id = msg_send![v, layer];
-        let color: Id = msg_send![class!(NSColor), colorWithWhite: 0f64 alpha: 0.6f64];
+        let color: Id = msg_send![class!(NSColor), colorWithWhite: 0f64 alpha: alpha];
         let cg: *const std::ffi::c_void = msg_send![color, CGColor];
         let _: () = msg_send![layer, setBackgroundColor: cg];
         let _: () = msg_send![layer, setCornerRadius: size / 2.];
+        if alpha == 0. {
+            // Bare icons stay readable over bright frames.
+            let _: () = msg_send![layer, setShadowOpacity: 0.6f32];
+            let _: () = msg_send![layer, setShadowRadius: 3f64];
+            let _: () = msg_send![layer, setShadowOffset: NSPoint { x: 0., y: 0. }];
+        }
         let iv: Id = msg_send![class!(NSImageView), alloc];
         let iv: Id = msg_send![iv, initWithFrame: NSRect { x: 0., y: 0., w: size, h: size }];
         let _: () = msg_send![iv, setImage: symbol(name, points)];
@@ -291,6 +398,77 @@ unsafe fn circle(parent: Id, size: f64, name: &str, points: f64) -> (Id, Id) {
         let _: () = msg_send![parent, addSubview: v];
         let _: () = msg_send![v, release];
         (v, iv)
+    }
+}
+
+/// One-line white label (truncates with …), added hidden.
+unsafe fn label(parent: Id, size: f64, weight: f64, alpha: f64) -> Id {
+    unsafe {
+        let l: Id = msg_send![class!(NSTextField), labelWithString: ns_string("")];
+        let font: Id = msg_send![class!(NSFont), monospacedDigitSystemFontOfSize: size weight: weight];
+        let _: () = msg_send![l, setFont: font];
+        let color: Id = msg_send![class!(NSColor), colorWithWhite: 1f64 alpha: alpha];
+        let _: () = msg_send![l, setTextColor: color];
+        // NSLineBreakByTruncatingTail = 4
+        let _: () = msg_send![l, setLineBreakMode: 4isize];
+        let _: () = msg_send![l, setMaximumNumberOfLines: 1isize];
+        let _: () = msg_send![l, setWantsLayer: YES];
+        let layer: Id = msg_send![l, layer];
+        let _: () = msg_send![layer, setShadowOpacity: 0.5f32];
+        let _: () = msg_send![layer, setShadowRadius: 2f64];
+        let _: () = msg_send![layer, setShadowOffset: NSPoint { x: 0., y: 0. }];
+        let _: () = msg_send![l, setHidden: YES];
+        let _: () = msg_send![parent, addSubview: l];
+        l
+    }
+}
+
+/// Plain colored rectangle (timeline track / fill), added hidden.
+unsafe fn bar(parent: Id, rgb: (f32, f32, f32), alpha: f64) -> Id {
+    unsafe {
+        let v: Id = msg_send![class!(NSView), alloc];
+        let v: Id = msg_send![v, initWithFrame: NSRect { x: 0., y: 0., w: 1., h: 1. }];
+        let _: () = msg_send![v, setWantsLayer: YES];
+        set_layer_color(v, rgb, alpha);
+        let _: () = msg_send![v, setHidden: YES];
+        let _: () = msg_send![parent, addSubview: v];
+        let _: () = msg_send![v, release];
+        v
+    }
+}
+
+unsafe fn set_layer_color(v: Id, rgb: (f32, f32, f32), alpha: f64) {
+    unsafe {
+        let layer: Id = msg_send![v, layer];
+        let color: Id = msg_send![class!(NSColor), colorWithSRGBRed: rgb.0 as f64 green: rgb.1 as f64 blue: rgb.2 as f64 alpha: alpha];
+        let cg: *const std::ffi::c_void = msg_send![color, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg];
+    }
+}
+
+/// Black → clear gradient from the top (`top`) or bottom edge, added hidden.
+unsafe fn shade(parent: Id, top: bool) -> Id {
+    unsafe {
+        let v: Id = msg_send![class!(NSView), alloc];
+        let v: Id = msg_send![v, initWithFrame: NSRect { x: 0., y: 0., w: 1., h: 1. }];
+        let g: Id = msg_send![class!(CAGradientLayer), layer];
+        let dark: Id = msg_send![class!(NSColor), colorWithWhite: 0f64 alpha: 0.7f64];
+        let clear: Id = msg_send![class!(NSColor), colorWithWhite: 0f64 alpha: 0f64];
+        let dark: Id = msg_send![dark, CGColor];
+        let clear: Id = msg_send![clear, CGColor];
+        // Layer space is y-up: y 0 is the bottom edge.
+        let colors = if top { [clear, dark] } else { [dark, clear] };
+        let arr: Id = msg_send![class!(NSArray), arrayWithObjects: colors.as_ptr() count: 2usize];
+        let _: () = msg_send![g, setColors: arr];
+        let _: () = msg_send![g, setStartPoint: NSPoint { x: 0.5, y: 0. }];
+        let _: () = msg_send![g, setEndPoint: NSPoint { x: 0.5, y: 1. }];
+        // Layer-hosting view: set the layer first.
+        let _: () = msg_send![v, setLayer: g];
+        let _: () = msg_send![v, setWantsLayer: YES];
+        let _: () = msg_send![v, setHidden: YES];
+        let _: () = msg_send![parent, addSubview: v];
+        let _: () = msg_send![v, release];
+        v
     }
 }
 

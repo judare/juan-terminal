@@ -417,6 +417,26 @@ mod ffi {
 
 use ffi::{Doc, Retained};
 
+/// Top of page 1 rendered `width` px wide and cropped to `aspect` (h / w), saved as JPEG at
+/// `dest`. For chat previews; call off the main thread.
+pub fn first_page_jpeg(src: &std::path::Path, dest: &std::path::Path, width: u32, aspect: f32) -> Option<()> {
+    let doc = Doc::open(src)?;
+    if doc.locked() || doc.count() == 0 {
+        return None;
+    }
+    let (pw, _) = doc.display_size(0);
+    let (w, h, bgra) = doc.render(0, width as f64 / pw.max(1.))?;
+    let crop_h = h.min((w as f32 * aspect).round() as u32).max(1);
+    let mut rgb = image::RgbImage::new(w, crop_h);
+    for (x, y, p) in rgb.enumerate_pixels_mut() {
+        let i = ((y * w + x) * 4) as usize;
+        *p = image::Rgb([bgra[i + 2], bgra[i + 1], bgra[i]]);
+    }
+    std::fs::create_dir_all(dest.parent()?).ok()?;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(dest).ok()?);
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&rgb).ok()
+}
+
 // ---- view -------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]

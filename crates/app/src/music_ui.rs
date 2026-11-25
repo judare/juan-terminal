@@ -1137,17 +1137,15 @@ impl Render for MusicCard {
         let music = self.music.clone();
         let m = self.music.read(cx);
         let Some(track) = m.current().cloned() else { return div().into_any_element() };
-        // Card margins (8 + 8), padding (10 + 10) and border (1 + 1): exact 16:9, no black bars.
-        let video_h = ((self.width - 38.) * 9. / 16.).max(60.);
         let show_video = m.video_on && !m.theater;
-        let video_ready = !m.video_loading && !m.resolving;
-        let hover = show_video && video_ready && self.video_hover;
-        m.video_view.set_overlay(hover.then_some(m.playing));
-        use crate::video_player::{OVERLAY_BUTTON, OVERLAY_GAP, OVERLAY_MARGIN, OVERLAY_PLAY};
         let on = |f: fn(&mut Music, &mut Context<Music>)| {
             let music = music.clone();
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| music.update(cx, |m, cx| f(m, cx))
         };
+        if show_video {
+            return self.render_video(&music, &track, cx);
+        }
+        m.video_view.set_overlay(None);
         div()
             .flex()
             .flex_col()
@@ -1160,49 +1158,6 @@ impl Render for MusicCard {
             .bg(theme::rgb(theme::HOVER))
             .border_1()
             .border_color(theme::rgb(theme::BORDER))
-            .when(show_video, |d| {
-                d.child(
-                    div()
-                        .id("music-card-video")
-                        .relative()
-                        .w_full()
-                        .h(px(video_h))
-                        .rounded(px(6.))
-                        .overflow_hidden()
-                        .bg(gpui::black())
-                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                            if this.video_hover != *hovered {
-                                this.video_hover = *hovered;
-                                cx.notify();
-                            }
-                        }))
-                        .when(video_ready, |d| d.child(crate::video_player::player_slot(m.video_view.clone())))
-                        .when(!video_ready, |d| d.flex().items_center().justify_center().text_size(px(11.)).text_color(gpui::hsla(0., 0., 1., 0.6)).child("Cargando video…"))
-                        // Under the native buttons (same spots): the player lets the clicks through.
-                        .when(hover, |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top(px((video_h - OVERLAY_PLAY) / 2.))
-                                    .left_0()
-                                    .w_full()
-                                    .flex()
-                                    .justify_center()
-                                    .child(overlay_target("music-card-video-play", OVERLAY_PLAY).on_click(on(|m, cx| m.toggle(cx)))),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(OVERLAY_MARGIN))
-                                    .right(px(OVERLAY_MARGIN))
-                                    .flex()
-                                    .gap(px(OVERLAY_GAP))
-                                    .child(overlay_target("music-card-video-expand", OVERLAY_BUTTON).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(MusicCardEvent::OpenTheater))))
-                                    .child(overlay_target("music-card-video-audio", OVERLAY_BUTTON).on_click(on(|m, cx| m.set_video(false, cx)))),
-                            )
-                        }),
-                )
-            })
             .child(
                 div()
                     .flex()
@@ -1261,8 +1216,150 @@ impl Render for MusicCard {
                     ),
             )
             .child(progress(&music, m, "music-card-progress"))
-            // With the video showing, play / pause lives on the picture (on hover).
-            .when(!show_video, |d| d.child(transport(&music, m, false, "card")))
+            .child(transport(&music, m, false, "card"))
+            .into_any_element()
+    }
+}
+
+impl MusicCard {
+    /// Video mode: just the picture, edge to edge in the sidebar. Title, controls and timeline
+    /// are drawn natively over it (GPUI can't paint above the player); invisible GPUI targets
+    /// at the same spots take the clicks.
+    fn render_video(&mut self, music: &Entity<Music>, track: &Track, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let on_hover = cx.listener(|this, hovered: &bool, _, cx| {
+            if this.video_hover != *hovered {
+                this.video_hover = *hovered;
+                cx.notify();
+            }
+        });
+        let open_theater = cx.listener(|_, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            cx.emit(MusicCardEvent::OpenTheater)
+        });
+        let m = music.read(cx);
+        use crate::video_player::{OverlayInfo, OVERLAY_BAR_BOTTOM, OVERLAY_BUTTON, OVERLAY_GAP, OVERLAY_MARGIN, OVERLAY_PAD, OVERLAY_PLAY, OVERLAY_SKIP, OVERLAY_SKIP_GAP};
+        const SIDE: f32 = 6.;
+        let video_w = (self.width - 2. * SIDE).max(80.);
+        let video_h = video_w * 9. / 16.;
+        let video_ready = !m.video_loading && !m.resolving;
+        let hover = video_ready && self.video_hover;
+        let accent = gpui::Rgba::from(theme::rgb(track.mode.color()));
+        let time = if let Some(e) = &m.error {
+            e.clone()
+        } else if m.buffering {
+            "Cargando…".into()
+        } else {
+            format!("{} / {}", fmt_time(m.position), if m.duration > 0. { fmt_time(m.duration) } else { "--:--".into() })
+        };
+        m.video_view.set_corner_radius(8.);
+        m.video_view.set_overlay(video_ready.then(|| OverlayInfo {
+            hover,
+            playing: m.playing,
+            title: track.title.to_string(),
+            channel: track.channel.to_string(),
+            progress: if m.duration > 0. { (m.position / m.duration) as f32 } else { 0. },
+            time,
+            accent: (accent.r, accent.g, accent.b),
+        }));
+        let on = |f: fn(&mut Music, &mut Context<Music>)| {
+            let music = music.clone();
+            // Targets overlap (buttons sit over the click-to-pause area): handle once.
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
+                music.update(cx, |m, cx| f(m, cx))
+            }
+        };
+        let bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let b2 = bounds.clone();
+        let music_seek = music.clone();
+        let duration = m.duration;
+        div()
+            .id("music-card-video")
+            .flex_none()
+            .relative()
+            .mx(px(SIDE))
+            .mb(px(8.))
+            .h(px(video_h))
+            .rounded(px(8.))
+            .overflow_hidden()
+            .bg(gpui::black())
+            .on_hover(on_hover)
+            .when(video_ready, |d| d.child(crate::video_player::player_slot(m.video_view.clone())))
+            .when(!video_ready, |d| {
+                // No native view yet: GPUI paints the escape hatches itself.
+                let btn = |id: &'static str, path: &'static str| {
+                    overlay_target(id, OVERLAY_BUTTON).flex().items_center().justify_center().bg(gpui::hsla(0., 0., 0., 0.45)).hover(|s| s.bg(gpui::hsla(0., 0., 0., 0.7))).child(gpui::svg().path(path).size(px(11.)).text_color(gpui::white()))
+                };
+                d.flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.))
+                    .text_color(gpui::hsla(0., 0., 1., 0.6))
+                    .child("Cargando video…")
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(OVERLAY_MARGIN))
+                            .right(px(OVERLAY_MARGIN))
+                            .flex()
+                            .gap(px(OVERLAY_GAP))
+                            .child(btn("music-card-loading-audio", "icons/music.svg").tooltip(tip("Solo audio")).on_click(on(|m, cx| m.set_video(false, cx))))
+                            .child(btn("music-card-loading-close", "icons/close.svg").tooltip(tip("Cerrar reproductor")).on_click(on(|m, cx| m.stop(cx)))),
+                    )
+            })
+            .when(hover, |d| {
+                let cy = video_h / 2.;
+                d.child(
+                    // Click on the picture (outside the buttons) toggles play / pause.
+                    div().id("music-card-video-toggle").absolute().top(px(44.)).left_0().w_full().h(px((video_h - 44. - 30.).max(0.))).on_click(on(|m, cx| m.toggle(cx))),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(cy - OVERLAY_PLAY / 2.))
+                        .left_0()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(OVERLAY_SKIP_GAP))
+                        .child(overlay_target("music-card-video-prev", OVERLAY_SKIP).on_click(on(|m, cx| m.previous(cx))))
+                        .child(overlay_target("music-card-video-play", OVERLAY_PLAY).on_click(on(|m, cx| m.toggle(cx))))
+                        .child(overlay_target("music-card-video-next", OVERLAY_SKIP).on_click(on(|m, cx| m.next(cx)))),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(OVERLAY_MARGIN))
+                        .right(px(OVERLAY_MARGIN))
+                        .flex()
+                        .gap(px(OVERLAY_GAP))
+                        .child(overlay_target("music-card-video-expand", OVERLAY_BUTTON).tooltip(tip("Pantalla grande")).on_click(open_theater))
+                        .child(overlay_target("music-card-video-audio", OVERLAY_BUTTON).tooltip(tip("Solo audio")).on_click(on(|m, cx| m.set_video(false, cx))))
+                        .child(overlay_target("music-card-video-close", OVERLAY_BUTTON).tooltip(tip("Cerrar reproductor")).on_click(on(|m, cx| m.stop(cx)))),
+                )
+                .child(
+                    // Timeline: click / drag-free seek over a taller strip than the bar.
+                    div()
+                        .id("music-card-video-seek")
+                        .absolute()
+                        .left(px(OVERLAY_PAD))
+                        .right(px(OVERLAY_PAD))
+                        .bottom(px(OVERLAY_BAR_BOTTOM - 7.))
+                        .h(px(14.))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(b) = b2.get() {
+                                let x = f32::from(e.position.x - b.origin.x) / f32::from(b.size.width).max(1.);
+                                if duration > 0. {
+                                    music_seek.update(cx, |m, cx| m.seek_to(duration * x.clamp(0., 1.) as f64, cx));
+                                }
+                            }
+                        })
+                        .child(canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {}).absolute().size_full()),
+                )
+            })
             .into_any_element()
     }
 }
@@ -1309,6 +1406,7 @@ impl Render for MusicTheater {
         let m = self.music.read(cx);
         let Some(track) = m.current().cloned().filter(|_| m.theater) else { return div().into_any_element() };
         m.video_view.set_overlay(None);
+        m.video_view.set_corner_radius(0.);
         let size = window.bounds().size;
         let (ww, wh) = (f32::from(size.width), f32::from(size.height));
         // Compact: ~60% of the window, never taller than it leaves room for the controls.
