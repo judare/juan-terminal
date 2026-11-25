@@ -3182,6 +3182,13 @@ impl Render for ChatView {
                 this.attachments.extend(paths.paths().iter().cloned());
                 cx.notify();
             }))
+            .drag_over::<crate::workspace::DraggedFile>(|s, _, _, _| s.opacity(0.85))
+            .on_drop(cx.listener(|this, f: &crate::workspace::DraggedFile, _, cx| {
+                if !f.is_dir && !this.attachments.contains(&f.path) {
+                    this.attachments.push(f.path.clone());
+                }
+                cx.notify();
+            }))
             .child(
                 div()
                     .flex()

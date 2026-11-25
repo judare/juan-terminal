@@ -27,6 +27,41 @@ use crate::tools_panel::{ToolsPanel, ToolsPanelEvent};
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
 use crate::theme;
 
+/// A file or folder dragged out of the sidebar tree. Dropped on a WhatsApp chat it becomes an
+/// attachment; dropped on a terminal (e.g. Claude) it types its shell-quoted path.
+#[derive(Clone)]
+pub struct DraggedFile {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+impl Render for DraggedFile {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let el = if self.is_dir {
+            crate::assets::folder_icon_el(&name, false, 16., None, false)
+        } else {
+            let (icon_path, icon_color) = crate::assets::file_icon(&name);
+            icon(icon_path, icon_color)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(5.))
+            .rounded(px(6.))
+            .bg(theme::rgb(theme::SELECTED))
+            .border_1()
+            .border_color(theme::rgb(theme::BORDER))
+            .shadow_md()
+            .text_size(px(13.))
+            .text_color(theme::rgb(theme::TEXT))
+            .child(el)
+            .child(name)
+    }
+}
+
 actions!(
     workspace,
     [
@@ -3417,6 +3452,9 @@ impl Workspace {
                             let p = path.clone();
                             cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| this.open_context_menu(e.position, p.clone(), is_dir, false, cx))
                         })
+                    })
+                    .when(!virtual_others && !gone, |d| {
+                        d.on_drag(DraggedFile { path: path.clone(), is_dir }, |f, _, _, cx| cx.new(|_| f.clone()))
                     })
                     .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
                         this.located = None;

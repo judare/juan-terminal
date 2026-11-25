@@ -1118,6 +1118,18 @@ impl Render for TerminalView {
                 window.focus(&this.focus_handle);
                 cx.stop_propagation();
             }))
+            .drag_over::<crate::workspace::DraggedFile>(|s, _, _, _| s.opacity(0.8))
+            .on_drop(cx.listener(|this, f: &crate::workspace::DraggedFile, window, cx| {
+                if this.exit_code.is_some() {
+                    return;
+                }
+                let mut text = shell_quote(&f.path.to_string_lossy());
+                text.push(' ');
+                let bytes = encode_paste(&text, this.snapshot.mode.bracketed_paste);
+                this.write_user_input(bytes, cx);
+                window.focus(&this.focus_handle);
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .flex_1()
