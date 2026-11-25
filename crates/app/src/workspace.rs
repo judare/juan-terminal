@@ -3388,12 +3388,11 @@ impl Workspace {
                     0xc3c7ce
                 };
                 let virtual_others = entry.virtual_others;
-                let (icon_path, icon_color) = if virtual_others {
-                    ("icons/folder-others.svg", 0x3fb950)
-                } else if is_dir {
-                    (if expanded { "icons/folder-open.svg" } else { "icons/folder.svg" }, if dimmed { theme::TEXT_FAINT } else { 0x8fa3bf })
+                let row_icon = if is_dir || virtual_others {
+                    crate::assets::folder_icon_el(&entry.name, expanded, 16., dimmed.then_some(theme::TEXT_FAINT), virtual_others)
                 } else {
-                    crate::assets::file_icon(&entry.name)
+                    let (icon_path, icon_color) = crate::assets::file_icon(&entry.name);
+                    icon(icon_path, if dimmed { theme::TEXT_FAINT } else { icon_color })
                 };
                 inner
                     .id(ix)
@@ -3429,7 +3428,7 @@ impl Workspace {
                         }
                     }))
                     .child(if is_dir { chevron(expanded) } else { div().w(px(12.)).flex_none() })
-                    .child(icon(icon_path, if dimmed && !is_dir { theme::TEXT_FAINT } else { icon_color }))
+                    .child(row_icon)
                     .child(
                         div()
                             .flex_1()
