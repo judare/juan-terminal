@@ -20,7 +20,7 @@ use whatsapp_rust::wacore::types::presence::{ChatPresence, ReceiptType};
 
 use crate::convert::{self, Parsed};
 use crate::ipc::{self, SendRequest};
-use crate::model::{MsgKind, MsgStatus, Status, Update};
+use crate::model::{GroupMember, MsgKind, MsgStatus, Status, Update};
 use crate::store::{ChatMeta, NewMessage, Store, hidden_chat, now};
 
 /// Sender id stored for our own messages.
@@ -48,6 +48,10 @@ struct Shared {
     transcribing: Mutex<HashSet<(String, String)>>,
     /// One whisper at a time (it already uses every core).
     whisper: tokio::sync::Mutex<()>,
+    /// Group participants fetched this session (see `group_members`).
+    members: Mutex<HashMap<String, Vec<GroupMember>>>,
+    /// Background media prefetch: a few downloads at a time (see `prefetch`).
+    prefetch_slots: tokio::sync::Semaphore,
 }
 
 impl Shared {
@@ -166,6 +170,8 @@ impl WhatsApp {
                 avatars_running: Mutex::new(false),
                 avatar_tried: Mutex::new(HashSet::new()),
                 transcribing: Mutex::new(HashSet::new()),
+                members: Mutex::new(HashMap::new()),
+                prefetch_slots: tokio::sync::Semaphore::new(4),
                 whisper: tokio::sync::Mutex::new(()),
             });
             let wa = WhatsApp { shared, rt };
@@ -415,6 +421,88 @@ impl WhatsApp {
         });
     }
 
+    /// Members of a group as last fetched (None until `fetch_group_members` answers).
+    pub fn group_members(&self, chat: &str) -> Option<Vec<GroupMember>> {
+        self.shared.members.lock().unwrap().get(chat).cloned()
+    }
+
+    /// Ask the server for a group's participants; emits `Update::Group(chat)` when they arrive.
+    pub fn fetch_group_members(&self, chat: &str) {
+        let Some(client) = self.shared.client() else { return };
+        let Some(j) = parse_jid(chat) else { return };
+        let (shared, chat) = (self.shared.clone(), chat.to_string());
+        let me = self.own_jid();
+        self.rt.spawn(async move {
+            let meta = match client.groups().get_metadata(&j).await {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("whatsapp group members {chat}: {e}");
+                    return;
+                }
+            };
+            let store = &shared.store;
+            let mut members: Vec<GroupMember> = meta
+                .participants
+                .iter()
+                .map(|p| {
+                    let lid = p.lid.clone().or_else(|| p.jid.is_lid().then(|| p.jid.clone())).map(|j| j.to_non_ad_string());
+                    let pn = p.phone_number.clone().or_else(|| (!p.jid.is_lid()).then(|| p.jid.clone())).map(|j| j.to_non_ad_string());
+                    if let (Some(l), Some(n)) = (&lid, &pn) {
+                        store.set_alias(l, n);
+                    }
+                    let jid = pn.clone().or(lid).map(|j| store.canonical(&j)).unwrap_or_else(|| p.jid.to_string());
+                    let mut name = store.display_name(&jid);
+                    let phone = crate::store::phone_label(&jid);
+                    if name == phone && let Some(u) = p.username.as_ref().filter(|u| !u.is_empty()) {
+                        name = format!("~{u}");
+                    }
+                    GroupMember { me: me.as_deref() == Some(jid.as_str()), name, phone, admin: p.is_admin(), jid }
+                })
+                .collect();
+            // Me first, then admins, then saved contacts, then the rest; by name.
+            let rank = |m: &GroupMember| (!m.me, !m.admin, m.name.starts_with('~') || m.name == m.phone, m.name.to_lowercase());
+            members.sort_by_key(rank);
+            shared.members.lock().unwrap().insert(chat.clone(), members);
+            shared.emit(Update::Group(chat));
+        });
+    }
+
+    /// Delete one of my messages for everyone (revoke): it shows "Se eliminó este mensaje".
+    pub fn delete_for_everyone(&self, chat: &str, id: &str) {
+        let (shared, chat, id) = (self.shared.clone(), chat.to_string(), id.to_string());
+        self.rt.spawn(async move {
+            let Some(client) = shared.client() else { return };
+            let Some(jid) = parse_jid(&chat) else { return };
+            match client.revoke_message(jid, id.clone(), whatsapp_rust::RevokeType::Sender).await {
+                Ok(()) => {
+                    shared.store.revoke(&chat, &id);
+                    shared.emit(Update::Messages(chat.clone()));
+                    shared.emit(Update::Chats);
+                }
+                Err(e) => shared.emit(Update::SendFailed { chat: chat.clone(), error: format!("No se pudo eliminar: {e}") }),
+            }
+        });
+    }
+
+    /// Delete a message only on my devices (synced to the phone via app state).
+    pub fn delete_for_me(&self, chat: &str, id: &str, ts: i64) {
+        let (shared, chat, id) = (self.shared.clone(), chat.to_string(), id.to_string());
+        // Gone from this view right away; the app-state sync follows.
+        let origin = shared.store.message_origin(&chat, &id);
+        shared.store.delete_message(&chat, &id);
+        shared.emit(Update::Messages(chat.clone()));
+        shared.emit(Update::Chats);
+        self.rt.spawn(async move {
+            let Some(client) = shared.client() else { return };
+            let Some(jid) = parse_jid(&chat) else { return };
+            let (sender, from_me) = origin.unwrap_or_default();
+            let participant = (chat.ends_with("@g.us") && !from_me).then(|| parse_jid(&sender)).flatten();
+            if let Err(e) = client.chat_actions().delete_message_for_me(&jid, participant.as_ref(), &id, from_me, true, Some(ts)).await {
+                log::warn!("whatsapp delete_for_me {id}: {e}");
+            }
+        });
+    }
+
     /// Where the full-size profile picture of `chat` is cached (see `fetch_full_avatar`).
     pub fn full_avatar_path(&self, chat: &str) -> PathBuf {
         self.shared.dir.join("avatars").join(format!("full-{}.jpg", safe(chat)))
@@ -459,6 +547,30 @@ impl WhatsApp {
             }
             shared.emit(Update::Messages(key.0));
         });
+    }
+
+    /// Download these messages' media in the background, in order, a few at a time, so photos
+    /// are ready before they're scrolled into view. A `download` for something still queued
+    /// here isn't held back: whichever starts first does it.
+    pub fn prefetch(&self, chat: &str, ids: Vec<String>) {
+        for id in ids {
+            let (shared, chat) = (self.shared.clone(), chat.to_string());
+            self.rt.spawn(async move {
+                let Ok(_slot) = shared.prefetch_slots.acquire().await else { return };
+                let key = (chat, id);
+                if !shared.downloading.lock().unwrap().insert(key.clone()) {
+                    return;
+                }
+                let had = shared.store.message(&key.0, &key.1).is_some_and(|m| m.media.is_some());
+                let res = download(&shared, &key.0, &key.1).await;
+                shared.downloading.lock().unwrap().remove(&key);
+                match res {
+                    Ok(_) if !had => shared.emit(Update::Messages(key.0)),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("whatsapp prefetch {}: {e}", key.1),
+                }
+            });
+        }
     }
 
     /// Transcribe a voice note with whisper (downloading it first) and store the text, so it's

@@ -201,6 +201,8 @@ pub struct Music {
     downloaded: HashSet<String>,
     downloads: HashMap<String, DownloadJob>,
     download_failed: HashSet<String>,
+    /// 👍 (true) / 👎 (false) by id; logged to the personal brain too.
+    ratings: HashMap<String, bool>,
     /// Bytes used by the local copies (songs, podcasts, videos); None while measuring.
     disk_usage: Option<u64>,
     /// Ids with a complete `.m4a` in the song cache (refreshed with `disk_usage`).
@@ -267,6 +269,13 @@ pub fn init(cx: &mut App) {
                     music_engine::MenuCommand::Remote(ev) => music.update(cx, |m, cx| m.remote(ev, cx)).is_ok(),
                     music_engine::MenuCommand::Stop => music.update(cx, |m, cx| m.stop(cx)).is_ok(),
                     music_engine::MenuCommand::OpenSearch => cx.update(crate::launcher::open_music).is_ok(),
+                    music_engine::MenuCommand::Rate(good) => music
+                        .update(cx, |m, cx| {
+                            if let Some(t) = m.current().cloned() {
+                                m.rate(&t, good, cx);
+                            }
+                        })
+                        .is_ok(),
                 };
                 if !ok {
                     break;
@@ -324,6 +333,7 @@ impl Music {
             library: load_library(),
             downloads: HashMap::new(),
             download_failed: HashSet::new(),
+            ratings: load_ratings(),
             disk_usage: None,
             _downloads_tick: None,
             _tick: None,
@@ -772,6 +782,7 @@ impl Music {
             }
         }
         if before != (self.position as i64, self.buffering, self.duration as i64) {
+            self.sync_status_item();
             cx.notify();
         }
         true
@@ -783,7 +794,7 @@ impl Music {
             music_engine::set_status_item(None);
             return;
         };
-        music_engine::set_status_item(Some((&t.title, &t.channel, self.playing)));
+        self.sync_status_item();
         let thumb = t.thumb_path();
         music_engine::set_now_playing(Some(NowPlaying {
             title: &t.title,
@@ -792,6 +803,22 @@ impl Music {
             elapsed: self.position,
             playing: self.playing,
             artwork: thumb.exists().then_some(thumb.as_path()),
+        }));
+    }
+
+    /// The menu bar mini player (cheap: called every second while playing).
+    fn sync_status_item(&self) {
+        let Some(t) = self.current() else { return };
+        let thumb = t.thumb_path();
+        music_engine::set_status_item(Some(music_engine::StatusInfo {
+            title: &t.title,
+            artist: &t.channel,
+            playing: self.playing,
+            elapsed: self.position,
+            duration: self.duration,
+            artwork: thumb.exists().then_some(thumb.as_path()),
+            rating: self.rating(&t.id),
+            accent: t.mode.color(),
         }));
     }
 
@@ -969,9 +996,15 @@ impl Music {
         self.start_download(track.clone(), true, None, cx);
     }
 
+    /// Whether `id` has a local copy (downloaded podcast / video or cached song) or one on its way.
+    pub fn has_local_copy(&self, id: &str) -> bool {
+        self.downloaded.contains(id) || self.downloads.contains_key(id) || self.cached_songs.contains(id)
+    }
+
     /// Cancel a download in progress or delete the local copy (and its library entry).
     pub fn remove_download(&mut self, id: &str, cx: &mut Context<Self>) {
         self.forget_download(id);
+        self.cached_songs.remove(id);
         self.refresh_disk_usage(cx);
         cx.notify();
     }
@@ -1124,7 +1157,9 @@ impl Music {
         let mut continuing: Vec<&Progress> = self.progress.values().filter(|p| p.track.mode == mode && !p.finished && p.pos > 20.).collect();
         continuing.sort_by(|a, b| b.at.cmp(&a.at));
         let continuing: Vec<Track> = continuing.into_iter().take(5).map(|p| p.track.clone()).collect();
-        let exclude: HashSet<String> = if mode == Mode::Music { HashSet::new() } else { self.progress.keys().cloned().collect() };
+        let mut exclude: HashSet<String> = if mode == Mode::Music { HashSet::new() } else { self.progress.keys().cloned().collect() };
+        // Never suggest what got a 👎.
+        exclude.extend(self.ratings.iter().filter(|(_, g)| !**g).map(|(id, _)| id.clone()));
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         // Same topics all day unless refreshed by hand.
         let seed = if force { nanos } else { nanos / 86_400_000_000_000 };
@@ -1150,6 +1185,40 @@ impl Music {
             });
         })
         .detach();
+    }
+
+    pub fn rating(&self, id: &str) -> Option<bool> {
+        self.ratings.get(id).copied()
+    }
+
+    /// 👍 / 👎 on a track; the same one again clears it. Saved locally and appended to the
+    /// personal brain's log (committed there), which the preferences task reads.
+    pub fn rate(&mut self, track: &Track, good: bool, cx: &mut Context<Self>) {
+        let rating = if self.ratings.get(&track.id) == Some(&good) { None } else { Some(good) };
+        match rating {
+            Some(g) => {
+                self.ratings.insert(track.id.clone(), g);
+            }
+            None => {
+                self.ratings.remove(&track.id);
+            }
+        }
+        // 👎: out of the current suggestions right away.
+        if rating == Some(false) {
+            for (_, s) in self.suggestions.values_mut() {
+                s.tracks.retain(|t| t.id != track.id);
+            }
+        }
+        self.sync_status_item();
+        let snapshot = self.ratings.clone();
+        let track = track.clone();
+        std::thread::spawn(move || {
+            save_json(&ratings_file(), &snapshot);
+            if let Err(e) = log_rating_to_brain(&track, rating) {
+                crate::startup_log(&format!("music rating → personal brain: {e}"));
+            }
+        });
+        cx.notify();
     }
 
     /// ✕ on a suggestion's topic: never suggest it again (moved to `avoid` in the preferences,
@@ -1527,6 +1596,89 @@ fn library_file() -> PathBuf {
 
 fn load_library() -> Vec<LibraryEntry> {
     std::fs::read(library_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+// ---- ratings (👍 / 👎) ----------------------------------------------------------------------------
+
+fn ratings_file() -> PathBuf {
+    music_dir().join("ratings.json")
+}
+
+fn load_ratings() -> HashMap<String, bool> {
+    std::fs::read(ratings_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// The personal brain repo (`$JUAN_BRAIN_DIR`, else ~/Desktop/repositories/personal brain).
+pub fn brain_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("JUAN_BRAIN_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join("Desktop/repositories/personal brain")
+}
+
+/// Log of ratings inside the brain (read by the preferences task).
+pub const BRAIN_RATINGS_FILE: &str = "calificaciones-media.md";
+
+const BRAIN_RATINGS_HEADER: &str = "# Calificaciones de música, podcasts y videos\n\n\
+Log automático desde el reproductor de juan-terminal: una línea por calificación (👍 gustó, 👎 no gustó, ⊘ se quitó). \
+La tarea semanal de preferencias lo lee para sugerir más de lo que gusta y nada de lo que no.\n\n";
+
+/// Append one line to the brain's ratings log, commit it there (only that file) and push.
+fn log_rating_to_brain(track: &Track, rating: Option<bool>) -> Result<(), String> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = brain_dir();
+    if !dir.join(".git").exists() {
+        return Err(format!("{} no es un repo git", dir.display()));
+    }
+    let path = dir.join(BRAIN_RATINGS_FILE);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.is_empty() {
+        text.push_str(BRAIN_RATINGS_HEADER);
+    } else if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let mark = match rating {
+        Some(true) => "👍",
+        Some(false) => "👎",
+        None => "⊘",
+    };
+    let clean = |s: &str| s.replace(['\n', '\r'], " ").trim().to_string();
+    let mut line = format!("- {} · {mark} · {} · {}", chrono::Local::now().format("%Y-%m-%d %H:%M"), track.mode.label(), clean(&track.title));
+    if !track.channel.is_empty() {
+        line.push_str(&format!(" — {}", clean(&track.channel)));
+    }
+    if let Some(topic) = &track.topic {
+        line.push_str(&format!(" · tema: {}", clean(topic)));
+    }
+    line.push_str(&format!(" · https://youtu.be/{}\n", track.id));
+    text.push_str(&line);
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+
+    let git = |args: &[&str]| -> Result<(), String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            // Never block on a password / host-key prompt (runs from the GUI, no terminal).
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect()) }
+    };
+    git(&["add", "--", BRAIN_RATINGS_FILE])?;
+    let title: String = clean(&track.title).chars().take(50).collect();
+    let msg = format!("{} {}: {title}", if rating.is_some() { "Calificar" } else { "Quitar calificación" }, mark);
+    git(&["commit", "-q", "-m", &msg, "--", BRAIN_RATINGS_FILE])?;
+    // Push; if the remote moved ahead, rebase onto it and retry once.
+    if git(&["push", "-q"]).is_err() {
+        git(&["pull", "-q", "--rebase", "--autostash"]).map_err(|e| format!("push: pull --rebase falló: {e}"))?;
+        git(&["push", "-q"]).map_err(|e| format!("push falló: {e}"))?;
+    }
+    Ok(())
 }
 
 fn now_secs() -> i64 {

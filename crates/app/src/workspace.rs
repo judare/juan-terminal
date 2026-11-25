@@ -1783,6 +1783,10 @@ impl Workspace {
                 this.open_file(&path, true, window, cx);
             }
             EditorEvent::AskClaude { jid, instruction } => this.ask_claude_about_chat(jid, instruction, cx),
+            EditorEvent::OpenChat { jid, name } => {
+                this.pending_chat = Some((jid.clone(), name.clone()));
+                cx.notify();
+            }
         });
         self._subscriptions.push(sub);
     }
