@@ -106,6 +106,8 @@ pub struct NewMessage {
     pub quoted_sender: Option<String>,
     pub quoted_text: Option<String>,
     pub quoted_kind: Option<MsgKind>,
+    /// Forwarding score (0 = not forwarded).
+    pub forwarded: u32,
     pub mime: Option<String>,
     pub file_name: Option<String>,
     pub duration: Option<u32>,
@@ -157,7 +159,26 @@ impl Store {
         // Project (juan-terminal project id) a label is linked to: Claude's suggested replies
         // in those chats may read that project's code, servers and connectors.
         let _ = conn.execute("ALTER TABLE labels ADD COLUMN project TEXT", []);
+        // Forwarding score (0 = not forwarded). Newly added: backfill from the stored protos.
+        if conn.execute("ALTER TABLE messages ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0", []).is_ok() {
+            Self::backfill_forwarded(&conn);
+        }
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    fn backfill_forwarded(conn: &Connection) {
+        let rows: Vec<(String, String, Vec<u8>)> = conn
+            .prepare("SELECT chat, id, proto FROM messages WHERE proto IS NOT NULL")
+            .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|rows| rows.flatten().collect()))
+            .unwrap_or_default();
+        for (chat, id, proto) in rows {
+            let Some(msg) = crate::convert::decode(&proto) else { continue };
+            if let crate::convert::Parsed::Message(c) = crate::convert::parse(&msg, false)
+                && c.forwarded > 0
+            {
+                let _ = conn.execute("UPDATE messages SET forwarded=?3 WHERE chat=?1 AND id=?2", params![chat, id, c.forwarded]);
+            }
+        }
     }
 
     /// Read-only handle (MCP process). Fails if the cache doesn't exist yet.
@@ -466,14 +487,14 @@ impl Store {
         if exists {
             // History can deliver a message we already got live: keep our status/seen, fill blanks.
             let _ = db.execute(
-                "UPDATE messages SET proto=COALESCE(proto,?3), status=MAX(status,?4) WHERE chat=?1 AND id=?2",
-                params![m.chat, m.id, m.proto, m.status.as_i64()],
+                "UPDATE messages SET proto=COALESCE(proto,?3), status=MAX(status,?4), forwarded=MAX(forwarded,?5) WHERE chat=?1 AND id=?2",
+                params![m.chat, m.id, m.proto, m.status.as_i64(), m.forwarded],
             );
             return false;
         }
         let _ = db.execute(
-            "INSERT INTO messages(chat,id,sender,from_me,ts,kind,text,status,seen,quoted_id,quoted_sender,quoted_text,quoted_kind,mime,file_name,duration,width,height,proto)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            "INSERT INTO messages(chat,id,sender,from_me,ts,kind,text,status,seen,quoted_id,quoted_sender,quoted_text,quoted_kind,mime,file_name,duration,width,height,proto,forwarded)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 m.chat,
                 m.id,
@@ -494,6 +515,7 @@ impl Store {
                 m.width,
                 m.height,
                 m.proto,
+                m.forwarded,
             ],
         );
         let _ = db.execute("INSERT OR IGNORE INTO chats(jid,is_group) VALUES(?1,?2)", params![m.chat, m.chat.ends_with("@g.us")]);
@@ -613,7 +635,7 @@ impl Store {
             .collect()
     }
 
-    const MSG_COLS: &'static str = "chat,id,sender,from_me,ts,kind,text,status,edited,quoted_id,quoted_sender,quoted_text,quoted_kind,mime,file_name,duration,width,height,media,transcript";
+    const MSG_COLS: &'static str = "chat,id,sender,from_me,ts,kind,text,status,edited,quoted_id,quoted_sender,quoted_text,quoted_kind,mime,file_name,duration,width,height,media,transcript,forwarded";
 
     fn row_to_msg(db: &Connection, r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
         let chat: String = r.get(0)?;
@@ -652,6 +674,7 @@ impl Store {
             height: r.get(17)?,
             media: media.map(PathBuf::from).filter(|p| p.exists()),
             transcript: r.get::<_, Option<String>>(19).ok().flatten(),
+            forwarded: r.get(20).unwrap_or(0),
         })
     }
 

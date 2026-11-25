@@ -28,6 +28,15 @@ pub const ME: &str = "me";
 /// Minimum gap between two sends requested by Claude.
 const CLAUDE_SEND_GAP: Duration = Duration::from_secs(3);
 
+/// What the app did with a send Claude requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendAnswer {
+    Send,
+    Reject,
+    /// Put in the chat's composer for the user to review and send.
+    Drafted,
+}
+
 struct Shared {
     store: Arc<Store>,
     dir: PathBuf,
@@ -38,7 +47,7 @@ struct Shared {
     /// Chats open in a tab: incoming messages there are read right away.
     open: Mutex<HashSet<String>>,
     downloading: Mutex<HashSet<(String, String)>>,
-    pending: Mutex<HashMap<u64, std::sync::mpsc::Sender<bool>>>,
+    pending: Mutex<HashMap<u64, std::sync::mpsc::Sender<SendAnswer>>>,
     next_id: AtomicU64,
     last_claude_send: Mutex<Option<Instant>>,
     avatars_running: Mutex<bool>,
@@ -393,6 +402,19 @@ impl WhatsApp {
         });
     }
 
+    /// Forward message `id` of `from` to each chat in `to` (marked "Reenviado"; media is reused,
+    /// not uploaded again).
+    pub fn forward(&self, from: &str, id: &str, to: Vec<String>) {
+        let (shared, from, id) = (self.shared.clone(), from.to_string(), id.to_string());
+        self.rt.spawn(async move {
+            for chat in to {
+                if let Err(e) = forward(&shared, &from, &id, &chat).await {
+                    shared.emit(Update::SendFailed { chat: chat.clone(), error: e });
+                }
+            }
+        });
+    }
+
     pub fn send_sticker(&self, chat: &str, sticker_id: &str) {
         let (shared, chat, id) = (self.shared.clone(), chat.to_string(), sticker_id.to_string());
         self.rt.spawn(async move {
@@ -604,9 +626,9 @@ impl WhatsApp {
     }
 
     /// The user's answer to a send requested by Claude.
-    pub fn answer_send(&self, id: u64, approved: bool) {
+    pub fn answer_send(&self, id: u64, answer: SendAnswer) {
         if let Some(tx) = self.shared.pending.lock().unwrap().remove(&id) {
-            let _ = tx.send(approved);
+            let _ = tx.send(answer);
         }
     }
 
@@ -690,10 +712,14 @@ fn serve_ipc(stream: std::os::unix::net::UnixStream, shared: &Arc<Shared>, handl
     let (tx, rx) = std::sync::mpsc::channel();
     shared.pending.lock().unwrap().insert(req.id, tx);
     shared.emit(Update::ConfirmSend(req.clone()));
-    let approved = rx.recv_timeout(Duration::from_secs(600)).unwrap_or(false);
+    let answer = rx.recv_timeout(Duration::from_secs(600)).unwrap_or(SendAnswer::Reject);
     shared.pending.lock().unwrap().remove(&req.id);
-    if !approved {
-        return reply(false, "El usuario rechazó el envío en juan-terminal (o no respondió).".into());
+    match answer {
+        SendAnswer::Send => {}
+        SendAnswer::Drafted => {
+            return reply(true, format!("No se envió: quedó como borrador en el compositor del chat {} para que el usuario lo revise y lo envíe él mismo.", req.chat_name));
+        }
+        SendAnswer::Reject => return reply(false, "El usuario rechazó el envío en juan-terminal (o no respondió).".into()),
     }
     *shared.last_claude_send.lock().unwrap() = Some(Instant::now());
     let result: Result<(), String> = handle.block_on(async {
@@ -1149,6 +1175,7 @@ async fn store_parsed(shared: &Shared, chat: &str, id: &str, sender: &str, from_
                 quoted_sender,
                 quoted_text: c.quoted_text,
                 quoted_kind: c.quoted_kind,
+                forwarded: c.forwarded,
                 mime: c.mime,
                 file_name: c.file_name,
                 duration: c.duration,
@@ -1437,6 +1464,51 @@ async fn send_file(shared: &Shared, chat: &str, path: &Path, caption: &str, quot
         row.file_name = file_name;
     }
     deliver(shared, chat, msg, row, Some(cached)).await
+}
+
+/// Context of a forwarded message (drops any quote the original had).
+fn forwarded_context(score: u32) -> MessageField<wa::ContextInfo> {
+    MessageField::some(wa::ContextInfo { is_forwarded: Some(true), forwarding_score: Some(score), ..Default::default() })
+}
+
+async fn forward(shared: &Shared, from: &str, id: &str, chat: &str) -> Result<(), String> {
+    let m = shared.store.message(from, id).ok_or("Mensaje no encontrado")?;
+    if m.kind == MsgKind::Revoked {
+        return Err("No se puede reenviar un mensaje eliminado".into());
+    }
+    let original = shared.store.proto(from, id).and_then(|p| convert::decode(&p)).map(|p| p.get_base_message().clone());
+    // Media keeps its upload (url / keys); everything else goes as forwarded text.
+    let media_msg = original.filter(|_| m.kind.has_media()).and_then(|mut o| {
+        macro_rules! fwd {
+            ($($f:ident),*) => {
+                $(if let Some(x) = o.$f.as_option_mut() {
+                    let score = x.context_info.as_option().and_then(|c| c.forwarding_score).unwrap_or(0) + 1;
+                    x.context_info = forwarded_context(score);
+                    return Some(wa::Message { $f: o.$f.clone(), ..Default::default() });
+                })*
+            };
+        }
+        fwd!(image_message, video_message, audio_message, document_message, sticker_message);
+        None
+    });
+    let msg = media_msg.unwrap_or_else(|| wa::Message {
+        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage { text: Some(m.text.clone()), context_info: forwarded_context(1), ..Default::default() }),
+        ..Default::default()
+    });
+    let as_text = msg.extended_text_message.is_set();
+    let media = if as_text { None } else { m.media.clone() };
+    let row = NewMessage {
+        kind: Some(if as_text { MsgKind::Text } else { m.kind }),
+        forwarded: m.forwarded + 1,
+        text: m.text.clone(),
+        mime: m.mime.clone(),
+        file_name: m.file_name.clone(),
+        duration: m.duration,
+        width: m.width,
+        height: m.height,
+        ..Default::default()
+    };
+    deliver(shared, chat, msg, row, media).await
 }
 
 async fn send_sticker(shared: &Shared, chat: &str, fav_id: &str) -> Result<(), String> {

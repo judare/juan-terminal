@@ -1314,7 +1314,7 @@ impl MusicCard {
             cx.emit(MusicCardEvent::OpenTheater)
         });
         let m = music.read(cx);
-        use crate::video_player::{OverlayInfo, OVERLAY_BAR_BOTTOM, OVERLAY_BUTTON, OVERLAY_GAP, OVERLAY_MARGIN, OVERLAY_PAD, OVERLAY_PLAY, OVERLAY_SKIP, OVERLAY_SKIP_GAP};
+        use crate::video_player::{OverlayInfo, OVERLAY_BAR_BOTTOM, OVERLAY_BUTTON, OVERLAY_GAP, OVERLAY_MARGIN, OVERLAY_PAD, OVERLAY_PLAY, OVERLAY_ROW_BOTTOM, OVERLAY_SKIP, OVERLAY_SKIP_GAP, OVERLAY_VOL_ICON, OVERLAY_VOL_W};
         const SIDE: f32 = 6.;
         let video_w = (self.width - 2. * SIDE).max(80.);
         let video_h = video_w * 9. / 16.;
@@ -1337,6 +1337,7 @@ impl MusicCard {
             progress: if m.duration > 0. { (m.position / m.duration) as f32 } else { 0. },
             time,
             accent: (accent.r, accent.g, accent.b),
+            volume: m.volume,
         }));
         let on = |f: fn(&mut Music, &mut Context<Music>)| {
             let music = music.clone();
@@ -1350,6 +1351,19 @@ impl MusicCard {
         let b2 = bounds.clone();
         let music_seek = music.clone();
         let duration = m.duration;
+        let vol_bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+        let set_vol = {
+            let vol_bounds = vol_bounds.clone();
+            let music = music.clone();
+            move |x: Pixels, cx: &mut App| {
+                if let Some(b) = vol_bounds.get() {
+                    let v = f32::from(x - b.origin.x) / f32::from(b.size.width).max(1.);
+                    music.update(cx, |m, cx| m.set_volume(v, cx));
+                }
+            }
+        };
+        let set_vol_move = set_vol.clone();
+        let music_wheel = music.clone();
         div()
             .id("music-card-video")
             .flex_none()
@@ -1361,6 +1375,19 @@ impl MusicCard {
             .overflow_hidden()
             .bg(gpui::black())
             .on_hover(on_hover)
+            // Wheel / two-finger scroll over the picture: volume.
+            .when(video_ready, |d| {
+                d.on_scroll_wheel(move |e: &gpui::ScrollWheelEvent, _, cx| {
+                    let dy = f32::from(e.delta.pixel_delta(px(16.)).y);
+                    if dy != 0. {
+                        cx.stop_propagation();
+                        music_wheel.update(cx, |m, cx| {
+                            let v = m.volume + dy * 0.004;
+                            m.set_volume(v, cx)
+                        });
+                    }
+                })
+            })
             .when(video_ready, |d| d.child(crate::video_player::player_slot(m.video_view.clone())))
             .when(!video_ready, |d| {
                 // No native view yet: GPUI paints the escape hatches itself.
@@ -1435,6 +1462,37 @@ impl MusicCard {
                             }
                         })
                         .child(canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {}).absolute().size_full()),
+                )
+                .child(
+                    // Speaker (mute) at the left of the volume slider.
+                    overlay_target("music-card-video-mute", OVERLAY_VOL_ICON)
+                        .absolute()
+                        .right(px(OVERLAY_PAD + OVERLAY_VOL_W + 4.))
+                        .bottom(px(OVERLAY_ROW_BOTTOM - OVERLAY_VOL_ICON / 2.))
+                        .tooltip(tip("Silenciar"))
+                        .on_click(on(|m, cx| m.toggle_mute(cx))),
+                )
+                .child(
+                    // Volume slider: click or drag.
+                    div()
+                        .id("music-card-video-volume")
+                        .absolute()
+                        .right(px(OVERLAY_PAD))
+                        .bottom(px(OVERLAY_ROW_BOTTOM - 7.))
+                        .w(px(OVERLAY_VOL_W))
+                        .h(px(14.))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            set_vol(e.position.x, cx);
+                        })
+                        .on_mouse_move(move |e: &gpui::MouseMoveEvent, _, cx| {
+                            if e.pressed_button == Some(MouseButton::Left) {
+                                set_vol_move(e.position.x, cx);
+                            }
+                        })
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(canvas(move |b, _, _| vol_bounds.set(Some(b)), |_, _, _, _| {}).absolute().size_full()),
                 )
             })
             .into_any_element()

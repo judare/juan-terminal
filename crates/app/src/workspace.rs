@@ -347,6 +347,8 @@ impl Workspace {
             cx.observe_window_activation(window, |this, window, cx| {
                 let active = window.is_window_active();
                 this.stay_awake.set(active);
+                // Repaint so a shared video player moves to the window just focused.
+                cx.notify();
                 if active {
                     crate::launcher::set_last_workspace(window.window_handle(), cx);
                     this.on_window_activated(cx);
@@ -1326,6 +1328,7 @@ impl Workspace {
             view
         };
         if let Some(chat) = view.read(cx).chat.clone() {
+            chat.update(cx, |c, cx| c.take_draft(cx));
             let focus = chat.read(cx).composer_focus(cx);
             window.focus(&focus);
         }

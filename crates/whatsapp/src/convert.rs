@@ -32,12 +32,17 @@ pub struct Content {
     pub quoted_sender: Option<String>,
     pub quoted_text: Option<String>,
     pub quoted_kind: Option<MsgKind>,
+    /// Forwarding score (0 = not forwarded; ≥5 = "forwarded many times").
+    pub forwarded: u32,
     /// Serialized base message (kept for media download / quoting / forwarding stickers).
     pub proto: Option<Vec<u8>>,
 }
 
 fn quote_from(ci: Option<&wa::ContextInfo>, c: &mut Content) {
     let Some(ci) = ci else { return };
+    if ci.is_forwarded.unwrap_or(false) || ci.forwarding_score.unwrap_or(0) > 0 {
+        c.forwarded = ci.forwarding_score.unwrap_or(0).max(1);
+    }
     let Some(id) = ci.stanza_id.clone().filter(|s| !s.is_empty()) else { return };
     c.quoted_id = Some(id);
     c.quoted_sender = ci.participant.clone();

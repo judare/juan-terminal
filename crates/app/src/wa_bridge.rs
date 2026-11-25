@@ -1,10 +1,10 @@
 //! App-wide WhatsApp glue (one per process, not per window): reconnects at launch, macOS
-//! notifications, the unread count on the Dock badge, and the approval dialog for messages
-//! Claude wants to send through the MCP tool.
+//! notifications, the unread count on the Dock badge, and drafts of messages Claude wants to
+//! send through the MCP tool (they go to the chat's composer, never straight out).
 #![allow(unexpected_cfgs)] // objc 0.2 macros
 
 use futures::StreamExt;
-use gpui::{App, PromptLevel};
+use gpui::App;
 use whatsapp::{Update, WhatsApp};
 
 /// Dock-badge owner id for WhatsApp's unread count (windows use their entity ids).
@@ -60,38 +60,20 @@ fn listen(cx: &mut App) {
                     }
                 }
                 Update::ConfirmSend(req) => {
-                    let id = req.id;
-                    let mut detail = format!("Para: {}\n", req.chat_name);
-                    if !req.text.is_empty() {
-                        detail.push_str(&format!("\n{}\n", req.text));
-                    }
-                    if !req.files.is_empty() {
-                        detail.push_str("\nAdjuntos:\n");
-                        for f in &req.files {
-                            detail.push_str(&format!("• {}\n", f.display()));
+                    // Never sent straight away: the message lands in the chat's composer, where
+                    // the user reviews, edits and sends it.
+                    let (id, jid, name) = (req.id, req.chat.clone(), req.chat_name.clone());
+                    crate::chat_view::queue_draft(req);
+                    WhatsApp::global().answer_send(id, whatsapp::SendAnswer::Drafted);
+                    let _ = cx.update(|cx| {
+                        let ws = cx
+                            .active_window()
+                            .and_then(|w| w.downcast::<crate::workspace::Workspace>())
+                            .or_else(|| crate::workspace::workspace_windows(cx).into_iter().next());
+                        if let Some(ws) = ws {
+                            let _ = ws.update(cx, |w, window, cx| w.open_chat(&jid, &name, window, cx));
                         }
-                    }
-                    let answer = cx
-                        .update(|cx| {
-                            let window = cx.active_window().or_else(|| cx.windows().into_iter().next())?;
-                            window
-                                .update(cx, |_, window, cx| {
-                                    window.prompt(PromptLevel::Warning, "Claude quiere enviar un mensaje de WhatsApp", Some(&detail), &["Enviar", "No enviar"], cx)
-                                })
-                                .ok()
-                        })
-                        .ok()
-                        .flatten();
-                    // Wait off the update loop so other updates keep flowing meanwhile.
-                    cx.background_executor()
-                        .spawn(async move {
-                            let approved = match answer {
-                                Some(rx) => rx.await == Ok(0),
-                                None => false,
-                            };
-                            WhatsApp::global().answer_send(id, approved);
-                        })
-                        .detach();
+                    });
                 }
                 _ => {}
             }
