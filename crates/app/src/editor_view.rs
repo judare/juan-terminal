@@ -1266,6 +1266,39 @@ impl EditorView {
         }));
     }
 
+    /// ⌘-click on a URL opens it in the browser; on a file path (relative to this file's folder
+    /// or any folder above it), opens the file.
+    fn open_link_at(&mut self, pos: usize, cx: &mut Context<Self>) -> bool {
+        let (line, col) = self.doc.line_col(pos);
+        let text = self.doc.line(line).to_string();
+        let text = text.trim_end_matches(['\n', '\r']).to_string();
+        if let Some(url) = crate::terminal_view::url_at(std::slice::from_ref(&text), &[false], 0, col) {
+            cx.open_url(&url);
+            return true;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let Some((a, b)) = crate::terminal_view::token_at(&chars, col) else { return false };
+        let tok: String = chars[a..b].iter().collect();
+        if !tok.contains('/') && !tok.contains('.') {
+            return false;
+        }
+        let dir = self.doc.path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let found = match dir {
+            Some(d) => d.ancestors().find_map(|anc| crate::terminal_view::resolve_path(&tok, Some(anc))),
+            None => crate::terminal_view::resolve_path(&tok, None),
+        };
+        let Some((path, l, c)) = found else { return false };
+        if self.doc.path.as_ref() == Some(&path) && l.is_none() {
+            return false;
+        }
+        if path.is_dir() {
+            cx.reveal_path(&path);
+        } else {
+            cx.emit(EditorEvent::OpenLocation { path, line: l.unwrap_or(1).saturating_sub(1), character: c.unwrap_or(1).saturating_sub(1) });
+        }
+        true
+    }
+
     fn go_to_definition(&mut self, cx: &mut Context<Self>) {
         let Some(server) = self.lsp.iter().find(|s| s.name == "tsgo").cloned() else { return };
         let Some(path) = self.doc.path.clone() else { return };
@@ -1456,6 +1489,9 @@ impl EditorView {
             return;
         }
         self.doc.clear_extra();
+        if e.modifiers.platform && e.click_count == 1 && self.open_link_at(pos, cx) {
+            return;
+        }
         if e.modifiers.platform && e.click_count == 1 && !self.markdown_live {
             self.doc.set_cursor(pos, false);
             self.go_to_definition(cx);
