@@ -177,6 +177,8 @@ pub struct TerminalView {
     pub dev_dir: Option<PathBuf>,
     pub claude_status: Option<ClaudeStatus>,
     claude_menu: Option<ClaudeMenu>,
+    /// Waiting for the user to pick an element in Brave (inspector button).
+    picking: bool,
     /// Claude Code is the foreground process (updated each render).
     claude_fg: bool,
     hover_cell: Option<(usize, usize)>,
@@ -266,6 +268,7 @@ impl TerminalView {
             dev_dir: None,
             claude_status: None,
             claude_menu: None,
+            picking: false,
             claude_fg: false,
             hover_cell: None,
             mouse_forwarding: false,
@@ -321,6 +324,60 @@ impl TerminalView {
         self.send_input(&format!("{cmd}\r"));
         window.focus(&self.focus_handle);
         cx.notify();
+    }
+
+    /// Inspector: let the user click an element in Brave, then hand Claude its screenshot (as an
+    /// image, through the clipboard + Ctrl-V like a pasted image) and its context (as pasted text).
+    fn pick_in_brave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picking {
+            crate::brave::cancel_pick();
+            return;
+        }
+        self.picking = true;
+        self.claude_menu = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { crate::brave::pick_element(std::time::Duration::from_secs(180)) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.picking = false;
+                cx.activate(true);
+                window.activate_window();
+                window.focus(&this.focus_handle);
+                cx.notify();
+                match res {
+                    Ok(Some(pick)) => this.send_pick(pick, cx),
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = window.prompt(gpui::PromptLevel::Warning, "Brave inspector", Some(&e), &["OK"], cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn send_pick(&mut self, pick: crate::brave::Pick, cx: &mut Context<Self>) {
+        let previous = cx.read_from_clipboard();
+        let shot = pick.shot.clone();
+        cx.spawn(async move |this, cx| {
+            let with_image = match shot {
+                Some(p) => cx.background_executor().spawn(async move { crate::brave::png_to_clipboard(&p) }).await,
+                None => false,
+            };
+            if with_image {
+                let _ = this.update(cx, |this, cx| this.write_user_input(b"\x16".to_vec(), cx));
+                // Claude reads the clipboard asynchronously: let it attach the image first.
+                cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
+            }
+            let _ = this.update(cx, |this, cx| {
+                let bytes = encode_paste(&format!("{} ", pick.summary), this.snapshot.mode.bracketed_paste);
+                this.write_user_input(bytes, cx);
+                if with_image && let Some(item) = previous {
+                    cx.write_to_clipboard(item);
+                }
+            });
+        })
+        .detach();
     }
 
     fn toggle_menu(&mut self, menu: ClaudeMenu, cx: &mut Context<Self>) {
@@ -405,6 +462,28 @@ impl TerminalView {
                 cx.stop_propagation();
                 this.toggle_menu(ClaudeMenu::Effort, cx)
             })))
+            .child(
+                div()
+                    .id("brave-inspect")
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .px(px(7.))
+                    .h(px(20.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(11.5))
+                    .text_color(theme::rgb(if self.picking { theme::ACCENT } else { theme::TEXT_MUTED }))
+                    .when(self.picking, |d| d.bg(theme::rgb(0x1e2a3d)))
+                    .hover(|s| s.bg(theme::rgb(theme::HOVER)).text_color(theme::rgb(theme::TEXT)))
+                    .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip("Pick an element in Brave and send it to Claude")).into())
+                    .child(gpui::svg().path("icons/inspect.svg").size(px(12.)).text_color(theme::rgb(if self.picking { theme::ACCENT } else { theme::TEXT_MUTED })))
+                    .child(if self.picking { "Selecting… (click to cancel)" } else { "Inspect" })
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.pick_in_brave(window, cx)
+                    })),
+            )
             .child(div().flex_1())
             .when_some(st.five_hour, |d, w| d.child(usage_meter("rl-5h", "5h", w)))
             .when_some(st.seven_day, |d, w| d.child(usage_meter("rl-7d", "week", w)))

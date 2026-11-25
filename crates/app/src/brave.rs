@@ -23,7 +23,7 @@ unsafe extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
 }
 
-pub const INSTRUCTIONS: &str = " The user's own Brave browser (with their logins) is reachable through brave_tabs, brave_open, brave_screenshot and brave_eval_js: use them when the user asks to look at, check or screenshot something in their browser or a page that needs their session. Prefer the local dev server URL for their own app as said above.";
+pub const INSTRUCTIONS: &str = " The user's own Brave browser (with their logins) is reachable through brave_tabs, brave_open, brave_screenshot, brave_eval_js and brave_pick_element (the user points at an element): use them when the user asks to look at, check or screenshot something in their browser or a page that needs their session. Prefer the local dev server URL for their own app as said above.";
 
 pub fn tools() -> Vec<Value> {
     let target = json!({
@@ -68,12 +68,24 @@ pub fn call(name: &str, args: &Value) -> Option<(Vec<Value>, bool)> {
         "brave_open" => open(args).map(|t| vec![text(t)]),
         "brave_screenshot" => screenshot(args),
         "brave_eval_js" => eval_js(args).map(|t| vec![text(t)]),
+        "brave_pick_element" => pick_for_tool(),
         _ => return None,
     };
     Some(match result {
         Ok(content) => (content, false),
         Err(e) => (vec![text(e)], true),
     })
+}
+
+fn pick_for_tool() -> Result<Vec<Value>, String> {
+    let pick = pick_element(Duration::from_secs(180));
+    activate_self();
+    let Some(pick) = pick? else { return Err("The user cancelled the selection (Esc) or didn't pick anything.".into()) };
+    let mut out = vec![text(pick.summary)];
+    if let Some(bytes) = pick.shot.and_then(|p| std::fs::read(p).ok()) {
+        out.push(json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(bytes), "mimeType": "image/png"}));
+    }
+    Ok(out)
 }
 
 fn text(s: impl Into<String>) -> Value {
@@ -259,4 +271,241 @@ fn screenshot(args: &Value) -> Result<Vec<Value>, String> {
         text(format!("Brave window {window}: {title} — {url}\nSaved: {}", path.display())),
         json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(bytes), "mimeType": "image/png"}),
     ])
+}
+
+// ---------------------------------------------------------------------------------------------
+// Element picker: an overlay in the page highlights what's under the mouse (box + label); a
+// click captures the element's context (selector, component + source file, styles, HTML) and
+// a screenshot of it. The page stores the result in `window.__jtPick`, which we poll.
+
+static PICK_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const PICK_JS: &str = r#"(() => {
+  if (window.__jtPickCleanup) window.__jtPickCleanup();
+  window.__jtPick = '';
+  const Z = 2147483647, ACC = '#7aa2f7';
+  const mk = (css) => { const d = document.createElement('div'); d.style.cssText = css; document.documentElement.appendChild(d); return d; };
+  const box = mk(`position:fixed;pointer-events:none;z-index:${Z};border:2px solid ${ACC};background:rgba(122,162,247,.16);border-radius:3px;display:none;box-sizing:border-box`);
+  const pad = mk(`position:fixed;pointer-events:none;z-index:${Z};outline:1px dashed rgba(122,162,247,.55);display:none`);
+  const tag = mk(`position:fixed;pointer-events:none;z-index:${Z};background:#1a1b1f;color:#d7dae0;font:11px/1.5 Menlo,monospace;padding:3px 7px;border-radius:5px;white-space:nowrap;box-shadow:0 2px 10px rgba(0,0,0,.35);display:none`);
+  const bar = mk(`position:fixed;left:50%;top:10px;transform:translateX(-50%);z-index:${Z};background:#1a1b1f;color:#d7dae0;font:12px/1.4 -apple-system,system-ui,sans-serif;padding:7px 14px;border-radius:8px;border:1px solid ${ACC};box-shadow:0 4px 18px rgba(0,0,0,.4);pointer-events:none`);
+  bar.innerHTML = '<b style="color:#7aa2f7">juan-terminal</b> · Click an element to send it to Claude · <b>Esc</b> to cancel';
+  const ours = new Set([box, pad, tag, bar]);
+  const comp = (el) => {
+    const out = { names: [], source: null };
+    const fk = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (fk) {
+      for (let f = el[fk], n = 0; f && n < 60; f = f.return, n++) {
+        const t = f.type;
+        if (t && typeof t !== 'string') { const nm = t.displayName || t.name || (t.render && (t.render.displayName || t.render.name)); if (nm && out.names.length < 4 && !out.names.includes(nm)) out.names.push(nm); }
+        if (!out.source && f._debugSource) out.source = f._debugSource.fileName + ':' + f._debugSource.lineNumber;
+      }
+    }
+    for (let e = el; e && !out.names.length; e = e.parentElement) {
+      const v = e.__vueParentComponent;
+      if (v) { for (let c = v; c && out.names.length < 4; c = c.parent) { const t = c.type || {}; const nm = t.__name || t.name || (t.__file && t.__file.split('/').pop()); if (nm) out.names.push(nm); if (!out.source && t.__file) out.source = t.__file; } }
+      else if (e.__vue__) { const o = e.__vue__.$options; out.names.push(o.name || o._componentTag || 'Vue'); out.source = o.__file || null; }
+    }
+    for (let e = el; e && !out.source; e = e.parentElement) if (e.__svelte_meta) out.source = e.__svelte_meta.loc.file + ':' + (e.__svelte_meta.loc.line + 1);
+    return out;
+  };
+  const sel = (el) => {
+    const parts = [];
+    for (let e = el; e && e.nodeType === 1 && e !== document.documentElement; e = e.parentElement) {
+      if (e.id && /^[A-Za-z][\w-]*$/.test(e.id)) { parts.unshift('#' + e.id); break; }
+      let s = e.localName;
+      const tid = e.getAttribute('data-testid');
+      if (tid) { parts.unshift(`${s}[data-testid="${tid}"]`); break; }
+      const cls = [...e.classList].filter(c => /^[A-Za-z_-][\w-]*$/.test(c) && c.length < 30).slice(0, 2);
+      if (cls.length) s += '.' + cls.join('.');
+      const p = e.parentElement;
+      if (p) { const same = [...p.children].filter(c => c.localName === e.localName); if (same.length > 1) s += `:nth-of-type(${same.indexOf(e) + 1})`; }
+      parts.unshift(s);
+      try { if (document.querySelectorAll(parts.join(' > ')).length === 1) break; } catch (_) {}
+    }
+    return parts.join(' > ');
+  };
+  const label = (el) => {
+    const r = el.getBoundingClientRect(), c = comp(el);
+    let s = el.localName + (el.id ? '#' + el.id : '') + [...el.classList].slice(0, 2).map(c => '.' + c).join('');
+    return `${c.names[0] ? '<' + c.names[0] + '> ' : ''}${s}  ${Math.round(r.width)}×${Math.round(r.height)}`;
+  };
+  let cur = null;
+  const place = () => {
+    if (!cur) return;
+    const r = cur.getBoundingClientRect(), cs = getComputedStyle(cur);
+    Object.assign(box.style, { display: 'block', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+    const ml = parseFloat(cs.marginLeft) || 0, mt = parseFloat(cs.marginTop) || 0, mr = parseFloat(cs.marginRight) || 0, mb = parseFloat(cs.marginBottom) || 0;
+    Object.assign(pad.style, { display: (ml || mt || mr || mb) ? 'block' : 'none', left: (r.left - ml) + 'px', top: (r.top - mt) + 'px', width: (r.width + ml + mr) + 'px', height: (r.height + mt + mb) + 'px' });
+    tag.textContent = label(cur);
+    tag.style.display = 'block';
+    const th = 22, above = r.top - th - 6;
+    tag.style.left = Math.max(4, Math.min(r.left, innerWidth - tag.offsetWidth - 4)) + 'px';
+    tag.style.top = (above > 4 ? above : Math.min(r.bottom + 6, innerHeight - th - 4)) + 'px';
+  };
+  const move = (e) => {
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el || ours.has(el) || el === cur) return;
+    cur = el; place();
+  };
+  const block = (e) => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); };
+  const describe = (el) => {
+    const r = el.getBoundingClientRect(), cs = getComputedStyle(el), c = comp(el);
+    const keys = ['display','position','width','height','margin','padding','color','background-color','background-image','font-family','font-size','font-weight','line-height','text-align','border','border-radius','box-shadow','gap','flex-direction','justify-content','align-items','grid-template-columns','opacity','z-index','overflow'];
+    const def = { 'background-image': 'none', 'box-shadow': 'none', opacity: '1', 'z-index': 'auto', overflow: 'visible', gap: 'normal', 'grid-template-columns': 'none', position: 'static' };
+    const styles = keys.map(k => [k, cs.getPropertyValue(k)]).filter(([k, v]) => v && def[k] !== v && !(k === 'border' && /^0px/.test(v)) && !(k === 'margin' && v === '0px') && !(k === 'padding' && v === '0px') && !(k === 'border-radius' && v === '0px')).map(([k, v]) => `${k}: ${v}`);
+    const attrs = [...el.attributes].filter(a => /^(aria-|data-|role$|href$|type$|name$|alt$|title$|placeholder$)/.test(a.name)).map(a => `${a.name}="${a.value.slice(0, 80)}"`);
+    let html = el.outerHTML.replace(/\s+/g, ' ');
+    if (html.length > 1200) html = html.slice(0, 1200) + '…';
+    const zoom = (() => { const z = outerWidth / innerWidth; return z > 0.25 && z < 5 ? z : 1; })();
+    const chrome = outerHeight - innerHeight * zoom;
+    const x0 = Math.max(0, r.left - 6), y0 = Math.max(0, r.top - 6), x1 = Math.min(innerWidth, r.right + 6), y1 = Math.min(innerHeight, r.bottom + 6);
+    return {
+      url: location.href, title: document.title, selector: sel(el), tag: el.localName,
+      text: (el.innerText || el.value || '').trim().replace(/\s+/g, ' ').slice(0, 200),
+      components: c.names, source: c.source, styles, attrs, html,
+      rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+      viewport: { w: innerWidth, h: innerHeight, dpr: devicePixelRatio },
+      shot: x1 > x0 && y1 > y0 ? { x: Math.round(screenX + x0 * zoom), y: Math.round(screenY + chrome + y0 * zoom), w: Math.round((x1 - x0) * zoom), h: Math.round((y1 - y0) * zoom) } : null,
+    };
+  };
+  const finish = (r) => { cleanup(); window.__jtPick = JSON.stringify(r); };
+  const click = (e) => { block(e); if (cur) finish(describe(cur)); };
+  const key = (e) => { if (e.key === 'Escape') { block(e); finish({ cancelled: true }); } };
+  const opts = { capture: true, passive: false };
+  const evs = [['mousemove', move], ['click', click], ['mousedown', block], ['mouseup', block], ['pointerdown', block], ['pointerup', block], ['auxclick', block], ['contextmenu', block], ['keydown', key], ['scroll', place], ['resize', place]];
+  const cleanup = () => { evs.forEach(([t, f]) => window.removeEventListener(t, f, opts)); ours.forEach(d => d.remove()); delete window.__jtPickCleanup; };
+  evs.forEach(([t, f]) => window.addEventListener(t, f, opts));
+  window.__jtPickCleanup = () => { cleanup(); window.__jtPick = JSON.stringify({ cancelled: true }); };
+  return 'ok';
+})()"#;
+
+/// A picked element, ready to hand to Claude.
+pub struct Pick {
+    /// Markdown context (page, selector, component, styles, HTML).
+    pub summary: String,
+    /// Screenshot of the element, when Screen Recording is allowed.
+    pub shot: Option<PathBuf>,
+}
+
+/// Cancel a running `pick_element` (removes the overlay from the page).
+pub fn cancel_pick() {
+    PICK_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn js_in(target: &str, code: &str) -> Result<String, String> {
+    let script = format!("on run argv\n tell application \"{APP}\" to return execute {target} javascript (item 1 of argv)\nend run");
+    osascript(&script, &[code]).map_err(|e| {
+        if e.contains("JavaScript") || e.contains("javascript") {
+            format!("Brave blocks JavaScript from AppleScript. Enable Brave menu › View › Developer › Allow JavaScript from Apple Events. ({e})")
+        } else {
+            e
+        }
+    })
+}
+
+/// Bring juan-terminal back to the front (works from the MCP helper process too).
+pub fn activate_self() {
+    let _ = Command::new("osascript").args(["-e", "tell application id \"dev.juan-terminal.app\" to activate"]).output();
+}
+
+/// Let the user pick an element in the active Brave tab (blocks until click, Esc, cancel or
+/// `timeout`). `Ok(None)` = cancelled.
+pub fn pick_element(timeout: Duration) -> Result<Option<Pick>, String> {
+    use std::sync::atomic::Ordering;
+    ensure_running()?;
+    PICK_CANCEL.store(false, Ordering::SeqCst);
+    let ids = osascript(&format!("tell application \"{APP}\"\n if (count of windows) = 0 then error \"Brave has no open windows.\"\n return ((id of front window) as text) & \",\" & ((id of active tab of front window) as text)\nend tell"), &[])?;
+    let (w, t) = ids.split_once(',').ok_or("Couldn't read the active Brave tab.")?;
+    let target = format!("tab id {t} of window id {w}");
+    js_in(&target, PICK_JS)?;
+    let _ = osascript(&format!("tell application \"{APP}\" to activate"), &[]);
+
+    let start = Instant::now();
+    let raw = loop {
+        std::thread::sleep(Duration::from_millis(150));
+        if PICK_CANCEL.load(Ordering::SeqCst) || start.elapsed() > timeout {
+            let _ = js_in(&target, "window.__jtPickCleanup && window.__jtPickCleanup(); 'ok'");
+            return Ok(None);
+        }
+        match js_in(&target, "window.__jtPick || ''") {
+            Ok(s) if !s.is_empty() => break s,
+            Ok(_) => {}
+            // Tab closed or navigated away from: give up.
+            Err(_) => return Ok(None),
+        }
+    };
+    let _ = js_in(&target, "delete window.__jtPick; 'ok'");
+    let v: Value = serde_json::from_str(&raw).map_err(|e| format!("bad pick result: {e}"))?;
+    if v.get("cancelled").and_then(|c| c.as_bool()) == Some(true) {
+        return Ok(None);
+    }
+    let shot = v.get("shot").filter(|s| !s.is_null()).and_then(|s| {
+        let n = |k: &str| s.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+        let (x, y, w, h) = (n("x"), n("y"), n("w"), n("h"));
+        if w < 1 || h < 1 {
+            return None;
+        }
+        let dir = std::env::temp_dir().join("juan-terminal-shots");
+        std::fs::create_dir_all(&dir).ok()?;
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let path = dir.join(format!("pick-{ts}.png"));
+        // The overlay is gone already; give the page a frame to repaint.
+        std::thread::sleep(Duration::from_millis(120));
+        let ok = Command::new("screencapture").args(["-x", &format!("-R{x},{y},{w},{h}")]).arg(&path).status().is_ok_and(|s| s.success());
+        (ok && path.exists()).then(|| {
+            let _ = Command::new("sips").args(["-Z", "1600"]).arg(&path).output();
+            path
+        })
+    });
+    Ok(Some(Pick { summary: pick_summary(&v, shot.as_deref()), shot }))
+}
+
+fn pick_summary(v: &Value, shot: Option<&std::path::Path>) -> String {
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let list = |k: &str| v.get(k).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+    let n = |a: &str, b: &str| v.pointer(&format!("/{a}/{b}")).and_then(|x| x.as_f64()).unwrap_or(0.);
+    let mut out = format!("Element selected in Brave: <{}>", s("tag"));
+    let text = s("text");
+    if !text.is_empty() {
+        out.push_str(&format!(" \"{text}\""));
+    }
+    out.push_str(&format!("\n- page: {} ({})", s("url"), s("title")));
+    out.push_str(&format!("\n- selector: {}", s("selector")));
+    let comps = list("components");
+    if !comps.is_empty() {
+        out.push_str(&format!("\n- component: {}", comps.join(" ← ")));
+    }
+    if let Some(src) = v.get("source").and_then(|x| x.as_str()) {
+        out.push_str(&format!("\n- source: {src}"));
+    }
+    out.push_str(&format!(
+        "\n- box: {}×{} at ({}, {}) in a {}×{} viewport (dpr {})",
+        n("rect", "w"),
+        n("rect", "h"),
+        n("rect", "x"),
+        n("rect", "y"),
+        n("viewport", "w"),
+        n("viewport", "h"),
+        n("viewport", "dpr")
+    ));
+    let attrs = list("attrs");
+    if !attrs.is_empty() {
+        out.push_str(&format!("\n- attributes: {}", attrs.join(" ")));
+    }
+    let styles = list("styles");
+    if !styles.is_empty() {
+        out.push_str(&format!("\n- computed styles: {}", styles.join("; ")));
+    }
+    out.push_str(&format!("\n- html: {}", s("html")));
+    if let Some(p) = shot {
+        out.push_str(&format!("\n- screenshot: {}", p.display()));
+    }
+    out
+}
+
+/// Put a PNG on the clipboard (Claude Code reads it on Ctrl-V).
+pub fn png_to_clipboard(path: &std::path::Path) -> bool {
+    let script = "on run argv\n set the clipboard to (read (POSIX file (item 1 of argv)) as «class PNGf»)\nend run";
+    Command::new("osascript").arg("-e").arg(script).arg(path).status().is_ok_and(|s| s.success())
 }
