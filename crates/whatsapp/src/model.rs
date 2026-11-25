@@ -169,6 +169,8 @@ pub struct ChatMessage {
     pub text: String,
     pub status: MsgStatus,
     pub edited: bool,
+    /// Forwarding score (0 = not forwarded; ≥5 = "forwarded many times").
+    pub forwarded: u32,
     /// Downloaded media file, if already in the cache.
     pub media: Option<std::path::PathBuf>,
     pub mime: Option<String>,

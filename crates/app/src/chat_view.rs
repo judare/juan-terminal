@@ -119,6 +119,16 @@ fn note_reaction(emoji: &str) {
 /// Chats open in a tab somewhere (notifications for them are skipped while the app is active).
 static OPEN_CHATS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// Messages Claude asked to send (whatsapp_send), waiting to land in their chat's composer.
+static DRAFTS: std::sync::Mutex<Vec<whatsapp::ipc::SendRequest>> = std::sync::Mutex::new(Vec::new());
+
+pub fn queue_draft(req: whatsapp::ipc::SendRequest) {
+    if let Ok(mut v) = DRAFTS.lock() {
+        v.retain(|r| r.chat != req.chat);
+        v.push(req);
+    }
+}
+
 pub fn is_chat_open(jid: &str) -> bool {
     OPEN_CHATS.lock().map(|v| v.iter().any(|j| j == jid)).unwrap_or(false)
 }
@@ -152,6 +162,7 @@ fn signature(m: &ChatMessage) -> u64 {
     (m.status as u8).hash(&mut h);
     m.media.is_some().hash(&mut h);
     m.edited.hash(&mut h);
+    m.forwarded.hash(&mut h);
     m.transcript.hash(&mut h);
     for r in &m.reactions {
         r.emoji.hash(&mut h);
@@ -165,6 +176,15 @@ struct Menu {
     msg: Rc<ChatMessage>,
     /// "Eliminar…" was picked: the menu shows the delete options instead.
     confirm_delete: bool,
+}
+
+/// "Reenviar…": pick the chats to forward a message to.
+struct Forward {
+    msg: Rc<ChatMessage>,
+    input: Entity<TextInput>,
+    chats: Vec<whatsapp::ChatSummary>,
+    picked: Vec<String>,
+    _sub: Subscription,
 }
 
 /// Text selected with the mouse inside one message bubble (byte offsets into `text`).
@@ -210,6 +230,7 @@ pub struct ChatView {
     attachments: Vec<PathBuf>,
     reply_to: Option<Rc<ChatMessage>>,
     menu: Option<Menu>,
+    forward: Option<Forward>,
     stickers_open: bool,
     picker_tab: PickerTab,
     typing: Option<(Option<String>, Instant)>,
@@ -341,6 +362,7 @@ impl ChatView {
             attachments: Vec::new(),
             reply_to: None,
             menu: None,
+            forward: None,
             stickers_open: false,
             picker_tab: PickerTab::Emojis,
             typing: None,
@@ -381,6 +403,25 @@ impl ChatView {
         };
         this.reload(cx);
         this
+    }
+
+    /// Move a queued Claude draft for this chat into the composer (text, files, quoted message).
+    pub fn take_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(req) = DRAFTS.lock().ok().and_then(|mut v| v.iter().position(|r| r.chat == self.jid).map(|i| v.remove(i))) else { return };
+        self.composer.update(cx, |c, cx| c.set_text(&req.text, cx));
+        self.attachments = req.files;
+        if let Some(q) = req.quote {
+            self.reply_to = self
+                .items
+                .iter()
+                .find_map(|i| match i {
+                    Item::Msg(m) if m.id == q => Some(m.clone()),
+                    _ => None,
+                })
+                .or_else(|| WhatsApp::global().store().message(&self.jid, &q).map(Rc::new));
+        }
+        self.stickers_open = false;
+        cx.notify();
     }
 
     pub fn composer_focus(&self, cx: &App) -> FocusHandle {
@@ -662,6 +703,149 @@ impl ChatView {
         window.focus(&input.focus_handle(cx));
         self.ask = Some((input, sub));
         cx.notify();
+    }
+
+    fn open_forward(&mut self, msg: Rc<ChatMessage>, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| TextInput::new("Buscar chat", cx));
+        let sub = cx.subscribe(&input, |this, _, e: &TextInputEvent, cx| match e {
+            TextInputEvent::Changed => cx.notify(),
+            TextInputEvent::Submit { .. } => this.send_forward(cx),
+            TextInputEvent::Cancel => {
+                this.forward = None;
+                cx.notify();
+            }
+        });
+        window.focus(&input.focus_handle(cx));
+        let chats = WhatsApp::global().store().chats();
+        self.forward = Some(Forward { msg, input, chats, picked: Vec::new(), _sub: sub });
+        cx.notify();
+    }
+
+    fn send_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(f) = self.forward.take() else { return };
+        if !f.picked.is_empty() {
+            WhatsApp::global().forward(&f.msg.chat, &f.msg.id, f.picked);
+            self.interacted(cx);
+        }
+        cx.notify();
+    }
+
+    fn render_forward(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let f = self.forward.as_ref()?;
+        let q = f.input.read(cx).content.trim().to_lowercase();
+        let rows: Vec<&whatsapp::ChatSummary> = f.chats.iter().filter(|c| q.is_empty() || c.name.to_lowercase().contains(&q) || c.jid.contains(&q)).take(80).collect();
+        let n = f.picked.len();
+        let list = div().id("fwd-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().children(rows.into_iter().enumerate().map(|(i, c)| {
+            let on = f.picked.contains(&c.jid);
+            let jid = c.jid.clone();
+            div()
+                .id(("fwd-chat", i))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+                .child(wa_ui::avatar(c.avatar.as_ref(), &c.name, 32.))
+                .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(theme::rgb(theme::TEXT)).child(c.name.clone()))
+                .child(
+                    div()
+                        .size(px(18.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(theme::rgb(if on { wa_ui::GREEN } else { theme::BORDER }))
+                        .when(on, |d| d.bg(theme::rgb(wa_ui::GREEN)).child(wa_ui::icon("icons/wa-check.svg", 11., 0xffffff))),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(f) = this.forward.as_mut() {
+                        match f.picked.iter().position(|j| *j == jid) {
+                            Some(i) => {
+                                f.picked.remove(i);
+                            }
+                            None => f.picked.push(jid.clone()),
+                        }
+                    }
+                    cx.notify();
+                }))
+        }));
+        Some(
+            div()
+                .id("fwd-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.forward = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("fwd-panel")
+                        .w(px(380.))
+                        .h(px(480.))
+                        .p(px(8.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .rounded(px(10.))
+                        .bg(theme::rgb(theme::SIDEBAR_BG))
+                        .border_1()
+                        .border_color(theme::rgb(theme::BORDER))
+                        .shadow_lg()
+                        // Clicks inside don't close it.
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(div().px(px(4.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("REENVIAR MENSAJE"))
+                        .child(div().h(px(30.)).px(px(8.)).flex().items_center().rounded(px(6.)).bg(theme::rgb(theme::SELECTED)).text_size(px(13.)).child(f.input.clone()))
+                        .child(list)
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .pt(px(4.))
+                                .child(
+                                    div()
+                                        .id("fwd-cancel")
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .rounded(px(6.))
+                                        .text_size(px(13.))
+                                        .text_color(theme::rgb(theme::TEXT_MUTED))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                                        .child("Cancelar")
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.forward = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("fwd-send")
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .rounded(px(6.))
+                                        .text_size(px(13.))
+                                        .text_color(gpui::white())
+                                        .bg(theme::rgb(wa_ui::GREEN))
+                                        .when(n == 0, |d| d.opacity(0.4))
+                                        .when(n > 0, |d| d.cursor_pointer().hover(|s| s.opacity(0.9)))
+                                        .child(if n > 1 { format!("Reenviar a {n}") } else { "Reenviar".to_string() })
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send_forward(cx))),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_ask(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1586,6 +1770,20 @@ impl ChatView {
                         ),
                 )
         });
+        let forwarded = (m.forwarded > 0 && m.kind != MsgKind::Revoked).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .mb(px(2.))
+                .text_size(px(12.))
+                .italic()
+                .text_color(theme::rgb(theme::TEXT_MUTED))
+                .when(visual, |d| d.px(px(6.)).pt(px(2.)))
+                .when(sticker, |d| d.px(px(8.)).py(px(2.)).rounded_full().bg(gpui::black().opacity(0.45)))
+                .child(wa_ui::icon("icons/wa-forward.svg", 13., theme::TEXT_MUTED))
+                .child(if m.forwarded >= 5 { "Reenviado muchas veces" } else { "Reenviado" })
+        });
         let sender = (self.is_group && !mine && !prev_same_sender).then(|| {
             div()
                 .text_size(px(12.5))
@@ -1666,6 +1864,7 @@ impl ChatView {
             })
             .when(is_hit, |d| d.child(div().absolute().inset_0().rounded(radius).border_2().border_color(theme::rgb(theme::MODIFIED))))
             .children(sender.map(|s| s.when(visual, |d| d.px(px(6.)).pt(px(2.)))))
+            .children(forwarded)
             .children(quoted)
             .child(content)
             .when(tail, |d| {
@@ -2488,7 +2687,7 @@ impl ChatView {
                     cx.notify();
                 }))
         }));
-        let (m_reply, m_copy, m_fav, m_show, m_open) = (m.clone(), m.clone(), m.clone(), m.clone(), m.clone());
+        let (m_reply, m_copy, m_fav, m_show, m_open, m_fwd) = (m.clone(), m.clone(), m.clone(), m.clone(), m.clone(), m.clone());
         let mut list = div()
             .flex()
             .flex_col()
@@ -2510,6 +2709,12 @@ impl ChatView {
                 w.focus(&this.composer.focus_handle(cx));
                 cx.notify();
             })));
+        if m.kind != MsgKind::Revoked {
+            list = list.child(item("m-forward", "Reenviar…".into()).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                this.menu = None;
+                this.open_forward(m_fwd.clone(), w, cx);
+            })));
+        }
         let selection = self.sel.as_ref().filter(|s| s.id == m.id).and_then(|s| s.selected()).map(str::to_string);
         if let Some(t) = selection {
             list = list.child(item("m-copy-sel", "Copiar selección".into()).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -3273,6 +3478,7 @@ impl Render for ChatView {
             )
             .children(zoom)
             .children(self.render_ask(cx))
+            .children(self.render_forward(cx))
             .children(self.render_menu(cx))
             .children(self.render_react_bar(cx))
     }

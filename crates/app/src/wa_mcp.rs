@@ -9,7 +9,7 @@ use chrono::{Local, TimeZone};
 use serde_json::{Value, json};
 use whatsapp::{ChatMessage, MsgKind, Store};
 
-pub const INSTRUCTIONS: &str = " The user's WhatsApp is available through whatsapp_list_chats, whatsapp_read_chat, whatsapp_search, whatsapp_get_media and whatsapp_send (text and file attachments; the user approves each send in juan-terminal). Chats can be referred to by name, phone number or JID. Never send messages the user didn't ask for.";
+pub const INSTRUCTIONS: &str = " The user's WhatsApp is available through whatsapp_list_chats, whatsapp_read_chat, whatsapp_search, whatsapp_get_media and whatsapp_send (text and file attachments; it is not sent: it lands in that chat's composer in juan-terminal for the user to review and send). Chats can be referred to by name, phone number or JID. Never send messages the user didn't ask for.";
 
 pub fn tools() -> Vec<Value> {
     vec![
@@ -55,7 +55,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "whatsapp_send",
-            "description": "Send a WhatsApp message from the user's account: text and/or files (absolute paths; images, videos and audio are sent as media, anything else as a document). The user must approve it in juan-terminal before it is sent. Optionally reply to a message id.",
+            "description": "Send a WhatsApp message from the user's account: text and/or files (absolute paths; images, videos and audio are sent as media, anything else as a document). It is not sent right away: it is placed in that chat's composer in juan-terminal, where the user reviews and sends it. Optionally reply to a message id.",
             "inputSchema": {"type": "object", "properties": {
                 "chat": {"type": "string", "description": "Chat name, phone number (with country code) or JID"},
                 "text": {"type": "string", "description": "Message text (caption of the first file when files are attached)"},

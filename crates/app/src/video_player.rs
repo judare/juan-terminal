@@ -61,6 +61,12 @@ pub const OVERLAY_GAP: f32 = 4.;
 pub const OVERLAY_PAD: f32 = 10.;
 /// Distance from the bottom edge to the timeline's center while hovered.
 pub const OVERLAY_BAR_BOTTOM: f32 = 10.;
+/// Volume slider at the right of the time row (hover only): its width, and the speaker
+/// icon's box at its left (icon click = mute).
+pub const OVERLAY_VOL_W: f32 = 52.;
+pub const OVERLAY_VOL_ICON: f32 = 16.;
+/// Distance from the bottom edge to the center of the time / volume row.
+pub const OVERLAY_ROW_BOTTOM: f32 = OVERLAY_BAR_BOTTOM + 11.5;
 const TOP_SHADE: f64 = 54.;
 const BOTTOM_SHADE: f64 = 46.;
 
@@ -77,6 +83,8 @@ pub struct OverlayInfo {
     pub time: String,
     /// Timeline color (sRGB 0…1).
     pub accent: (f32, f32, f32),
+    /// 0…1
+    pub volume: f32,
 }
 
 struct Overlay {
@@ -94,11 +102,16 @@ struct Overlay {
     expand: Id,
     audio: Id,
     close: Id,
+    /// Speaker: its (bare) circle and the image inside.
+    vol_box: Id,
+    vol_icon: Id,
+    vol_track: Id,
+    vol_fill: Id,
 }
 
 impl Overlay {
-    fn hover_views(&self) -> [Id; 11] {
-        [self.top_shade, self.bottom_shade, self.title, self.channel, self.time, self.play, self.prev, self.next, self.expand, self.audio, self.close]
+    fn hover_views(&self) -> [Id; 14] {
+        [self.top_shade, self.bottom_shade, self.title, self.channel, self.time, self.play, self.prev, self.next, self.expand, self.audio, self.close, self.vol_box, self.vol_track, self.vol_fill]
     }
 }
 
@@ -106,8 +119,8 @@ pub struct NativePlayer {
     view: Id,
     overlay: RefCell<Option<Overlay>>,
     overlay_info: RefCell<Option<OverlayInfo>>,
-    /// Last laid-out (w, h, fill width): skips relayout when nothing moved.
-    overlay_size: Cell<Option<(f64, f64, f64)>>,
+    /// Last laid-out (w, h, fill width, volume width): skips relayout when nothing moved.
+    overlay_size: Cell<Option<(f64, f64, f64, f64)>>,
     /// GPUI's NSView of the window the player was attached to (null until first paint).
     host: Cell<Id>,
     painted_gen: Cell<u64>,
@@ -205,7 +218,10 @@ impl NativePlayer {
                 let (expand, _) = circle(self.view, OVERLAY_BUTTON as f64, "arrow.up.left.and.arrow.down.right", 10., 0.45);
                 let (audio, _) = circle(self.view, OVERLAY_BUTTON as f64, "video.slash", 10., 0.45);
                 let (close, _) = circle(self.view, OVERLAY_BUTTON as f64, "xmark", 10., 0.45);
-                *self.overlay.borrow_mut() = Some(Overlay { top_shade, bottom_shade, title, channel, time, track, fill, play, play_icon, prev, next, expand, audio, close });
+                let (vol_box, vol_icon) = circle(self.view, OVERLAY_VOL_ICON as f64, "speaker.wave.2.fill", 9., 0.);
+                let vol_track = bar(self.view, (1., 1., 1.), 0.3);
+                let vol_fill = bar(self.view, (1., 1., 1.), 0.9);
+                *self.overlay.borrow_mut() = Some(Overlay { top_shade, bottom_shade, title, channel, time, track, fill, play, play_icon, prev, next, expand, audio, close, vol_box, vol_icon, vol_track, vol_fill });
             }
             self.overlay_size.set(None);
         }
@@ -225,6 +241,7 @@ impl NativePlayer {
                     let _: () = msg_send![o.channel, setStringValue: ns_string(&i.channel)];
                     let _: () = msg_send![o.time, setStringValue: ns_string(&i.time)];
                     set_layer_color(o.fill, i.accent, 1.);
+                    let _: () = msg_send![o.vol_icon, setImage: symbol(crate::music_engine::volume_symbol(i.volume), 9.)];
                 }
             }
         }
@@ -241,7 +258,9 @@ impl NativePlayer {
         let Some(info) = &*info else { return };
         let Some(o) = &*self.overlay.borrow() else { return };
         let progress = info.progress.clamp(0., 1.) as f64;
-        let key = (w, h, (progress * w).round());
+        let volume = info.volume.clamp(0., 1.) as f64;
+        let vol_w = OVERLAY_VOL_W as f64;
+        let key = (w, h, (progress * w).round(), (volume * vol_w).round());
         if self.overlay_size.replace(Some(key)) == Some(key) {
             return;
         }
@@ -272,7 +291,18 @@ impl NativePlayer {
                 let layer: Id = msg_send![v, layer];
                 let _: () = msg_send![layer, setCornerRadius: if info.hover { 1.5f64 } else { 0f64 }];
             }
-            let _: () = msg_send![o.time, setFrame: r(pad, by - 17., w - 2. * pad, 14.)];
+            // Time row: time at the left, speaker + volume slider at the right.
+            let row_cy = h - OVERLAY_ROW_BOTTOM as f64;
+            let vi = OVERLAY_VOL_ICON as f64;
+            let vx = w - pad - vol_w;
+            let _: () = msg_send![o.vol_box, setFrame: r(vx - 4. - vi, row_cy - vi / 2., vi, vi)];
+            let _: () = msg_send![o.vol_track, setFrame: r(vx, row_cy - 1.5, vol_w, 3.)];
+            let _: () = msg_send![o.vol_fill, setFrame: r(vx, row_cy - 1.5, vol_w * volume, 3.)];
+            for v in [o.vol_track, o.vol_fill] {
+                let layer: Id = msg_send![v, layer];
+                let _: () = msg_send![layer, setCornerRadius: 1.5f64];
+            }
+            let _: () = msg_send![o.time, setFrame: r(pad, by - 17., (w - 2. * pad - vol_w - vi - 8.).max(0.), 14.)];
         }
     }
 
@@ -304,6 +334,11 @@ impl NativePlayer {
                 return;
             }
             if self.host.get() != host {
+                // One native view shared by every window: only the focused window may take it
+                // from another, or two windows painting the slot bounce it each frame (flicker).
+                if !self.host.get().is_null() && !window.is_window_active() {
+                    return;
+                }
                 let sup: Id = msg_send![self.view, superview];
                 if !sup.is_null() {
                     let _: () = msg_send![self.view, removeFromSuperview];

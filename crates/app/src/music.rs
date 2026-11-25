@@ -205,6 +205,10 @@ pub struct Music {
     ratings: HashMap<String, bool>,
     /// Bytes used by the local copies (songs, podcasts, videos); None while measuring.
     disk_usage: Option<u64>,
+    /// Player volume 0…1 (persisted).
+    pub volume: f32,
+    /// Volume to go back to when unmuting.
+    volume_before_mute: f32,
     /// Ids with a complete `.m4a` in the song cache (refreshed with `disk_usage`).
     cached_songs: HashSet<String>,
     _downloads_tick: Option<Task<()>>,
@@ -267,6 +271,7 @@ pub fn init(cx: &mut App) {
             while let Some(cmd) = menu_rx.next().await {
                 let ok = match cmd {
                     music_engine::MenuCommand::Remote(ev) => music.update(cx, |m, cx| m.remote(ev, cx)).is_ok(),
+                    music_engine::MenuCommand::Volume(v) => music.update(cx, |m, cx| m.set_volume(v, cx)).is_ok(),
                     music_engine::MenuCommand::Stop => music.update(cx, |m, cx| m.stop(cx)).is_ok(),
                     music_engine::MenuCommand::OpenSearch => cx.update(crate::launcher::open_music).is_ok(),
                     music_engine::MenuCommand::Rate(good) => music
@@ -298,8 +303,11 @@ impl Music {
     fn new() -> Self {
         let video = AvPlayer::new(true);
         let video_view = NativePlayer::for_player(video.raw());
+        let audio = AvPlayer::new(false);
+        let volume = load_volume();
+        audio.set_volume(volume);
         Self {
-            audio: AvPlayer::new(false),
+            audio,
             video,
             video_view,
             queue: Vec::new(),
@@ -335,6 +343,8 @@ impl Music {
             download_failed: HashSet::new(),
             ratings: load_ratings(),
             disk_usage: None,
+            volume,
+            volume_before_mute: if volume > 0.01 { volume } else { 1. },
             _downloads_tick: None,
             _tick: None,
             _resolve: None,
@@ -550,6 +560,26 @@ impl Music {
         }
         self.sync_now_playing();
         cx.notify();
+    }
+
+    pub fn set_volume(&mut self, v: f32, cx: &mut Context<Self>) {
+        let v = v.clamp(0., 1.);
+        if (v - self.volume).abs() < 0.001 {
+            return;
+        }
+        self.volume = v;
+        if v > 0.01 {
+            self.volume_before_mute = v;
+        }
+        self.audio.set_volume(v);
+        self.sync_status_item();
+        save_json(&volume_file(), &v);
+        cx.notify();
+    }
+
+    pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        let v = if self.volume > 0.01 { 0. } else { self.volume_before_mute.max(0.1) };
+        self.set_volume(v, cx);
     }
 
     pub fn seek_by(&mut self, delta: f64, cx: &mut Context<Self>) {
@@ -819,6 +849,7 @@ impl Music {
             artwork: thumb.exists().then_some(thumb.as_path()),
             rating: self.rating(&t.id),
             accent: t.mode.color(),
+            volume: self.volume,
         }));
     }
 
@@ -1480,6 +1511,14 @@ const RENEW_SCRIPT: &str = include_str!("../assets/music-update-preferences.sh")
 
 pub fn preferences_file() -> PathBuf {
     music_dir().join("preferences.json")
+}
+
+fn volume_file() -> PathBuf {
+    music_dir().join("volume.json")
+}
+
+fn load_volume() -> f32 {
+    std::fs::read(volume_file()).ok().and_then(|b| serde_json::from_slice::<f32>(&b).ok()).map(|v| v.clamp(0., 1.)).unwrap_or(1.)
 }
 
 fn progress_file() -> PathBuf {

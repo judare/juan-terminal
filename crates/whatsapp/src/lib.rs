@@ -9,5 +9,5 @@ pub mod store;
 pub mod transcribe;
 
 pub use model::*;
-pub use service::{WhatsApp, data_dir};
+pub use service::{SendAnswer, WhatsApp, data_dir};
 pub use store::Store;

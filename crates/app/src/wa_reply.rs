@@ -245,7 +245,7 @@ pub fn ask_plan(jid: &str, instruction: &str) -> Result<AskPlan, String> {
         "Te paso una conversación de mi WhatsApp y una instrucción sobre ella. Haz lo que pide la instrucción.\n\
          - \"Yo\" soy yo. Las notas de voz vienen transcritas.\n\
          - Para más contexto usa whatsapp_read_chat (con `before` para mensajes anteriores), whatsapp_search o whatsapp_get_media.\n\
-         - Solo envía mensajes por WhatsApp (whatsapp_send) si la instrucción lo pide; yo apruebo cada envío.\n",
+         - Si la instrucción pide escribir o responder un mensaje, usa whatsapp_send: no se envía, queda en el compositor del chat para que yo lo revise y lo envíe.\n",
     );
     p.push_str(&format!("\nINSTRUCCIÓN: {instruction}\n"));
     p.push_str(&project_brief(&projects, false));

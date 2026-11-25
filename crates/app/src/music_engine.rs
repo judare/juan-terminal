@@ -147,6 +147,11 @@ impl AvPlayer {
         }
     }
 
+    /// 0…1 (AVPlayer's own gain, independent of the system volume).
+    pub fn set_volume(&self, v: f32) {
+        unsafe { let _: () = msg_send![self.player, setVolume: v.clamp(0., 1.)]; }
+    }
+
     pub fn pause(&self) {
         unsafe { let _: () = msg_send![self.player, pause]; }
     }
@@ -324,6 +329,8 @@ pub enum MenuCommand {
     Stop,
     /// 👍 (true) / 👎 (false) on what's playing.
     Rate(bool),
+    /// 0…1 from the volume slider.
+    Volume(f32),
 }
 
 /// Indexed by the controls' `tag`.
@@ -352,6 +359,8 @@ pub struct StatusInfo<'a> {
     pub rating: Option<bool>,
     /// 0xRRGGBB of the mode (progress bar, chosen rating).
     pub accent: u32,
+    /// 0…1
+    pub volume: f32,
 }
 
 struct StatusItem {
@@ -366,6 +375,9 @@ struct StatusItem {
     toggle: Id,
     up: Id,
     down: Id,
+    /// Volume row: speaker icon (always) + slider (faded in while the mouse is over the row).
+    vol_icon: Id,
+    slider: Id,
 }
 
 thread_local! {
@@ -398,7 +410,10 @@ const MP_ART_H: f64 = 63.;
 const MP_TRACK_Y: f64 = 92.;
 const MP_TRACK_W: f64 = MP_W - 2. * MP_PAD;
 const MP_BUTTONS_Y: f64 = 122.;
-const MP_H: f64 = 166.;
+const MP_VOLUME_Y: f64 = 160.;
+const MP_H: f64 = 188.;
+/// `tag` of the volume slider inside its row.
+const SLIDER_TAG: isize = 99;
 
 extern "C" fn on_menu_item(_: &Object, _: Sel, sender: Id) {
     let tag: isize = unsafe { msg_send![sender, tag] };
@@ -408,12 +423,32 @@ extern "C" fn on_menu_item(_: &Object, _: Sel, sender: Id) {
     }
 }
 
+extern "C" fn on_volume(_: &Object, _: Sel, sender: Id) {
+    let v: f64 = unsafe { msg_send![sender, doubleValue] };
+    if let Some(tx) = MENU_TX.lock().ok().and_then(|t| t.clone()) {
+        let _ = tx.unbounded_send(MenuCommand::Volume(v as f32));
+    }
+}
+
+/// Menu closed: fade the slider out again (no `mouseExited:` arrives once it's gone).
+extern "C" fn on_menu_closed(_: &Object, _: Sel, _menu: Id) {
+    STATUS.with(|s| {
+        if let Ok(s) = s.try_borrow() {
+            if let Some(st) = s.as_ref() {
+                unsafe { let _: () = msg_send![st.slider, setAlphaValue: 0f64]; }
+            }
+        }
+    });
+}
+
 fn menu_target() -> Id {
     use objc::declare::ClassDecl;
     static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let cls = *CLASS.get_or_init(|| {
         let mut decl = ClassDecl::new("JTMusicMenuTarget", class!(NSObject)).expect("JTMusicMenuTarget");
         unsafe { decl.add_method(sel!(musicMenuItem:), on_menu_item as extern "C" fn(&Object, Sel, Id)) };
+        unsafe { decl.add_method(sel!(musicVolume:), on_volume as extern "C" fn(&Object, Sel, Id)) };
+        unsafe { decl.add_method(sel!(menuDidClose:), on_menu_closed as extern "C" fn(&Object, Sel, Id)) };
         decl.register() as *const objc::runtime::Class as usize
     });
     unsafe {
@@ -451,6 +486,58 @@ unsafe fn set_layer_bg(view: Id, color: Id) {
     if !layer.is_null() {
         let cg: *const std::ffi::c_void = msg_send![color, CGColor];
         let _: () = msg_send![layer, setBackgroundColor: cg];
+    }
+}
+
+fn reveal_slider(row: &Object, alpha: f64) {
+    unsafe {
+        let slider: Id = msg_send![row, viewWithTag: SLIDER_TAG];
+        if !slider.is_null() {
+            let anim: Id = msg_send![slider, animator];
+            let _: () = msg_send![anim, setAlphaValue: alpha];
+        }
+    }
+}
+extern "C" fn row_entered(this: &Object, _: Sel, _: Id) {
+    reveal_slider(this, 1.);
+}
+extern "C" fn row_exited(this: &Object, _: Sel, _: Id) {
+    reveal_slider(this, 0.);
+}
+
+/// Row that shows its slider (`SLIDER_TAG`) only while the mouse is over it.
+unsafe fn hover_row(parent: Id, frame: NSRect) -> Id {
+    use objc::declare::ClassDecl;
+    static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cls = *CLASS.get_or_init(|| {
+        let mut decl = ClassDecl::new("JTMusicHoverRow", class!(NSView)).expect("JTMusicHoverRow");
+        unsafe {
+            decl.add_method(sel!(mouseEntered:), row_entered as extern "C" fn(&Object, Sel, Id));
+            decl.add_method(sel!(mouseExited:), row_exited as extern "C" fn(&Object, Sel, Id));
+            decl.add_method(sel!(isFlipped), is_flipped as extern "C" fn(&Object, Sel) -> objc::runtime::BOOL);
+        }
+        decl.register() as *const objc::runtime::Class as usize
+    });
+    let v: Id = msg_send![cls as *const objc::runtime::Class, alloc];
+    let v: Id = msg_send![v, initWithFrame: frame];
+    // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+    let opts: usize = 0x01 | 0x80 | 0x200;
+    let area: Id = msg_send![class!(NSTrackingArea), alloc];
+    let area: Id = msg_send![area, initWithRect: rect(0., 0., frame.w, frame.h) options: opts owner: v userInfo: std::ptr::null_mut::<Object>()];
+    let _: () = msg_send![v, addTrackingArea: area];
+    let _: () = msg_send![parent, addSubview: v];
+    v
+}
+
+pub fn volume_symbol(v: f32) -> &'static str {
+    if v <= 0.001 {
+        "speaker.slash.fill"
+    } else if v < 0.34 {
+        "speaker.wave.1.fill"
+    } else if v < 0.67 {
+        "speaker.wave.2.fill"
+    } else {
+        "speaker.wave.3.fill"
     }
 }
 
@@ -560,6 +647,24 @@ fn build_status_item() -> StatusItem {
         let up = symbol_button(view, target, 7, "hand.thumbsup", 13., rect(MP_PAD - 6., y, 30., 32.), "Me gusta");
         let down = symbol_button(view, target, 8, "hand.thumbsdown", 13., rect(MP_W - MP_PAD - 24., y, 30., 32.), "No me gusta");
 
+        // Volume: a dim speaker; the slider fades in while hovering the row.
+        let row = hover_row(view, rect(MP_PAD - 4., MP_VOLUME_Y, MP_TRACK_W + 8., 22.));
+        let vol_icon: Id = msg_send![class!(NSImageView), alloc];
+        let vol_icon: Id = msg_send![vol_icon, initWithFrame: rect(2., 2., 22., 18.)];
+        let _: () = msg_send![vol_icon, setImage: symbol("speaker.wave.2.fill", 11., 0.)];
+        let _: () = msg_send![vol_icon, setContentTintColor: secondary];
+        let _: () = msg_send![vol_icon, setToolTip: ns_string("Volumen")];
+        let _: () = msg_send![row, addSubview: vol_icon];
+        let slider: Id = msg_send![class!(NSSlider), sliderWithValue: 1f64 minValue: 0f64 maxValue: 1f64 target: target action: sel!(musicVolume:)];
+        let _: () = msg_send![slider, setFrame: rect(28., 1., MP_TRACK_W + 8. - 34., 20.)];
+        // NSControlSizeSmall = 1
+        let _: () = msg_send![slider, setControlSize: 1isize];
+        let _: () = msg_send![slider, setContinuous: YES];
+        let _: () = msg_send![slider, setTag: SLIDER_TAG];
+        let _: () = msg_send![slider, setAlphaValue: 0f64];
+        let _: () = msg_send![row, addSubview: slider];
+        let _: () = msg_send![menu, setDelegate: target];
+
         let player: Id = msg_send![class!(NSMenuItem), new];
         let _: () = msg_send![player, setView: view];
         let _: () = msg_send![menu, addItem: player];
@@ -579,7 +684,7 @@ fn build_status_item() -> StatusItem {
         add("Buscar música, podcasts y videos…", 5, "m");
         add("Cerrar reproductor", 6, "");
         let _: () = msg_send![item, setMenu: menu];
-        StatusItem { item, art, art_path: None, title, artist, fill, elapsed, total, toggle, up, down }
+        StatusItem { item, art, art_path: None, title, artist, fill, elapsed, total, toggle, up, down, vol_icon, slider }
     }
 }
 
@@ -648,6 +753,12 @@ pub fn set_status_item(info: Option<StatusInfo>) {
                 let tint: Id = if on { ns_color(info.accent, 1.) } else { std::ptr::null_mut() };
                 let _: () = msg_send![b, setContentTintColor: tint];
             }
+            let _: () = msg_send![st.vol_icon, setImage: symbol(volume_symbol(info.volume), 11., 0.)];
+            let current: f64 = msg_send![st.slider, doubleValue];
+            if (current - info.volume as f64).abs() > 0.001 {
+                let _: () = msg_send![st.slider, setDoubleValue: info.volume as f64];
+            }
+            let _: () = msg_send![st.slider, setTrackFillColor: ns_color(info.accent, 1.)];
         }
     });
 }
