@@ -316,6 +316,7 @@ impl NativePlayer {
             unsafe {
                 let _: () = msg_send![self.view, setHidden: v];
                 if hide {
+                    restore_responder(self.host.get(), self.view);
                     // Don't keep playing (sound) in a tab nobody sees.
                     let player: Id = msg_send![self.view, player];
                     if !player.is_null() {
@@ -371,6 +372,7 @@ impl Drop for NativePlayer {
                 let _: () = msg_send![player, pause];
             }
             let _: () = msg_send![self.view, setPlayer: std::ptr::null_mut::<Object>()];
+            restore_responder(self.host.get(), self.view);
             let _: () = msg_send![self.view, removeFromSuperview];
             let _: () = msg_send![self.view, release];
         }
@@ -507,6 +509,33 @@ unsafe fn shade(parent: Id, top: bool) -> Id {
     }
 }
 
+/// GPUI's view refuses first responder on click (it only gets it at window creation), so once
+/// the player took it (a click on its controls) and is hidden or removed, the window keeps the
+/// focus: GPUI stops getting keys and every event beeps. Hand it back to GPUI when the player,
+/// or nothing (the window itself), holds it.
+fn restore_responder(host: Id, player: Id) {
+    if host.is_null() {
+        return;
+    }
+    unsafe {
+        let window: Id = msg_send![host, window];
+        if window.is_null() {
+            return;
+        }
+        let fr: Id = msg_send![window, firstResponder];
+        let in_player = !player.is_null() && !fr.is_null() && {
+            let is_view: BOOL = msg_send![fr, isKindOfClass: class!(NSView)];
+            is_view != NO && {
+                let d: BOOL = msg_send![fr, isDescendantOf: player];
+                d != NO
+            }
+        };
+        if fr.is_null() || fr == window || in_player {
+            let _: BOOL = msg_send![window, makeFirstResponder: host];
+        }
+    }
+}
+
 fn gpui_view(window: &Window) -> Option<Id> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
@@ -527,6 +556,8 @@ pub fn frame_end(suppress: bool) -> impl IntoElement {
         |_, _, _| {},
         move |_, _, window: &mut Window, _: &mut App| {
             let Some(host) = gpui_view(window) else { return };
+            // Catch-all: the window must never be left as its own first responder.
+            restore_responder(host, std::ptr::null_mut());
             let g = GEN.with(|g| g.get());
             PLAYERS.with(|l| {
                 for p in l.borrow().iter().filter_map(Weak::upgrade) {
