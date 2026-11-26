@@ -333,6 +333,11 @@ fn handle_connection(inner: Arc<Inner>, mut stream: TcpStream) {
             return http_response(&mut stream, "204 No Content");
         }
         let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        if is_idle_notification(&v) {
+            // Claude's "waiting for your input" reminder after a finished turn: not a request
+            // for anything (Stop already reported it), so it must not mark the session as needing us.
+            return http_response(&mut stream, "204 No Content");
+        }
         let _ = inner.requests.unbounded_send(IdeRequest::Hook {
             terminal,
             event: s("hook_event_name").unwrap_or_default(),
@@ -550,6 +555,13 @@ fn call_tool(inner: &Inner, name: &str, args: &Value) -> Result<Value, (i64, Str
         }
         _ => Err((-32602, format!("Unknown tool: {name}"))),
     }
+}
+
+/// The idle reminder Claude sends ~60s after a turn ends ("Claude is waiting for your input").
+fn is_idle_notification(v: &Value) -> bool {
+    v.get("hook_event_name").and_then(Value::as_str) == Some("Notification")
+        && (v.get("notification_type").and_then(Value::as_str) == Some("idle_prompt")
+            || v.get("message").and_then(Value::as_str).is_some_and(|m| m.contains("waiting for your input")))
 }
 
 /// "Edit · lib.rs", "Bash · cargo test", "Grep · fn main" from a PreToolUse payload.

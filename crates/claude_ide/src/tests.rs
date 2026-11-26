@@ -261,3 +261,12 @@ fn tool_summaries() {
     assert_eq!(t(r#"{"tool_name":"mcp__juan-terminal__ssh_exec","tool_input":{}}"#).as_deref(), Some("ssh_exec"));
     assert_eq!(t(r#"{"hook_event_name":"Stop"}"#), None);
 }
+
+#[test]
+fn idle_reminder_is_not_a_request() {
+    let v = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+    assert!(is_idle_notification(&v(r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"x"}"#)));
+    assert!(is_idle_notification(&v(r#"{"hook_event_name":"Notification","message":"Claude is waiting for your input"}"#)));
+    assert!(!is_idle_notification(&v(r#"{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#)));
+    assert!(!is_idle_notification(&v(r#"{"hook_event_name":"Stop"}"#)));
+}
