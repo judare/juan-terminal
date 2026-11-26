@@ -377,7 +377,8 @@ impl Store {
         let db = self.db();
         let Ok(mut st) = db.prepare(
             "SELECT c.jid, c.name, c.is_group, c.last_ts, c.unread, c.pinned, c.muted_until, c.avatar,
-                    m.kind, m.text, m.from_me, m.status, m.sender, c.important
+                    m.kind, m.text, m.from_me, m.status, m.sender, c.important,
+                    EXISTS(SELECT 1 FROM reactions r WHERE r.chat=c.jid AND r.target=c.last_id AND r.from_me=1 AND r.emoji<>'')
              FROM chats c LEFT JOIN messages m ON m.chat=c.jid AND m.id=c.last_id
              WHERE c.archived=?1 AND c.last_ts>0
              ORDER BY c.pinned DESC, c.last_ts DESC",
@@ -401,6 +402,7 @@ impl Store {
                     r.get::<_, Option<i64>>(11)?,
                     r.get::<_, Option<String>>(12)?,
                     r.get::<_, Option<bool>>(13).ok().flatten().unwrap_or(false),
+                    r.get::<_, bool>(14).unwrap_or(false),
                 ))
             })
             .map(|rows| rows.flatten().collect::<Vec<_>>())
@@ -416,7 +418,7 @@ impl Store {
         }
         rows.into_iter()
             .filter(|r| !hidden_chat(&r.0))
-            .map(|(jid, name, is_group, last_ts, unread, pinned, muted, avatar, kind, text, from_me, status, sender, important)| {
+            .map(|(jid, name, is_group, last_ts, unread, pinned, muted, avatar, kind, text, from_me, status, sender, important, reacted)| {
                 let kind = kind.as_deref().map(MsgKind::parse);
                 let text = text.unwrap_or_default();
                 let last_text = match kind {
@@ -440,6 +442,7 @@ impl Store {
                     last_kind: kind.unwrap_or(MsgKind::Text),
                     last_sender,
                     last_from_me: from_me,
+                    last_reacted_by_me: reacted,
                     last_status: MsgStatus::from_i64(status.unwrap_or(0)),
                     unread: unread.max(0) as u32,
                     pinned: pinned > 0,

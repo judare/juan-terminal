@@ -306,6 +306,14 @@ impl NativePlayer {
         }
     }
 
+    /// Whether `window` shows this player (or nobody has it yet). The native view is shared by
+    /// every window, so only that window may drive its overlay: others painting their own hover
+    /// state would toggle the controls each frame (flicker).
+    pub fn shown_in(&self, window: &Window) -> bool {
+        let host = self.host.get();
+        host.is_null() || gpui_view(window) == Some(host)
+    }
+
     pub fn is_hidden(&self) -> bool {
         self.hidden.get()
     }

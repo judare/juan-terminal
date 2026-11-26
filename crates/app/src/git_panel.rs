@@ -68,10 +68,27 @@ pub struct GitPanel {
     activity_all: bool,
     /// A reload was requested while one was running (e.g. the scope changed).
     activity_stale: bool,
+    /// Heat map grid width at the last paint (decides how many weeks fit).
+    activity_width: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Hovered heat map day (index into `Activity::counts`) and where the mouse entered it.
+    activity_hover: Option<(usize, gpui::Point<gpui::Pixels>)>,
 }
 
-/// Full weeks shown in the heat map (Sunday to Saturday; the last one is the current week).
-const ACTIVITY_WEEKS: i64 = 13;
+/// Full weeks loaded for the heat map (Sunday to Saturday; the last one is the current
+/// week). Only the most recent ones that fit the panel width are drawn.
+const ACTIVITY_WEEKS: i64 = 53;
+const ACTIVITY_CELL: f32 = 11.;
+const ACTIVITY_GAP: f32 = 3.;
+/// Weekday label column ("Mon", "Wed", "Fri") plus its right padding.
+const ACTIVITY_LABEL_W: f32 = 24.;
+
+/// Week columns that fit in a grid `width` px wide (13 until the first paint measures it).
+fn activity_weeks_for(width: f32) -> usize {
+    if width <= 0. {
+        return 13;
+    }
+    (((width - ACTIVITY_LABEL_W) / (ACTIVITY_CELL + ACTIVITY_GAP)).floor() as i64).clamp(1, ACTIVITY_WEEKS) as usize
+}
 
 struct Activity {
     /// Commits per day, oldest first, from the Sunday that starts the grid to today.
@@ -99,6 +116,8 @@ impl GitPanel {
             activity_loading: false,
             activity_all: false,
             activity_stale: false,
+            activity_width: Default::default(),
+            activity_hover: None,
         }
     }
 
@@ -216,39 +235,88 @@ impl GitPanel {
     fn render_activity(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let act = self.activity.as_ref()?;
         let counts = &act.counts;
-        let total: u32 = counts.iter().sum();
-        let max = counts.iter().copied().max().unwrap_or(0);
+        let weeks = activity_weeks_for(self.activity_width.get());
+        // Index of the first drawn day (a Sunday): skip the weeks that don't fit.
+        let skip = (ACTIVITY_WEEKS as usize - weeks) * 7;
+        let shown = counts.get(skip..).unwrap_or_default();
+        let total: u32 = shown.iter().sum();
+        let max = shown.iter().copied().max().unwrap_or(0);
         let first = activity_first(self.activity_today);
-        const CELL: f32 = 11.;
-        const GAP: f32 = 3.;
+        const CELL: f32 = ACTIVITY_CELL;
+        const GAP: f32 = ACTIVITY_GAP;
         let label = |t: &'static str| div().h(px(CELL)).flex().items_center().text_size(px(9.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(t);
-        let mut grid = div().flex().gap(px(GAP)).child(
-            div().flex().flex_col().gap(px(GAP)).pr(px(2.)).children(["", "Mon", "", "Wed", "", "Fri", ""].map(label)),
-        );
-        for w in 0..ACTIVITY_WEEKS as usize {
-            let mut col = div().flex().flex_col().gap(px(GAP));
+        let width = self.activity_width.clone();
+        let mut grid = div()
+            .relative()
+            .w_full()
+            .flex()
+            .gap(px(GAP))
+            // Measure the available width; repaint when it changes so the week count follows.
+            .child(
+                gpui::canvas(
+                    move |b, window, _| {
+                        let w = f32::from(b.size.width);
+                        if (w - width.get()).abs() > 0.5 {
+                            width.set(w);
+                            window.refresh();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_col()
+                    .gap(px(GAP))
+                    .w(px(ACTIVITY_LABEL_W - GAP))
+                    .children(["", "Mon", "", "Wed", "", "Fri", ""].map(label)),
+            );
+        for w in 0..weeks {
+            let mut col = div().flex().flex_none().flex_col().gap(px(GAP));
             for d in 0..7 {
-                let i = w * 7 + d;
+                let i = skip + w * 7 + d;
                 let cell = div().size(px(CELL)).rounded(px(2.));
                 col = col.child(match counts.get(i) {
                     None => cell.border_1().border_color(theme::rgb(theme::SELECTED)).into_any_element(),
                     Some(&n) => {
                         let day = first + i as i64;
-                        let tip = ActivityTooltip {
-                            date: long_date(day),
-                            today: day == self.activity_today,
-                            commits: n,
-                            repos: act.repos.get(i).cloned().unwrap_or_default(),
-                        };
                         let mut cell = cell.id(SharedString::from(format!("act-{i}"))).bg(theme::rgb(heat_color(level(n, max))));
                         if day == self.activity_today {
                             cell = cell.border_1().border_color(theme::rgb(theme::TEXT_FAINT));
                         }
-                        cell.tooltip(move |_, cx| cx.new(|_| tip.clone()).into()).into_any_element()
+                        // Own hover tooltip: gpui's `.tooltip` waits 500ms before showing.
+                        cell.on_hover(cx.listener(move |this, on: &bool, window, cx| {
+                            if *on {
+                                this.activity_hover = Some((i, window.mouse_position()));
+                            } else if this.activity_hover.is_some_and(|(h, _)| h == i) {
+                                this.activity_hover = None;
+                            } else {
+                                return;
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element()
                     }
                 });
             }
             grid = grid.child(col);
+        }
+        if let Some((i, pos)) = self.activity_hover {
+            if i >= skip && i < counts.len() {
+                let day = first + i as i64;
+                let tip = ActivityTooltip {
+                    date: long_date(day),
+                    today: day == self.activity_today,
+                    commits: counts[i],
+                    repos: act.repos.get(i).cloned().unwrap_or_default(),
+                };
+                let pos = gpui::point(pos.x + px(10.), pos.y + px(14.));
+                grid = grid.child(gpui::deferred(gpui::anchored().position(pos).snap_to_window_with_margin(px(8.)).child(cx.new(|_| tip))).with_priority(2));
+            }
         }
         let legend = div()
             .flex()
@@ -282,7 +350,7 @@ impl GitPanel {
             .border_color(theme::rgb(theme::BORDER))
             .child(seg("act-scope-project", "Proyecto", !all).on_click(cx.listener(|this, _, _, cx| this.set_activity_all(false, cx))))
             .child(seg("act-scope-all", "Todo", all).on_click(cx.listener(|this, _, _, cx| this.set_activity_all(true, cx))));
-        let title = format!("{total} {} in the last {ACTIVITY_WEEKS} weeks", if total == 1 { "commit" } else { "commits" });
+        let title = format!("{total} {} in the last {weeks} weeks", if total == 1 { "commit" } else { "commits" });
         Some(
             div()
                 .flex()

@@ -1192,7 +1192,7 @@ fn overlay_target(id: &'static str, size: f32) -> gpui::Stateful<gpui::Div> {
 }
 
 impl Render for MusicCard {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let music = self.music.clone();
         let m = self.music.read(cx);
         let Some(track) = m.current().cloned() else { return div().into_any_element() };
@@ -1202,7 +1202,7 @@ impl Render for MusicCard {
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| music.update(cx, |m, cx| f(m, cx))
         };
         if show_video {
-            return self.render_video(&music, &track, cx);
+            return self.render_video(&music, &track, window, cx);
         }
         m.video_view.set_overlay(None);
         div()
@@ -1302,7 +1302,7 @@ impl MusicCard {
     /// Video mode: just the picture, edge to edge in the sidebar. Title, controls and timeline
     /// are drawn natively over it (GPUI can't paint above the player); invisible GPUI targets
     /// at the same spots take the clicks.
-    fn render_video(&mut self, music: &Entity<Music>, track: &Track, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_video(&mut self, music: &Entity<Music>, track: &Track, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let on_hover = cx.listener(|this, hovered: &bool, _, cx| {
             if this.video_hover != *hovered {
                 this.video_hover = *hovered;
@@ -1328,8 +1328,12 @@ impl MusicCard {
         } else {
             format!("{} / {}", fmt_time(m.position), if m.duration > 0. { fmt_time(m.duration) } else { "--:--".into() })
         };
-        m.video_view.set_corner_radius(8.);
-        m.video_view.set_overlay(video_ready.then(|| OverlayInfo {
+        let owner = m.video_view.shown_in(window);
+        if owner {
+            m.video_view.set_corner_radius(8.);
+        }
+        if owner {
+            m.video_view.set_overlay(video_ready.then(|| OverlayInfo {
             hover,
             playing: m.playing,
             title: track.title.to_string(),
@@ -1338,7 +1342,8 @@ impl MusicCard {
             time,
             accent: (accent.r, accent.g, accent.b),
             volume: m.volume,
-        }));
+            }));
+        }
         let on = |f: fn(&mut Music, &mut Context<Music>)| {
             let music = music.clone();
             // Targets overlap (buttons sit over the click-to-pause area): handle once.
