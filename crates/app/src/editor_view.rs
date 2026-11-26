@@ -16,6 +16,8 @@ use gpui::{
 };
 
 use crate::text_input::{TextInput, TextInputEvent};
+
+mod insights;
 use crate::theme;
 
 actions!(
@@ -243,6 +245,10 @@ struct Layout {
     viewport: Bounds<Pixels>,
     lines: Vec<RenderedLine>,
     total_rows: usize,
+    /// Inline blame annotation: (bounds, line).
+    blame: Option<(Bounds<Pixels>, usize)>,
+    /// Conflict actions painted on `<<<<<<<` lines: (bounds, conflict index, resolution).
+    conflict_buttons: Vec<(Bounds<Pixels>, usize, editor::conflicts::Resolution)>,
 }
 
 pub struct EditorView {
@@ -316,6 +322,8 @@ pub struct EditorView {
     wrap_cols: usize,
     /// Display-column goal for visual up/down: (cursor pos it applies to, goal).
     visual_goal: Option<(usize, usize)>,
+    /// Inline blame, merge conflicts and LSP hover (see `insights`).
+    ins: insights::Insights,
 }
 
 impl Drop for EditorView {
@@ -384,6 +392,7 @@ impl EditorView {
             wrap_cache: None,
             wrap_cols: usize::MAX,
             visual_goal: None,
+            ins: Default::default(),
         };
         this.markdown_live = this.doc.language == Language::Markdown && this.doc.line_count() < 5000;
         this.svg_preview = this.is_svg();
@@ -906,6 +915,7 @@ impl EditorView {
             Ok(()) => {
                 self.disk_conflict = false;
                 self.preview = false;
+                self.schedule_blame(Duration::from_millis(300), cx);
                 cx.emit(EditorEvent::Changed);
                 if let Some(p) = self.doc.path.clone() {
                     cx.emit(EditorEvent::Saved(p));
@@ -959,6 +969,7 @@ impl EditorView {
             Ok(()) => {
                 self.disk_conflict = false;
                 self.schedule_highlight(Duration::ZERO, cx);
+                self.schedule_blame(Duration::ZERO, cx);
                 cx.emit(EditorEvent::Changed);
             }
             Err(e) => cx.emit(EditorEvent::Error(format!("{e:#}"))),
@@ -1016,6 +1027,8 @@ impl EditorView {
             }
             self.schedule_highlight(Duration::from_millis(30), cx);
             self.schedule_lsp_sync(Duration::from_millis(250), cx);
+            self.schedule_blame(Duration::from_millis(1200), cx);
+            self.clear_lsp_hover(cx);
             if self.find.is_some() {
                 self.update_find_matches(false, cx);
             }
@@ -1532,6 +1545,19 @@ impl EditorView {
 
     fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
+        self.clear_lsp_hover(cx);
+        if e.click_count == 1 && !self.markdown_live {
+            if let Some(layout) = self.layout.as_ref() {
+                if let Some(&(_, ix, how)) = layout.conflict_buttons.iter().find(|(b, _, _)| b.contains(&e.position)) {
+                    self.resolve_conflict(ix, how, cx);
+                    return;
+                }
+                if let Some((_, line)) = layout.blame.filter(|(b, _)| b.contains(&e.position)) {
+                    self.copy_blame_hash(line, cx);
+                    return;
+                }
+            }
+        }
         let Some(pos) = self.pos_at(e.position) else { return };
         // ⌥-click: add (or remove) a caret.
         if e.modifiers.alt && e.click_count == 1 && !self.markdown_live {
@@ -1585,15 +1611,35 @@ impl EditorView {
 
     fn mouse_move(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selecting || e.pressed_button != Some(MouseButton::Left) {
-            // Hover: show the diagnostic under the mouse.
-            if !self.diagnostics.is_empty() && !self.markdown_live {
-                let hit = self.pos_at(e.position).and_then(|p| self.diagnostic_at(p));
-                let new = hit.map(|i| (i, e.position));
-                if new.map(|n| n.0) != self.hover.map(|h| h.0) {
-                    self.hover = new;
-                    cx.notify();
-                }
+            if self.markdown_live {
+                return;
             }
+            // Conflict actions and the blame annotation sit over the text.
+            let (btn, on_blame) = match self.layout.as_ref() {
+                Some(l) => (
+                    l.conflict_buttons.iter().find(|(b, _, _)| b.contains(&e.position)).map(|&(_, ix, how)| (ix, how)),
+                    l.blame.is_some_and(|(b, _)| b.contains(&e.position)),
+                ),
+                None => (None, false),
+            };
+            if btn != self.ins.conflict_btn_hover {
+                self.ins.conflict_btn_hover = btn;
+                cx.notify();
+            }
+            let blame_hover = on_blame.then_some(self.ins.blame_hover.unwrap_or(e.position));
+            if blame_hover != self.ins.blame_hover {
+                self.ins.blame_hover = blame_hover;
+                cx.notify();
+            }
+            // Hover: show the diagnostic under the mouse, else ask the language server.
+            let pos = if btn.is_some() || on_blame { None } else { self.pos_at(e.position) };
+            let hit = pos.and_then(|p| self.diagnostic_at(p));
+            let new = hit.map(|i| (i, e.position));
+            if new.map(|n| n.0) != self.hover.map(|h| h.0) {
+                self.hover = new;
+                cx.notify();
+            }
+            self.hover_lsp_at(if hit.is_some() { None } else { pos }, e.position, cx);
             return;
         }
         // Dragging is handled by the window-level listener registered in paint (`register_drag`),
@@ -1697,6 +1743,7 @@ impl EditorView {
     }
 
     fn scroll_wheel(&mut self, e: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_lsp_hover(cx);
         if self.markdown_live {
             let dy = match e.delta {
                 ScrollDelta::Pixels(p) => p.y,
@@ -1759,6 +1806,12 @@ impl Render for EditorView {
                 .on_action(cx.listener(Self::save_action))
                 .child(asset);
         }
+        if self.ins.blame.is_none() && self.ins.blame_task.is_none() {
+            self.schedule_blame(Duration::ZERO, cx);
+        }
+        let conflict_bar = if self.markdown_live { None } else { self.render_conflict_bar(cx) };
+        let blame_card = self.ins.blame_hover.and_then(|at| self.layout.as_ref().and_then(|l| l.blame).and_then(|(_, line)| self.render_blame_card(line, at)));
+        let lsp_hover = if self.hover.is_none() && !self.markdown_live { self.render_lsp_hover() } else { None };
         let focused_editor = cx.entity();
         let find_bar = self.find.as_ref().map(|f| {
             let count = if f.go_to_line {
@@ -1993,7 +2046,10 @@ impl Render for EditorView {
                 )
                 .with_priority(2)
             }))
+            .children(blame_card)
+            .children(lsp_hover)
             .children(conflict)
+            .children(conflict_bar)
             .children(self.export.clone().map(|d| gpui::deferred(d).with_priority(2)))
             .when(self.doc.language == Language::Markdown || self.is_svg() || self.csv_source, |d| {
                 let svg = self.is_svg();
@@ -2033,6 +2089,14 @@ impl Render for EditorView {
                     .on_mouse_move(cx.listener(Self::mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if !*hovered {
+                            this.clear_lsp_hover(cx);
+                            if this.ins.conflict_btn_hover.take().is_some() {
+                                cx.notify();
+                            }
+                        }
+                    }))
                     .on_scroll_wheel(cx.listener(Self::scroll_wheel))
                     .child(if self.svg_preview && self.is_svg() {
                         div()
@@ -2162,6 +2226,8 @@ struct Prepaint {
     marked: Option<(Point<Pixels>, ShapedLine)>,
     line_height: Pixels,
     text_clip: Bounds<Pixels>,
+    /// Clickable spots (conflict actions, blame): pointing-hand cursor.
+    hand: Vec<gpui::Hitbox>,
 }
 
 fn color(hex: u32) -> Hsla {
@@ -2300,6 +2366,7 @@ impl Element for EditorElement {
             let last_row = (first_row + visible).min(total_rows);
             let first = view.line_of_row(first_row);
 
+            let conflicts: Vec<editor::conflicts::Conflict> = view.conflicts().to_vec();
             // Spans are only valid for the version they were computed from.
             let spans: &[HighlightSpan] = if view.spans_version == view.doc.version() { &view.spans } else { &[] };
             let sel = view.doc.selection.range();
@@ -2327,6 +2394,32 @@ impl Element for EditorElement {
             let mut lines = Vec::new();
             let mut rendered = Vec::new();
             let mut cursor = None;
+
+            // Merge conflicts: tinted blocks and "Accept …" actions on the `<<<<<<<` line.
+            use editor::conflicts::Resolution;
+            let (green, blue) = (color(0x3fb950), color(0x58a6ff));
+            let conflict_bg = |line: usize| -> Option<Hsla> {
+                let c = conflicts.iter().find(|c| (c.start..=c.end).contains(&line))?;
+                Some(if line == c.start {
+                    green.opacity(0.32)
+                } else if line == c.end {
+                    blue.opacity(0.32)
+                } else if line == c.sep || Some(line) == c.base {
+                    color(theme::TEXT_FAINT).opacity(0.18)
+                } else if line < c.base.unwrap_or(c.sep) {
+                    green.opacity(0.12)
+                } else if line < c.sep {
+                    color(theme::TEXT_FAINT).opacity(0.08)
+                } else {
+                    blue.opacity(0.12)
+                })
+            };
+            let mut conflict_buttons = Vec::new();
+            let mut blame_hit = None;
+            let blame_line = (sel.is_empty() && !view.doc.has_multi() && !conflicts.iter().any(|c| (c.start..=c.end).contains(&cur_line)))
+                .then(|| view.blame_annotation(cur_line))
+                .flatten();
+            let small = (font_size * 0.86).round();
 
             let gutter_font = view.font.clone();
             let mut line = first;
@@ -2381,8 +2474,42 @@ impl Element for EditorElement {
                     let shaped = ts.shape_line(SharedString::from(display[b0..b1].to_string()), font_size, &slice_runs(&runs, b0, b1), None);
                     let rl = RenderedLine { line, vrow, start, end, last_row: last, shaped, col_bytes: col_bytes[start..=end].iter().map(|b| b - b0).collect() };
 
+                    if let Some(bg) = conflict_bg(line) {
+                        quads.push((Bounds::new(point(text_left, y), size(text_width, line_height)), bg));
+                    }
                     if line == cur_line && sel.is_empty() {
                         quads.push((Bounds::new(point(text_left, y), size(text_width, line_height)), color(theme::CURRENT_LINE)));
+                    }
+                    if r == 0 {
+                        if let Some(ix) = conflicts.iter().position(|c| c.start == line) {
+                            let mut x = text_origin.x + rl.shaped.width + char_width * 3.;
+                            for (how, label) in [(Resolution::Current, "Accept Current"), (Resolution::Incoming, "Accept Incoming"), (Resolution::Both, "Accept Both")] {
+                                let hot = view.ins.conflict_btn_hover == Some((ix, how));
+                                let c = if hot { color(theme::ACCENT) } else { color(theme::TEXT_MUTED) };
+                                let run = TextRun {
+                                    len: label.len(),
+                                    font: view.font.clone(),
+                                    color: c,
+                                    background_color: None,
+                                    underline: hot.then_some(UnderlineStyle { color: Some(c), thickness: px(1.), wavy: false }),
+                                    strikethrough: None,
+                                };
+                                let shaped = ts.shape_line(SharedString::from(label), small, &[run], None);
+                                let b = Bounds::new(point(x, y), size(shaped.width, line_height));
+                                x += shaped.width + char_width * 2.;
+                                lines.push((point(b.origin.x, y), shaped));
+                                conflict_buttons.push((b, ix, how));
+                            }
+                        }
+                    }
+                    if last && line == cur_line {
+                        if let Some(text) = blame_line.as_ref() {
+                            let run = TextRun { len: text.len(), font: view.font.clone(), color: color(theme::TEXT_FAINT).opacity(0.75), background_color: None, underline: None, strikethrough: None };
+                            let shaped = ts.shape_line(SharedString::from(text.clone()), small, &[run], None);
+                            let x = text_origin.x + rl.shaped.width + char_width * 4.;
+                            blame_hit = Some((Bounds::new(point(x, y), size(shaped.width, line_height)), line));
+                            lines.push((point(x, y), shaped));
+                        }
                     }
                     // Doc char range (relative to line) clipped to this row → quad.
                     let band = |a: usize, b: usize, extra: Pixels, c: Hsla, quads: &mut Vec<(Bounds<Pixels>, Hsla)>| {
@@ -2446,7 +2573,17 @@ impl Element for EditorElement {
                 (c.origin, ts.shape_line(SharedString::from(t.clone()), font_size, &[run], None))
             });
 
-            view.layout = Some(Layout { text_origin, line_height, char_width, viewport: bounds, lines: rendered, total_rows });
+            let text_clip = Bounds::new(point(text_left, bounds.origin.y), size(text_width, bounds.size.height));
+            let hand = conflict_buttons
+                .iter()
+                .map(|(b, _, _)| *b)
+                .chain(blame_hit.map(|(b, _)| b))
+                .filter_map(|b: Bounds<Pixels>| {
+                    let b = b.intersect(&text_clip);
+                    (b.size.width > px(0.)).then(|| window.insert_hitbox(b, gpui::HitboxBehavior::Normal))
+                })
+                .collect();
+            view.layout = Some(Layout { text_origin, line_height, char_width, viewport: bounds, lines: rendered, total_rows, blame: blame_hit, conflict_buttons });
 
             Prepaint {
                 quads,
@@ -2456,7 +2593,8 @@ impl Element for EditorElement {
                 extra_cursors: if focused { extra_cursors } else { Vec::new() },
                 marked,
                 line_height,
-                text_clip: Bounds::new(point(text_left, bounds.origin.y), size(text_width, bounds.size.height)),
+                text_clip,
+                hand,
             }
         })
     }
@@ -2466,6 +2604,9 @@ impl Element for EditorElement {
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.view.clone()), cx);
         EditorView::register_drag(&self.view, bounds, window, cx);
         let lh = state.line_height;
+        for hb in &state.hand {
+            window.set_cursor_style(CursorStyle::PointingHand, hb);
+        }
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             for (origin, line) in &state.gutter {
                 let _ = line.paint(*origin, lh, window, cx);

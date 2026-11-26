@@ -510,6 +510,97 @@ pub fn activity(repo: &Path, days: u32) -> Result<Vec<(String, String)>> {
     Ok(parse_activity(&text))
 }
 
+/// Who last changed a line (`git blame`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlameLine {
+    /// Full hash; all zeros for lines not committed yet.
+    pub hash: String,
+    pub author: String,
+    pub author_mail: String,
+    /// Unix seconds.
+    pub author_time: i64,
+    pub summary: String,
+}
+
+impl BlameLine {
+    pub fn uncommitted(&self) -> bool {
+        self.hash.bytes().all(|b| b == b'0')
+    }
+}
+
+/// Blame of `file` as it is in `contents` (the editor buffer, so line numbers match even
+/// with unsaved edits). One entry per line; `None` past the end or for untracked files.
+/// Returns the blame and the repo's `user.email`.
+pub fn blame(file: &Path, contents: &str) -> Result<(Vec<Option<BlameLine>>, String)> {
+    let dir = file.parent().context("file has no parent")?;
+    let name = file.file_name().context("file has no name")?;
+    let mut cfg = git(dir);
+    cfg.args(["config", "user.email"]);
+    let email = run_text(cfg).map(|s| s.trim().to_string()).unwrap_or_default();
+    let mut cmd = git(dir);
+    cmd.args(["blame", "--porcelain", "--contents", "-", "--"]).arg(name);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("failed to run git")?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().context("no stdin")?;
+        let data = contents.as_bytes().to_vec();
+        // Write on a thread: git may fill stdout before it has read all of stdin.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        });
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok((parse_blame(&String::from_utf8_lossy(&out.stdout)), email))
+}
+
+fn parse_blame(text: &str) -> Vec<Option<BlameLine>> {
+    let mut commits: std::collections::HashMap<String, BlameLine> = std::collections::HashMap::new();
+    let mut lines: Vec<Option<BlameLine>> = Vec::new();
+    let mut cur: Option<(String, usize)> = None;
+    for l in text.lines() {
+        if let Some(_content) = l.strip_prefix('\t') {
+            if let Some((hash, final_line)) = cur.take() {
+                let idx = final_line.saturating_sub(1);
+                if lines.len() <= idx {
+                    lines.resize(idx + 1, None);
+                }
+                lines[idx] = commits.get(&hash).cloned();
+            }
+            continue;
+        }
+        let mut parts = l.split(' ');
+        let first = parts.next().unwrap_or_default();
+        if first.len() == 40 && first.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let _orig = parts.next();
+            let final_line = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            commits.entry(first.to_string()).or_insert_with(|| BlameLine {
+                hash: first.to_string(),
+                author: String::new(),
+                author_mail: String::new(),
+                author_time: 0,
+                summary: String::new(),
+            });
+            cur = Some((first.to_string(), final_line));
+            continue;
+        }
+        let Some((hash, _)) = &cur else { continue };
+        let Some(c) = commits.get_mut(hash) else { continue };
+        let rest = l.split_once(' ').map(|(_, r)| r).unwrap_or_default();
+        match first {
+            "author" => c.author = rest.to_string(),
+            "author-mail" => c.author_mail = rest.trim_matches(|ch| ch == '<' || ch == '>').to_string(),
+            "author-time" => c.author_time = rest.parse().unwrap_or(0),
+            "summary" => c.summary = rest.to_string(),
+            _ => {}
+        }
+    }
+    lines
+}
+
 fn parse_activity(text: &str) -> Vec<(String, String)> {
     text.lines().filter_map(|l| l.split_once(' ')).map(|(h, d)| (h.to_string(), d.trim().to_string())).collect()
 }
@@ -517,6 +608,21 @@ fn parse_activity(text: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_blame_porcelain() {
+        let h1 = "a".repeat(40);
+        let h0 = "0".repeat(40);
+        let text = format!(
+            "{h1} 1 1 2\nauthor Ana\nauthor-mail <ana@x.co>\nauthor-time 1700000000\nsummary First\nfilename f\n\tone\n{h1} 2 2\n\ttwo\n{h0} 3 3 1\nauthor Not Committed Yet\nauthor-mail <not.committed.yet>\nauthor-time 1700000100\nsummary Version of f from -\nfilename f\n\tthree\n"
+        );
+        let b = parse_blame(&text);
+        assert_eq!(b.len(), 3);
+        let l1 = b[0].as_ref().unwrap();
+        assert_eq!((l1.author.as_str(), l1.author_mail.as_str(), l1.author_time, l1.summary.as_str()), ("Ana", "ana@x.co", 1700000000, "First"));
+        assert_eq!(b[1].as_ref().unwrap().hash, h1);
+        assert!(b[2].as_ref().unwrap().uncommitted());
+    }
 
     #[test]
     fn parse_activity_lines() {

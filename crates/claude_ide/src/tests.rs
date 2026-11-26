@@ -193,7 +193,7 @@ fn hook_endpoint_needs_token_and_forwards_events() {
     assert!(post("bad").starts_with("HTTP/1.1 401"));
     assert!(post(srv.token()).starts_with("HTTP/1.1 204"));
     match futures::executor::block_on(rx.next()) {
-        Some(IdeRequest::Hook { terminal, event, message, cwd }) => {
+        Some(IdeRequest::Hook { terminal, event, message, cwd, .. }) => {
             assert_eq!(terminal.as_deref(), Some("term-7"));
             assert_eq!(event, "Notification");
             assert_eq!(message.as_deref(), Some("Claude needs your permission to use Bash"));
@@ -250,4 +250,14 @@ fn dump_hook_settings() {
     if let Ok(p) = std::env::var("JT_DUMP_SETTINGS") {
         std::fs::write(p, hook_settings_json()).unwrap();
     }
+}
+
+#[test]
+fn tool_summaries() {
+    let t = |v: &str| tool_summary(&serde_json::from_str(v).unwrap());
+    assert_eq!(t(r#"{"tool_name":"Edit","tool_input":{"file_path":"/a/b/lib.rs"}}"#).as_deref(), Some("Edit · lib.rs"));
+    assert_eq!(t(r#"{"tool_name":"Bash","tool_input":{"command":"cargo test\nmore"}}"#).as_deref(), Some("Bash · cargo test"));
+    assert_eq!(t(r#"{"tool_name":"Bash","tool_input":{"command":"x","description":"Run tests"}}"#).as_deref(), Some("Bash · Run tests"));
+    assert_eq!(t(r#"{"tool_name":"mcp__juan-terminal__ssh_exec","tool_input":{}}"#).as_deref(), Some("ssh_exec"));
+    assert_eq!(t(r#"{"hook_event_name":"Stop"}"#), None);
 }

@@ -72,7 +72,9 @@ pub enum IdeRequest {
     CloseTab { tab_name: String },
     SaveDocument { path: PathBuf, reply: oneshot::Sender<bool> },
     /// Claude Code hook event (from our injected hooks).
-    Hook { terminal: Option<String>, event: String, message: Option<String>, cwd: Option<String> },
+    /// `prompt`: what the user sent (UserPromptSubmit). `tool`: short summary of the tool
+    /// about to run (PreToolUse), e.g. "Edit · lib.rs".
+    Hook { terminal: Option<String>, event: String, message: Option<String>, cwd: Option<String>, prompt: Option<String>, tool: Option<String> },
     /// A Claude session connected (true) or went away (false).
     Connection { connected: bool },
     /// Claude Code statusLine payload (model, effort, context window, session id…).
@@ -336,6 +338,8 @@ fn handle_connection(inner: Arc<Inner>, mut stream: TcpStream) {
             event: s("hook_event_name").unwrap_or_default(),
             message: s("message"),
             cwd: s("cwd"),
+            prompt: s("prompt"),
+            tool: tool_summary(&v),
         });
         return http_response(&mut stream, "204 No Content");
     }
@@ -548,6 +552,31 @@ fn call_tool(inner: &Inner, name: &str, args: &Value) -> Result<Value, (i64, Str
     }
 }
 
+/// "Edit · lib.rs", "Bash · cargo test", "Grep · fn main" from a PreToolUse payload.
+pub fn tool_summary(v: &Value) -> Option<String> {
+    let name = v.get("tool_name")?.as_str()?;
+    let input = &v["tool_input"];
+    let s = |k: &str| input.get(k).and_then(|x| x.as_str()).map(str::trim).filter(|x| !x.is_empty());
+    let file = |k: &str| s(k).map(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string()));
+    let detail = file("file_path")
+        .or_else(|| file("notebook_path"))
+        .or_else(|| s("description").map(str::to_string))
+        .or_else(|| s("command").map(str::to_string))
+        .or_else(|| s("pattern").map(str::to_string))
+        .or_else(|| s("url").map(str::to_string))
+        .or_else(|| s("query").map(str::to_string))
+        .or_else(|| s("prompt").map(str::to_string));
+    let short = |t: &str| -> String {
+        let one = t.lines().next().unwrap_or_default();
+        if one.chars().count() > 70 { format!("{}…", one.chars().take(70).collect::<String>()) } else { one.to_string() }
+    };
+    let name = name.strip_prefix("mcp__").map(|n| n.rsplit("__").next().unwrap_or(n)).unwrap_or(name);
+    Some(match detail {
+        Some(d) => format!("{name} · {}", short(&d)),
+        None => name.to_string(),
+    })
+}
+
 /// Claude Code settings (passed with `--settings`) whose hooks report Stop / Notification /
 /// SessionEnd / UserPromptSubmit events back to this server, tagged with the terminal they came from.
 pub fn hook_settings_json() -> String {
@@ -556,7 +585,7 @@ pub fn hook_settings_json() -> String {
     // statusLine: hand the payload to juan-terminal (which draws its own bar) and print nothing.
     let status = r#"[ -n "$CLAUDE_CODE_SSE_PORT" ] && [ -n "$JT_HOOK_TOKEN" ] && curl -s -m 1 -X POST -H "X-JT-Token: $JT_HOOK_TOKEN" -H "X-JT-Terminal: $JT_TERMINAL_ID" -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$CLAUDE_CODE_SSE_PORT/statusline" >/dev/null 2>&1; exit 0"#;
     json!({
-        "hooks": {"Stop": hook, "Notification": hook, "SessionEnd": hook, "UserPromptSubmit": hook},
+        "hooks": {"Stop": hook, "Notification": hook, "SessionEnd": hook, "UserPromptSubmit": hook, "PreToolUse": hook},
         "statusLine": {"type": "command", "command": status, "padding": 0},
     })
     .to_string()

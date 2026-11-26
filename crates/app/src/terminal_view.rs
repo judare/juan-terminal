@@ -176,6 +176,8 @@ pub struct TerminalView {
     /// Set when this tab runs a project dev script (Servers → Dev servers).
     pub dev_dir: Option<PathBuf>,
     pub claude_status: Option<ClaudeStatus>,
+    /// What Claude is doing here (hook events), for the sessions board.
+    pub activity: crate::claude_board::ClaudeActivity,
     claude_menu: Option<ClaudeMenu>,
     /// Waiting for the user to pick an element in Brave (inspector button).
     picking: bool,
@@ -267,6 +269,7 @@ impl TerminalView {
             attention: None,
             dev_dir: None,
             claude_status: None,
+            activity: Default::default(),
             claude_menu: None,
             picking: false,
             claude_fg: false,

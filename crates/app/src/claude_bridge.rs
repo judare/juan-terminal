@@ -174,7 +174,7 @@ impl Workspace {
                 let ok = editor.is_some_and(|e| e.update(cx, |e, cx| e.save(cx)));
                 let _ = reply.send(ok);
             }
-            IdeRequest::Hook { terminal, event, message, cwd } => self.on_claude_hook(terminal, &event, message, cwd, window, cx),
+            IdeRequest::Hook { terminal, event, message, cwd, prompt, tool } => self.on_claude_hook(terminal, &event, message, cwd, prompt, tool, window, cx),
             IdeRequest::Status { terminal, data } => {
                 if let Some((_, t)) = terminal.as_deref().and_then(|id| self.find_terminal(id, cx)) {
                     let st = crate::terminal_view::ClaudeStatus::from_json(&data);
@@ -244,8 +244,17 @@ impl Workspace {
         self.terminals.iter().find_map(|(key, tabs)| tabs.tabs.iter().find(|t| t.read(cx).jt_id == id).map(|t| (key.clone(), t.clone())))
     }
 
-    fn on_claude_hook(&mut self, terminal: Option<String>, event: &str, message: Option<String>, cwd: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    #[allow(clippy::too_many_arguments)]
+    fn on_claude_hook(&mut self, terminal: Option<String>, event: &str, message: Option<String>, cwd: Option<String>, prompt: Option<String>, tool: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let found = terminal.as_deref().and_then(|id| self.find_terminal(id, cx));
+        // Sessions board: track what this terminal's Claude is doing.
+        if let Some((_, t)) = &found {
+            let changed = t.update(cx, |t, _| t.activity.apply(event, prompt, tool, message.clone()));
+            if changed {
+                // Other windows show this session on their board / badge too.
+                cx.defer(|cx| cx.refresh_windows());
+            }
+        }
         let attention = match event {
             "Stop" => Attention::Done,
             "Notification" => Attention::NeedsInput,
