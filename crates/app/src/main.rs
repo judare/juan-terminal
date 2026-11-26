@@ -10,6 +10,7 @@ mod pdf_view;
 mod pptx_view;
 mod brave;
 mod chat_view;
+mod claude_board;
 mod claude_bridge;
 mod claude_sessions;
 mod claude_tools;

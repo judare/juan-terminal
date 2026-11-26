@@ -86,7 +86,7 @@ struct Totp {
     copied: Option<(String, std::time::Instant)>,
     tick: Option<gpui::Task<()>>,
     /// Workspace projects (id, name), in sidebar order: group headers and the right-click menu.
-    projects: Vec<(String, String)>,
+    projects: Vec<(String, String, Option<std::path::PathBuf>)>,
     /// Right-click menu on an account: (position, account id).
     menu: Option<(gpui::Point<gpui::Pixels>, String)>,
 }
@@ -877,7 +877,7 @@ impl ServersPanel {
             cx.notify();
         }))
         .child(div().px(px(12.)).py(px(2.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("PROYECTO"));
-        let options = std::iter::once((None, "Ninguno".to_string())).chain(self.totp.projects.iter().map(|(pid, name)| (Some(pid.clone()), name.clone())));
+        let options = std::iter::once((None, "Ninguno".to_string())).chain(self.totp.projects.iter().map(|(pid, name, _)| (Some(pid.clone()), name.clone())));
         for (i, (pid, name)) in options.enumerate() {
             let on = pid == current;
             let id = id.clone();
@@ -980,7 +980,7 @@ impl ServersPanel {
         let now = crate::totp::now_secs();
         // Grouped by project (sidebar order), then the unassigned ones; headers only once
         // some account has a project.
-        let project_ix = |a: &crate::totp::Account| a.project.as_deref().and_then(|p| self.totp.projects.iter().position(|(id, _)| id == p));
+        let project_ix = |a: &crate::totp::Account| a.project.as_deref().and_then(|p| self.totp.projects.iter().position(|(id, _, _)| id == p));
         let mut ordered: Vec<(Option<usize>, &crate::totp::Account)> = self.totp.accounts.iter().map(|a| (project_ix(a), a)).collect();
         ordered.sort_by_key(|(ix, _)| ix.unwrap_or(usize::MAX));
         let grouped = ordered.iter().any(|(ix, _)| ix.is_some());
@@ -989,7 +989,22 @@ impl ServersPanel {
             if grouped && last_group != Some(ix) {
                 last_group = Some(ix);
                 let title = ix.map(|i| self.totp.projects[i].1.clone()).unwrap_or_else(|| "Sin proyecto".into());
-                col = col.child(div().pl(px(14.)).pr(px(8.)).pt(px(8.)).pb(px(2.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_FAINT)).child(title.to_uppercase()));
+                let icon_el = match ix.and_then(|i| self.totp.projects[i].2.clone()) {
+                    Some(path) => gpui::img(path).size(px(16.)).flex_none().rounded(px(3.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                    None => gpui::svg().path("icons/project-empty.svg").size(px(16.)).flex_none().text_color(theme::rgb(theme::TEXT_FAINT)).into_any_element(),
+                };
+                col = col.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .pl(px(14.))
+                        .pr(px(8.))
+                        .pt(px(10.))
+                        .pb(px(4.))
+                        .child(icon_el)
+                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.5)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_MUTED)).child(title)),
+                );
             }
             let id = a.id.clone();
             let i3 = id.clone();
@@ -1233,8 +1248,8 @@ fn prompt_row(input: &Entity<TextInput>, depth: usize) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn load_projects() -> Vec<(String, String)> {
-    workspace_state::StateStore::default_location().load().projects.into_iter().map(|p| (p.id, p.name)).collect()
+fn load_projects() -> Vec<(String, String, Option<std::path::PathBuf>)> {
+    workspace_state::StateStore::default_location().load().projects.into_iter().map(|p| { let icon = p.icon_path(); (p.id, p.name, icon) }).collect()
 }
 
 fn totp_title(a: &crate::totp::Account) -> String {

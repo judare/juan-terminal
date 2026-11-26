@@ -219,6 +219,7 @@ enum SidebarMode {
     Ports,
     Servers,
     WhatsApp,
+    Claude,
 }
 
 pub struct Workspace {
@@ -229,6 +230,8 @@ pub struct Workspace {
     new_tab_menu: Option<gpui::Point<gpui::Pixels>>,
     name_prompt: Option<NamePrompt>,
     sidebar_mode: SidebarMode,
+    /// Repaints the Claude sessions board every second while it's visible.
+    pub(crate) board_tick: Option<Task<()>>,
     quick_open: Option<(Entity<QuickOpen>, Subscription)>,
     palette: Option<(Entity<crate::command_palette::CommandPalette>, Subscription, Option<FocusHandle>)>,
     /// Agent usage dashboard (full-window overlay) and the focus to restore when it closes.
@@ -383,6 +386,7 @@ impl Workspace {
             new_tab_menu: None,
             name_prompt: None,
             sidebar_mode: SidebarMode::Files,
+            board_tick: None,
             quick_open: None,
             palette: None,
             usage: None,
@@ -1663,6 +1667,20 @@ impl Workspace {
             .map(|(i, _)| i);
         if let Some(ix) = ix {
             self.select_terminal(ix, window, cx);
+        }
+    }
+
+    /// Show a terminal of this window by its `JT_TERMINAL_ID` (sessions board).
+    pub(crate) fn focus_terminal_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        for tabs in self.terminals.values_mut() {
+            if let Some(ix) = tabs.tabs.iter().position(|t| t.read(cx).jt_id == id) {
+                tabs.active = ix;
+                let t = tabs.tabs[ix].clone();
+                self.terminal_visible = true;
+                window.focus(&t.focus_handle(cx));
+                cx.notify();
+                return;
+            }
         }
     }
 
@@ -3532,7 +3550,11 @@ impl Workspace {
         div().w_full().px(px(6.)).child(el).into_any_element()
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn claude_board_visible(&self) -> bool {
+        self.sidebar_visible && self.sidebar_mode == SidebarMode::Claude
+    }
+
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.deleted_entries = self.git_panel.as_ref().map(|g| g.read(cx).deleted_entries()).unwrap_or_default();
         self.rows = if self.sidebar_mode == SidebarMode::Files { self.build_rows() } else { Rc::new(Vec::new()) };
         if self.locate_pending && self.sidebar_mode == SidebarMode::Files {
@@ -3552,6 +3574,8 @@ impl Workspace {
         let servers_panel = (self.sidebar_mode == SidebarMode::Servers).then(|| self.servers_panel.clone()).flatten();
         let whatsapp_panel = (self.sidebar_mode == SidebarMode::WhatsApp).then(|| self.whatsapp_panel.clone()).flatten();
         let wa_unread = self.whatsapp_panel.as_ref().map(|p| p.read(cx).total_unread()).unwrap_or(0);
+        let claude_needs = self.claude_needs_you(window, cx);
+        let claude_board = (self.sidebar_mode == SidebarMode::Claude).then(|| self.render_claude_board(window, cx));
         // The ports list polls only while it's on screen.
         if let Some(pp) = self.ports_panel.clone() {
             let on = self.sidebar_mode == SidebarMode::Ports && self.sidebar_visible;
@@ -3631,6 +3655,12 @@ impl Workspace {
                     .child(mode_tab("mode-search", "icons/search.svg", "Search", self.sidebar_mode == SidebarMode::Search).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
                         this.search_in_project(&SearchInProject, w, cx);
                     })))
+                    .child(mode_tab("mode-claude", "icons/claude-spark.svg", "Claude sessions", self.sidebar_mode == SidebarMode::Claude).when(claude_needs > 0, |d| d.child(
+                        mode_badge(claude_needs, 0xb8862b, 0xffffff),
+                    )).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.sidebar_mode = SidebarMode::Claude;
+                        cx.notify();
+                    })))
                     .child(mode_tab("mode-tools", "icons/gear.svg", "Tools", self.sidebar_mode == SidebarMode::Tools).when(problems > 0, |d| d.child(
                         mode_badge(problems, 0x8c2f39, 0xffffff),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_tools(w, cx))))
@@ -3651,6 +3681,7 @@ impl Workspace {
             .when_some(ports_panel, |d, pp| d.child(div().flex_1().min_h_0().child(pp)))
             .when_some(servers_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when_some(whatsapp_panel, |d, wp| d.child(div().flex_1().min_h_0().child(wp)))
+            .when_some(claude_board, |d, b| d.child(div().flex_1().min_h_0().child(b)))
             .when(self.sidebar_mode == SidebarMode::Files, |d| d.child(
                 uniform_list(
                     "sidebar-rows",
@@ -4126,7 +4157,7 @@ impl Render for Workspace {
             window.set_window_title(&title);
             self.window_title = title;
         }
-        let sidebar = self.sidebar_visible.then(|| self.render_sidebar(cx));
+        let sidebar = self.sidebar_visible.then(|| self.render_sidebar(window, cx));
         let context_menu = self.render_context_menu(cx);
         let new_tab_menu = self.render_new_tab_menu(cx);
         let name_prompt = self.render_name_prompt(cx);

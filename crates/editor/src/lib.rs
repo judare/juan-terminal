@@ -1,6 +1,7 @@
 //! Editor core: documents, editing commands, language detection and syntax highlighting.
 //! No UI code here; the GPUI view lives in the `app` crate.
 
+pub mod conflicts;
 pub mod document;
 pub mod highlight;
 pub mod language;

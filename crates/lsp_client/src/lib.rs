@@ -198,7 +198,8 @@ impl LspServer {
                         "synchronization": {"didSave": true},
                         "publishDiagnostics": {},
                         "diagnostic": {"dynamicRegistration": false},
-                        "definition": {"linkSupport": true}
+                        "definition": {"linkSupport": true},
+                        "hover": {"contentFormat": ["markdown", "plaintext"]}
                     },
                     "workspace": {"configuration": true, "workspaceFolders": true}
                 }
@@ -288,6 +289,16 @@ impl LspServer {
         Ok(parse_diagnostics(&items))
     }
 
+    /// Hover text (Markdown) at a position, if the server has any.
+    pub async fn hover(&self, path: &Path, line: usize, character: usize) -> Result<Option<String>> {
+        let rx = self.request(
+            "textDocument/hover",
+            json!({"textDocument": {"uri": path_to_uri(path)}, "position": {"line": line, "character": character}}),
+        )?;
+        let v = rx.await.map_err(|_| anyhow!("cancelled"))??;
+        Ok(parse_hover(&v))
+    }
+
     pub async fn definition(&self, path: &Path, line: usize, character: usize) -> Result<Vec<Location>> {
         let rx = self.request(
             "textDocument/definition",
@@ -312,6 +323,30 @@ impl LspServer {
             })
             .collect())
     }
+}
+
+/// Hover result → Markdown. Accepts `MarkupContent`, `MarkedString` and arrays of them.
+pub fn parse_hover(v: &Value) -> Option<String> {
+    fn piece(c: &Value) -> Option<String> {
+        match c {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) => {
+                let value = o.get("value")?.as_str()?;
+                match o.get("language").and_then(|l| l.as_str()) {
+                    Some(lang) => Some(format!("```{lang}\n{value}\n```")),
+                    None => Some(value.to_string()),
+                }
+            }
+            _ => None,
+        }
+    }
+    let contents = v.get("contents")?;
+    let text = match contents {
+        Value::Array(a) => a.iter().filter_map(piece).collect::<Vec<_>>().join("\n\n"),
+        other => piece(other)?,
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 pub fn parse_diagnostics(items: &Value) -> Vec<LspDiagnostic> {
