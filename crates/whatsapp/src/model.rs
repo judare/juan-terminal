@@ -16,6 +16,8 @@ pub struct ChatSummary {
     /// Who sent the last message in a group (empty otherwise / when it's ours).
     pub last_sender: String,
     pub last_from_me: bool,
+    /// We reacted to the last message (counts as answering it).
+    pub last_reacted_by_me: bool,
     /// Delivery state of the last message when it's ours.
     pub last_status: MsgStatus,
     pub unread: u32,

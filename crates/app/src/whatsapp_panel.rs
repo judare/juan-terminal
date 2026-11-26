@@ -30,18 +30,22 @@ enum Filter {
     All,
     Favorites,
     Unread,
+    /// Someone else wrote last and we neither answered nor reacted (chats only, not groups).
+    Unanswered,
     Groups,
     Label(i64),
 }
 
 impl Filter {
-    const ALL: [(Filter, &'static str); 4] = [(Filter::All, "Todos"), (Filter::Favorites, "Favoritos"), (Filter::Unread, "No leídos"), (Filter::Groups, "Grupos")];
+    const ALL: [(Filter, &'static str); 5] =
+        [(Filter::All, "Todos"), (Filter::Favorites, "Favoritos"), (Filter::Unread, "No leídos"), (Filter::Unanswered, "Sin respuesta"), (Filter::Groups, "Grupos")];
 
     fn keep(self, c: &ChatSummary) -> bool {
         match self {
             Filter::All => true,
             Filter::Favorites => c.important,
             Filter::Unread => c.unread > 0,
+            Filter::Unanswered => !c.is_group && !c.last_from_me && !c.last_reacted_by_me,
             Filter::Groups => c.is_group,
             Filter::Label(id) => c.labels.contains(&id),
         }
@@ -529,7 +533,7 @@ impl WhatsAppPanel {
                     _ => self.filter == f,
                 };
                 let count = match f {
-                    Filter::Unread => self.all.iter().filter(|c| c.unread > 0).count(),
+                    Filter::Unread | Filter::Unanswered => self.all.iter().filter(|c| f.keep(c)).count(),
                     _ => 0,
                 };
                 div()
@@ -1079,7 +1083,25 @@ impl Render for WhatsAppPanel {
                                 .rounded(px(6.))
                                 .bg(theme::rgb(theme::SELECTED))
                                 .text_size(px(12.5))
-                                .child(self.query.clone()),
+                                .child(div().flex_1().min_w_0().child(self.query.clone()))
+                                .when(!self.query.read(cx).content.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .id("wa-search-clear")
+                                            .flex_none()
+                                            .ml(px(4.))
+                                            .p(px(2.))
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(theme::rgb(theme::BORDER)))
+                                            .child(gpui::svg().path("icons/close.svg").size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)))
+                                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                                this.query.update(cx, |q, cx| q.set_text("", cx));
+                                                let fh = this.query.focus_handle(cx);
+                                                window.focus(&fh);
+                                            })),
+                                    )
+                                }),
                         ),
                 )
                 .children(self.render_archive_bar(cx))
@@ -1097,6 +1119,7 @@ impl Render for WhatsAppPanel {
                         (_, Some(_)) => "Ningún chat cumple los dos filtros.",
                         (Filter::Favorites, _) => "No hay chats favoritos. Clic derecho en un chat → Marcar como favorito.",
                         (Filter::Unread, _) => "No hay chats sin leer.",
+                        (Filter::Unanswered, _) => "No hay chats sin responder.",
                         _ => "No hay grupos.",
                     }),
                 )

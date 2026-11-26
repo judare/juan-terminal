@@ -438,6 +438,8 @@ impl WhatsApp {
             };
             if client.send_reaction(jid, key, &emoji).await.is_ok() {
                 shared.store.set_reaction(&chat, &id, ME, &emoji, true);
+                // A reaction to the last message takes the chat out of "Sin respuesta".
+                shared.emit(Update::Chats);
                 shared.emit(Update::Messages(chat));
             }
         });
