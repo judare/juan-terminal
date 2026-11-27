@@ -153,6 +153,10 @@ impl AssetView {
     pub fn new(path: PathBuf, kind: AssetKind, focus: FocusHandle, cx: &mut Context<Self>) -> Self {
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let display = if kind == AssetKind::Image { converted_image(&path) } else { path.clone() };
+        if kind == AssetKind::Image {
+            // GPUI caches images by path: drop it so a rewritten file shows its new pixels.
+            gpui::ImageSource::from(display.clone()).remove_asset(cx);
+        }
         let player = matches!(kind, AssetKind::Video | AssetKind::Audio).then_some(()).filter(|_| plays_natively(&path)).map(|_| crate::video_player::NativePlayer::new(&path, kind == AssetKind::Audio));
         let natural = if kind == AssetKind::Image {
             imagesize::size(&display).ok().map(|s| (s.width as f32, s.height as f32)).filter(|(w, h)| *w > 0. && *h > 0.)

@@ -1779,9 +1779,14 @@ impl Image {
             ImageFormat::Svg => {
                 let pixmap = svg_renderer.render_pixmap(&self.bytes, SvgSize::ScaleFactor(1.0))?;
 
-                let buffer =
+                let mut buffer =
                     image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())
                         .unwrap();
+
+                // Premultiplied RGBA from resvg -> BGRA like every other format (red showed blue).
+                for pixel in buffer.chunks_exact_mut(4) {
+                    crate::color::swap_rgba_pa_to_bgra(pixel);
+                }
 
                 SmallVec::from_elem(Frame::new(buffer), 1)
             }
