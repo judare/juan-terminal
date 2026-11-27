@@ -37,6 +37,9 @@ jobs:
           key: release
 
       - name: Build app bundle
+        env:
+          # audiopus_sys ships a CMakeLists older than CMake 4 accepts.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           VERSION="${TAG#v}" PROFILE=release BUNDLE_ONLY=1 ./packaging/build-app.sh
 
