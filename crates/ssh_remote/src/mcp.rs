@@ -52,7 +52,7 @@ pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServ
             "serverInfo": {"name": "juan-terminal", "version": env!("CARGO_PKG_VERSION")},
             "instructions": ({
                 let shown = |t: &str| !extra.hidden.iter().any(|h| h == t);
-                let mut s = String::from("You are running inside juan-terminal, the user's development workspace.");
+                let mut s = String::from("You are running inside Fragua (formerly juan-terminal), the user's development workspace.");
                 if shown("list_dev_servers") {
                     s.push_str(" When the user asks to see, screenshot, open or test their app/page (e.g. with Moli: `moli fetch --layout --dump screenshot URL > shot.png`, or any browser tool), first call list_dev_servers and use this project's local dev server URL (http://localhost:PORT) rather than the production site, unless they explicitly ask for production. If none is running, start it yourself in the background (list_dev_servers gives the repo's start command), wait until the URL responds, and then take the screenshot — don't fall back to production.");
                 }
@@ -97,7 +97,7 @@ pub fn handle_with(project_id: &str, msg: &Value, list: impl Fn() -> Vec<SshServ
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             if extra.hidden.iter().any(|h| h == name) {
-                json!({"content": [{"type": "text", "text": format!("{name} is switched off in juan-terminal (Tools tab).")}], "isError": true})
+                json!({"content": [{"type": "text", "text": format!("{name} is switched off in Fragua (Tools tab).")}], "isError": true})
             } else if let Some((content, is_error)) = (extra.call)(name, &args) {
                 json!({"content": content, "isError": is_error})
             } else {
@@ -115,7 +115,7 @@ fn call(project_id: &str, name: &str, args: &Value, list: &impl Fn() -> Vec<SshS
     match name {
         "list_servers" => {
             if servers.is_empty() {
-                return (format!("No SSH servers configured for this project ({project_id}). Add one in juan-terminal's Servers tab."), false);
+                return (format!("No SSH servers configured for this project ({project_id}). Add one in Fragua's Servers tab."), false);
             }
             let lines: Vec<String> = servers.iter().map(|s| format!("- {}: {} (port {})", s.name, s.destination(), s.port_or_default())).collect();
             (lines.join("\n"), false)

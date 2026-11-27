@@ -1,4 +1,4 @@
-//! Make Juan Terminal the default app for Office documents, PDFs, Markdown, plain text, source
+//! Make Fragua the default app for Office documents, PDFs, Markdown, plain text, source
 //! code, images, video and audio. Done once per VERSION (marker file), only from the installed
 //! .app, so a later choice in Finder ("Open With → Change All") wins.
 

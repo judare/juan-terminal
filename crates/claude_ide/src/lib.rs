@@ -24,7 +24,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
 use serde_json::{Value, json};
 
-pub const IDE_NAME: &str = "Juan Terminal";
+pub const IDE_NAME: &str = "Fragua";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Selection {

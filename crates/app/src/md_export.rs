@@ -676,7 +676,7 @@ mod tests {
     fn export_sample() {
         let out = PathBuf::from(std::env::var("JT_EXPORT_OUT").unwrap());
         let md = "# Informe trimestral\n\nTexto **importante** con *énfasis*.\n\n## Tabla\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n- uno\n- dos\n\n```rust\nfn main() {}\n```\n\n".repeat(6);
-        let b = Branding { name: "Juan Terminal".into(), subtitle: "Engineering".into(), logo: std::env::var("JT_LOGO").unwrap_or_default(), accent: "#1F4E99".into(), author: "Juan".into(), footer: "Confidential".into(), show_date: true, watermark: true, watermark_text: "BORRADOR".into(), watermark_opacity: 10 };
+        let b = Branding { name: "Fragua".into(), subtitle: "Engineering".into(), logo: std::env::var("JT_LOGO").unwrap_or_default(), accent: "#1F4E99".into(), author: "Juan".into(), footer: "Confidential".into(), show_date: true, watermark: true, watermark_text: "BORRADOR".into(), watermark_opacity: 10 };
         export(&md, &out, &out, &b).unwrap();
         assert!(out.is_file());
     }

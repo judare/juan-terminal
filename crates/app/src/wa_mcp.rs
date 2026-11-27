@@ -9,7 +9,7 @@ use chrono::{Local, TimeZone};
 use serde_json::{Value, json};
 use whatsapp::{ChatMessage, MsgKind, Store};
 
-pub const INSTRUCTIONS: &str = " The user's WhatsApp is available through whatsapp_list_chats, whatsapp_read_chat, whatsapp_search, whatsapp_get_media and whatsapp_send (text and file attachments; it is not sent: it lands in that chat's composer in juan-terminal for the user to review and send). Chats can be referred to by name, phone number or JID. Never send messages the user didn't ask for.";
+pub const INSTRUCTIONS: &str = " The user's WhatsApp is available through whatsapp_list_chats, whatsapp_read_chat, whatsapp_search, whatsapp_get_media and whatsapp_send (text and file attachments; it is not sent: it lands in that chat's composer in Fragua for the user to review and send). Chats can be referred to by name, phone number or JID. Never send messages the user didn't ask for.";
 
 pub fn tools() -> Vec<Value> {
     vec![

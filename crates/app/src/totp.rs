@@ -277,7 +277,7 @@ pub fn save_accounts(accounts: &[Account]) -> Result<()> {
 
 pub fn store_secret(id: &str, secret: &[u8]) -> Result<()> {
     let out = Command::new("/usr/bin/security")
-        .args(["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", id, "-l", "juan-terminal 2FA", "-w", &base32_encode(secret)])
+        .args(["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", id, "-l", "Fragua 2FA", "-w", &base32_encode(secret)])
         .stdin(Stdio::null())
         .output()
         .context("Couldn't run security")?;

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Build the release binary and install "Juan Terminal.app" into /Applications
+# Build the release binary and install "Fragua.app" into /Applications
 # (Finder, Spotlight, Raycast and the Dock can open it; no terminal needed).
 # CI (.github/workflows/release.yml) sets BUNDLE_ONLY=1 (build the bundle, don't install),
 # PROFILE=release and VERSION from the tag.
@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source "$HOME/.cargo/env" 2>/dev/null || true
 
-APP_NAME="Juan Terminal"
+APP_NAME="Fragua"
 DEST="/Applications/$APP_NAME.app"
 WORK="target/bundle/$APP_NAME.app"
 VERSION=${VERSION:-$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')}
@@ -123,7 +123,7 @@ if [[ -n "${BUNDLE_ONLY:-}" ]]; then echo "Built $WORK"; exit 0; fi
 # Replace the installed copy (quit it first).
 pkill -x juan-terminal 2>/dev/null || true
 sleep 0.5
-rm -rf "$DEST"
+rm -rf "$DEST" "/Applications/Juan Terminal.app"  # old name (before Fragua)
 cp -R "$WORK" "$DEST"
 # Let Launch Services / Spotlight / Raycast pick it up right away.
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST" >/dev/null 2>&1 || true

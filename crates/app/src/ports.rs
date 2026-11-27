@@ -434,11 +434,11 @@ impl Render for PortsPanel {
         let mut list = div().id("ports-panel").flex().flex_col().size_full().overflow_y_scroll().pb(px(16.));
         let ours_pids: Vec<i32> = ours.iter().map(|l| l.pid).collect();
         list = list.child(
-            section("ports-ours", "JUAN-TERMINAL", "started from your terminals", ours.len(), true)
+            section("ports-ours", "FRAGUA", "started from your terminals", ours.len(), true)
                 .when(!ours_pids.is_empty(), |d| {
                     d.child(kill_all_button("ports-kill-ours").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                         let n = ours_pids.len();
-                        this.confirm_kill(ours_pids.clone(), format!("{n} process(es) started from juan-terminal"), w, cx)
+                        this.confirm_kill(ours_pids.clone(), format!("{n} process(es) started from Fragua"), w, cx)
                     })))
                 })
                 .child(icon_action("ports-refresh", "icons/fetch.svg", "Refresh").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx)))),
@@ -447,7 +447,7 @@ impl Render for PortsPanel {
             list = list.child(div().mx(px(12.)).my(px(4.)).px(px(8.)).py(px(4.)).rounded(px(4.)).bg(theme::rgb(0x3a1f22)).text_size(px(11.5)).text_color(theme::rgb(0xf0b3b8)).child(e.clone()));
         }
         if ours.is_empty() && self.loaded {
-            list = list.child(div().px(px(16.)).pb(px(6.)).text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child("No dev servers running from juan-terminal."));
+            list = list.child(div().px(px(16.)).pb(px(6.)).text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child("No dev servers running from Fragua."));
         }
         for l in &ours {
             list = list.child(self.render_listener(l, &home, cx));
@@ -578,7 +578,7 @@ pub fn dev_servers_report(app_pid: i32, roots: &[(String, PathBuf)]) -> String {
     for l in list.iter().filter(|l| !l.system) {
         match project_of(&l.cwd) {
             Some(name) => project.push(format!("- [{name}] {}", line(l))),
-            None if l.ours => other.push(format!("- [started in juan-terminal] {}", line(l))),
+            None if l.ours => other.push(format!("- [started in Fragua] {}", line(l))),
             None => {}
         }
     }
@@ -597,7 +597,7 @@ pub fn dev_servers_report(app_pid: i32, roots: &[(String, PathBuf)]) -> String {
         out.push('\n');
     }
     if !other.is_empty() {
-        out.push_str("\nOther servers started from juan-terminal:\n");
+        out.push_str("\nOther servers started from Fragua:\n");
         out.push_str(&other.join("\n"));
         out.push('\n');
     }

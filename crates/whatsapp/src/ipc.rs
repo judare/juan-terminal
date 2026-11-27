@@ -43,7 +43,7 @@ pub fn socket_path(dir: &Path) -> PathBuf {
 
 fn roundtrip(dir: &Path, body: serde_json::Value, timeout: Duration) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket_path(dir))
-        .map_err(|_| "juan-terminal no está abierto o WhatsApp no está conectado en la app.".to_string())?;
+        .map_err(|_| "Fragua no está abierto o WhatsApp no está conectado en la app.".to_string())?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.write_all(format!("{body}\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream);

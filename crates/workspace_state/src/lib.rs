@@ -312,7 +312,7 @@ impl StateStore {
             Ok(text) => match toml::from_str::<WorkspaceState>(&text) {
                 Ok(state) => state,
                 Err(err) => {
-                    eprintln!("juan-terminal: state file is invalid ({err}); backing it up");
+                    eprintln!("fragua: state file is invalid ({err}); backing it up");
                     let _ = fs::rename(&self.path, self.path.with_extension("toml.bak"));
                     WorkspaceState { version: STATE_VERSION, ..Default::default() }
                 }

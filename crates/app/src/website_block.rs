@@ -146,7 +146,7 @@ fn copy_as_root(src: &Path) -> Result<(), String> {
         sh_quote(&src.display().to_string())
     );
     let apple = format!(
-        "do shell script \"{}\" with prompt \"juan-terminal needs your password to update the blocked websites in /etc/hosts.\" with administrator privileges",
+        "do shell script \"{}\" with prompt \"Fragua needs your password to update the blocked websites in /etc/hosts.\" with administrator privileges",
         script.replace('\\', "\\\\").replace('"', "\\\"")
     );
     let out = Command::new("/usr/bin/osascript").arg("-e").arg(apple).output().map_err(|e| format!("osascript: {e}"))?;

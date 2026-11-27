@@ -1,4 +1,8 @@
-# On every pushed tag (vX.Y.Z): build "Juan Terminal.app" for Apple Silicon, pack it in a .dmg
+# On every pushed tag (vX.Y.Z): build "Fragua.app" for Apple Silicon, pack it in a .dmg      - name: Build app bundle
+        env:
+          # audiopus_sys ships a CMakeLists older than CMake 4 accepts.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
 # and attach it to that tag's GitHub release (created here if it doesn't exist yet).
 name: Release DMG
 
@@ -45,12 +49,12 @@ jobs:
 
       - name: Create DMG
         run: |
-          APP="target/bundle/Juan Terminal.app"
-          DMG="Juan-Terminal-${TAG}-arm64.dmg"
+          APP="target/bundle/Fragua.app"
+          DMG="Fragua-${TAG}-arm64.dmg"
           STAGE=$(mktemp -d)
           cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "Juan Terminal" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
+          hdiutil create -volname "Fragua" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
           shasum -a 256 "$DMG" | tee "$DMG.sha256"
           echo "DMG=$DMG" >> "$GITHUB_ENV"
 

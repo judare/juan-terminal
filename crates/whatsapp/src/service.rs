@@ -707,7 +707,7 @@ fn serve_ipc(stream: std::os::unix::net::UnixStream, shared: &Arc<Shared>, handl
         return reply(false, "Petición inválida".into());
     };
     if shared.client().is_none() || !matches!(*shared.status.lock().unwrap(), Status::Connected | Status::Connecting) {
-        return reply(false, "WhatsApp no está conectado en juan-terminal (vincula el dispositivo en la pestaña WhatsApp).".into());
+        return reply(false, "WhatsApp no está conectado en Fragua (vincula el dispositivo en la pestaña WhatsApp).".into());
     }
     let Some(chat) = shared.store.resolve_chat(&req.chat) else {
         return reply(false, format!("No encontré el chat \"{}\". Usa whatsapp_list_chats para ver los JID.", req.chat));
@@ -744,7 +744,7 @@ fn serve_ipc(stream: std::os::unix::net::UnixStream, shared: &Arc<Shared>, handl
         SendAnswer::Drafted => {
             return reply(true, format!("No se envió: quedó como borrador en el compositor del chat {} para que el usuario lo revise y lo envíe él mismo.", req.chat_name));
         }
-        SendAnswer::Reject => return reply(false, "El usuario rechazó el envío en juan-terminal (o no respondió).".into()),
+        SendAnswer::Reject => return reply(false, "El usuario rechazó el envío en Fragua (o no respondió).".into()),
     }
     *shared.last_claude_send.lock().unwrap() = Some(Instant::now());
     let result: Result<(), String> = handle.block_on(async {
