@@ -143,6 +143,10 @@ impl Document {
         let mut fresh = Self::open(&path)?;
         let pos = self.selection.head.min(fresh.rope.len_chars());
         fresh.selection = Selection::caret(pos);
+        // Keep versions monotonic: caches keyed by `version()` (wrap rows, highlight spans)
+        // must see a reload as a change, or they keep describing the old text.
+        fresh.version = self.version + 1;
+        fresh.saved_version = fresh.version;
         *self = fresh;
         Ok(())
     }
@@ -918,6 +922,22 @@ mod tests {
 
     fn doc(s: &str) -> Document {
         Document::from_str(s, Language::TypeScript)
+    }
+
+    #[test]
+    fn reload_bumps_version() {
+        let dir = std::env::temp_dir().join(format!("doc-reload-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.ts");
+        fs::write(&path, "a\n").unwrap();
+        let mut d = Document::open(&path).unwrap();
+        let before = d.version();
+        fs::write(&path, "a\nb\nc\n").unwrap();
+        d.reload().unwrap();
+        assert!(d.version() > before);
+        assert!(!d.is_dirty());
+        assert_eq!(d.line_count(), 4);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
