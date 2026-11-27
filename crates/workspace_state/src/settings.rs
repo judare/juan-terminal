@@ -323,7 +323,7 @@ mod tests {
         )
         .unwrap();
         // /etc/hosts only gets blocked_websites; everything else is released (Brave handles it).
-        assert_eq!(st.hosts_file(), (v(&["a.com", "www.a.com"]), v(&["work.example", "instagram.com", "www.work.example", "www.instagram.com", "www.youtube.com", "youtube.com"])));
+        assert_eq!(st.hosts_file(), (v(&["a.com", "www.a.com"]), v(&["instagram.com", "work.example", "www.instagram.com", "www.work.example", "www.youtube.com", "youtube.com"])));
         // 2026-11-23 (Monday) 08:00 in Colombia: instagram blanked; work.example only when locked.
         let mon = 1_795_438_800;
         assert_eq!(st.brave_blocked_at(mon, 0, &[]), v(&["a.com", "instagram.com", "www.a.com", "www.instagram.com", "www.youtube.com", "youtube.com"]));
