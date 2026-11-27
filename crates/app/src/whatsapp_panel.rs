@@ -1117,6 +1117,9 @@ pub(crate) fn menu_box(on_out: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut 
         .border_1()
         .border_color(theme::rgb(theme::BORDER))
         .shadow_lg()
+        // Floating menus are painted over the chat list: block hover/clicks so they
+        // don't fall through to the rows underneath (which would open the chat).
+        .occlude()
         .on_mouse_down_out(on_out)
 }
 
