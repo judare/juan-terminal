@@ -526,6 +526,20 @@ impl Store {
         if m.unseen {
             let _ = db.execute("UPDATE chats SET unread=unread+1 WHERE jid=?1", [&m.chat]);
         }
+        // Our own message (e.g. replied from the phone) newer than every incoming one: like
+        // WhatsApp, answering means the chat was read, even if no read-self receipt reaches us.
+        if m.from_me {
+            let newer_incoming: bool = db
+                .query_row("SELECT 1 FROM messages WHERE chat=?1 AND from_me=0 AND ts>?2 LIMIT 1", params![m.chat, m.ts], |_| Ok(true))
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            if !newer_incoming {
+                let _ = db.execute("UPDATE messages SET seen=1 WHERE chat=?1 AND seen=0 AND ts<=?2", params![m.chat, m.ts]);
+                let _ = db.execute("UPDATE chats SET unread=0 WHERE jid=?1", [&m.chat]);
+            }
+        }
         true
     }
 

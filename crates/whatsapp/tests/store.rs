@@ -124,3 +124,18 @@ fn labels_set_filter_and_follow_lid_merge() {
     assert!(st.chat("111@s.whatsapp.net").unwrap().labels.is_empty());
     assert_eq!(st.labels().len(), 1);
 }
+
+#[test]
+fn own_reply_clears_unread() {
+    let st = Store::open(&tmp()).unwrap();
+    let c = "444@s.whatsapp.net";
+    st.insert_message(&msg(c, "i1", 100, "hola", false, true));
+    st.insert_message(&msg(c, "i2", 110, "¿cómo vas?", false, true));
+    // An old own message (history) doesn't clear newer incoming ones.
+    st.insert_message(&msg(c, "o0", 90, "antes", true, false));
+    assert_eq!(st.chat(c).unwrap().unread, 2);
+    // Replying from the phone does.
+    st.insert_message(&msg(c, "o1", 120, "bien", true, false));
+    assert_eq!(st.chat(c).unwrap().unread, 0);
+    assert!(st.mark_read(c).is_empty(), "incoming marked seen too");
+}

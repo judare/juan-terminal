@@ -3603,6 +3603,8 @@ impl Workspace {
                 card.update(cx, |c, _| c.width = w);
             }
         }
+        // Active project's icon + name next to the traffic lights.
+        let title_project = self.active_project().map(|p| (p.icon_path(), SharedString::from(p.name.clone())));
         div()
             .flex()
             .flex_col()
@@ -3610,7 +3612,41 @@ impl Workspace {
             .w(px(self.sidebar_width))
             .flex_none()
             .bg(theme::rgb(theme::SIDEBAR_BG))
-            .child(div().h(px(TOP_BAR_HEIGHT)).flex_none())
+            .child(
+                div()
+                    .id("sidebar-titlebar")
+                    .h(px(TOP_BAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .pl(px(80.))
+                    .pr(px(12.))
+                    .overflow_hidden()
+                    .on_click(|e: &ClickEvent, window, _| {
+                        if e.click_count() == 2 {
+                            window.titlebar_double_click();
+                        }
+                    })
+                    .when_some(title_project, |d, (icon_path, name)| {
+                        d.child(match icon_path {
+                            Some(path) => gpui::img(path).size(px(18.)).flex_none().rounded(px(4.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                            None => icon("icons/project-empty.svg", theme::TEXT_MUTED),
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(14.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::rgb(theme::TEXT))
+                                .child(name),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .flex()
