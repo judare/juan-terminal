@@ -139,6 +139,13 @@ pub fn phone_label(jid: &str) -> String {
     if jid.ends_with("@s.whatsapp.net") { format!("+{user}") } else { user.to_string() }
 }
 
+/// A name that is only a (possibly masked) phone number, e.g. `+57∙∙∙∙∙∙∙∙03` as WhatsApp's
+/// history sync sends for some 1:1 chats. It must not hide the name saved in the address book.
+pub fn phone_like(name: &str) -> bool {
+    let s = name.trim();
+    s.starts_with('+') && s.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')' | '.' | '∙' | '•' | '·' | '*'))
+}
+
 /// Chats hidden from the list: status updates, channels, broadcast lists.
 pub fn hidden_chat(jid: &str) -> bool {
     jid == "status@broadcast" || jid.ends_with("@newsletter") || jid.ends_with("@broadcast")
@@ -273,6 +280,7 @@ impl Store {
         let row: Option<(Option<String>, Option<String>)> =
             db.query_row("SELECT name, push_name FROM contacts WHERE jid=?1", [jid], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
         let chat: Option<String> = db.query_row("SELECT name FROM chats WHERE jid=?1", [jid], |r| r.get(0)).optional().ok().flatten().flatten();
+        let chat = chat.filter(|s| !phone_like(s));
         let (name, push) = row.unwrap_or((None, None));
         name.filter(|s| !s.is_empty())
             .or(chat.filter(|s| !s.is_empty()))
@@ -285,7 +293,7 @@ impl Store {
     pub fn upsert_chat(&self, jid: &str, meta: &ChatMeta) {
         let db = self.db();
         let _ = db.execute("INSERT OR IGNORE INTO chats(jid,is_group) VALUES(?1,?2)", params![jid, jid.ends_with("@g.us")]);
-        if let Some(n) = meta.name.as_deref().filter(|n| !n.is_empty()) {
+        if let Some(n) = meta.name.as_deref().filter(|n| !n.is_empty() && !phone_like(n)) {
             let _ = db.execute("UPDATE chats SET name=?2 WHERE jid=?1", params![jid, n]);
         }
         if let Some(v) = meta.is_group {
@@ -434,7 +442,8 @@ impl Store {
                     None => String::new(),
                 };
                 ChatSummary {
-                    name: name.filter(|n| !n.is_empty()).unwrap_or_else(|| Self::display_name_in(&db, &jid)),
+                    // 1:1 chats: the saved contact name wins over the chat name from history sync.
+                    name: if is_group { name.filter(|n| !n.is_empty()).unwrap_or_else(|| Self::display_name_in(&db, &jid)) } else { Self::display_name_in(&db, &jid) },
                     jid,
                     is_group,
                     last_ts,

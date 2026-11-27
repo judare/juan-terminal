@@ -124,3 +124,22 @@ fn labels_set_filter_and_follow_lid_merge() {
     assert!(st.chat("111@s.whatsapp.net").unwrap().labels.is_empty());
     assert_eq!(st.labels().len(), 1);
 }
+
+#[test]
+fn saved_contact_name_beats_masked_chat_name() {
+    let st = Store::open(&tmp()).unwrap();
+    let jid = "573000000003@s.whatsapp.net";
+    // History sync sends a masked phone as the chat name for some 1:1 chats.
+    st.upsert_chat(jid, &ChatMeta { name: Some("+57∙∙∙∙∙∙∙∙03".into()), ..Default::default() });
+    st.insert_message(&msg(jid, "m1", 10, "hola", false, false));
+    assert_eq!(st.chats()[0].name, "+573000000003", "masked name ignored");
+    st.set_push_name(jid, "Maria");
+    assert_eq!(st.chats()[0].name, "~Maria");
+    st.set_contact_name(jid, "Mi Amor");
+    assert_eq!(st.chats()[0].name, "Mi Amor");
+    // A real chat name from history doesn't hide the saved contact name either.
+    st.upsert_chat(jid, &ChatMeta { name: Some("Maria José".into()), ..Default::default() });
+    assert_eq!(st.chats()[0].name, "Mi Amor");
+    assert!(whatsapp::store::phone_like("+57 300 000 0000"));
+    assert!(!whatsapp::store::phone_like("Mi Amor 😍"));
+}
