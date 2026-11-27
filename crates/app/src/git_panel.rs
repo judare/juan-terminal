@@ -20,7 +20,8 @@ pub enum GitPanelEvent {
     OpenDiff { repo: PathBuf, change: FileChange, staged: bool },
     OpenCommit { repo: PathBuf, commit: Commit },
     CompareBranch { repo: PathBuf, base: String, head: String },
-    OpenFile(PathBuf),
+    /// Double-click on a changed file: open it at its first change.
+    OpenFile { path: PathBuf, repo: PathBuf, change: FileChange, staged: bool },
     /// Right-click on a changed file: show the file context menu (with "Locate in Explorer").
     ContextMenu { position: gpui::Point<gpui::Pixels>, path: PathBuf },
     /// Status changed (refresh open diffs, branch labels…).
@@ -685,7 +686,7 @@ impl GitPanel {
             .hover(|s| s.bg(theme::rgb(theme::HOVER)))
             .on_click(cx.listener(move |_, e: &ClickEvent, _, cx| {
                 if e.click_count() == 2 && file_path.is_file() {
-                    cx.emit(GitPanelEvent::OpenFile(file_path.clone()));
+                    cx.emit(GitPanelEvent::OpenFile { path: file_path.clone(), repo: p_open.clone(), change: c_open.clone(), staged });
                 } else {
                     cx.emit(GitPanelEvent::OpenDiff { repo: p_open.clone(), change: c_open.clone(), staged });
                 }

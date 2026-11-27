@@ -109,6 +109,18 @@ impl FileDiff {
         out
     }
 
+    /// 0-based line (new side) of the first change. A pure deletion maps to the line that
+    /// follows it (or the one before, at end of file).
+    pub fn first_change_line(&self) -> Option<usize> {
+        for h in &self.hunks {
+            let Some(i) = h.lines.iter().position(|l| l.kind != DiffLineKind::Context) else { continue };
+            let after = h.lines[i..].iter().find_map(|l| l.new_no);
+            let before = h.lines[..i].iter().rev().find_map(|l| l.new_no);
+            return Some(after.or(before).unwrap_or(h.new_start).saturating_sub(1));
+        }
+        None
+    }
+
     pub fn stats(&self) -> (usize, usize) {
         let mut add = 0;
         let mut del = 0;

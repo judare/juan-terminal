@@ -313,6 +313,9 @@ pub struct Workspace {
     /// Path revealed with "Locate in Explorer": highlighted, scrolled to on the next render.
     located: Option<PathBuf>,
     locate_pending: bool,
+    /// Bumped per diff request and per file open: a diff that finishes loading after a newer
+    /// request (e.g. the double-click that opens the file) is dropped instead of covering it.
+    diff_seq: u64,
     sidebar_visible: bool,
     sidebar_width: f32,
     resizing_sidebar: bool,
@@ -441,6 +444,7 @@ impl Workspace {
             tree_scroll: gpui::UniformListScrollHandle::new(),
             located: None,
             locate_pending: false,
+            diff_seq: 0,
             sidebar_visible: true,
             sidebar_width,
             resizing_sidebar: false,
@@ -1517,10 +1521,26 @@ impl Workspace {
                 let title = format!("{base}…{head}");
                 self.load_diff(title, DiffSource::ReadOnly, Some(repo.clone()), window, cx, move || git_engine::diff_refs(&r, &b, &h, None));
             }
-            GitPanelEvent::OpenFile(path) => {
+            GitPanelEvent::OpenFile { path, repo, change, staged } => {
                 let path = path.clone();
                 self.open_file(&path, true, window, cx);
                 self.persist(cx);
+                // Jump to the first change once the diff is computed (off the UI thread).
+                let (repo, change, staged) = (repo.clone(), change.clone(), *staged);
+                cx.spawn(async move |this, cx| {
+                    let line = cx
+                        .background_executor()
+                        .spawn(async move { git_engine::file_diff(&repo, &change, staged).ok().and_then(|t| git_engine::parse_diff(&t).first()?.first_change_line()) })
+                        .await;
+                    let Some(line) = line else { return };
+                    let _ = this.update(cx, |this, cx| {
+                        let editor = this.editors.values().flat_map(|t| t.tabs.iter()).find(|e| e.read(cx).path().map(|p| p.as_path()) == Some(path.as_path())).cloned();
+                        if let Some(e) = editor {
+                            e.update(cx, |e, cx| e.go_to(line, 0, cx));
+                        }
+                    });
+                })
+                .detach();
             }
             GitPanelEvent::ContextMenu { position, path } => {
                 let exists = path.exists();
@@ -1562,9 +1582,12 @@ impl Workspace {
         cx: &mut Context<Self>,
         compute: impl FnOnce() -> anyhow::Result<String> + Send + 'static,
     ) {
+        self.diff_seq += 1;
+        let seq = self.diff_seq;
         cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_executor().spawn(async move { compute() }).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
+                _ if this.diff_seq != seq => {}
                 Err(e) => {
                     this.error = Some(format!("{e:#}").into());
                     cx.notify();
@@ -1744,6 +1767,7 @@ impl Workspace {
 
     pub fn open_file(&mut self, path: &Path, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.diff_active = false;
+        self.diff_seq += 1;
         let key = self.active_key();
         let tabs = self.editors.entry(key.clone()).or_default();
         if let Some(ix) = tabs.tabs.iter().position(|e| e.read(cx).path().map(|p| p.as_path()) == Some(path)) {
@@ -3686,6 +3710,13 @@ impl Workspace {
                     .flex_none()
                     .child(mode_tab("mode-files", "icons/files.svg", "Files", self.sidebar_mode == SidebarMode::Files).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.sidebar_mode = SidebarMode::Files;
+                        // Viewing a git diff: reveal that file in the tree.
+                        if let Some(d) = this.diff.as_ref().filter(|_| this.diff_active) {
+                            if let DiffSource::Changes { repo, path, .. } = &d.read(cx).source {
+                                let target = repo.join(path);
+                                this.locate_in_tree(&target, cx);
+                            }
+                        }
                         cx.notify();
                     })))
                     .child(mode_tab("mode-search", "icons/search.svg", "Search", self.sidebar_mode == SidebarMode::Search).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
