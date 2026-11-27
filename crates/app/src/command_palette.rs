@@ -176,25 +176,29 @@ impl Render for CommandPalette {
                             .map(|ix| {
                                 let c = &this.commands[this.results[ix]];
                                 let selected = ix == this.selected;
-                                div()
-                                    .id(ix)
-                                    .flex()
-                                    .items_center()
-                                    .h(px(30.))
-                                    .px(px(12.))
-                                    .mx(px(6.))
-                                    .rounded(px(6.))
-                                    .cursor_pointer()
-                                    .when(selected, |d| d.bg(theme::rgb(theme::SELECTED)))
-                                    .hover(|s| s.bg(theme::rgb(theme::HOVER)))
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.confirm(ix, cx)))
-                                    .child(div().flex_1().text_size(px(13.)).text_color(theme::rgb(theme::TEXT)).child(c.label))
-                                    .child(div().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(c.shortcut))
+                                div().w_full().px(px(6.)).child(
+                                    div()
+                                        .id(ix)
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(12.))
+                                        .h(px(30.))
+                                        .px(px(12.))
+                                        .rounded(px(6.))
+                                        .cursor_pointer()
+                                        .when(selected, |d| d.bg(theme::rgb(theme::SELECTED)))
+                                        .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.confirm(ix, cx)))
+                                        .child(div().flex_1().text_size(px(13.)).text_color(theme::rgb(theme::TEXT)).child(c.label))
+                                        .child(div().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(c.shortcut)),
+                                )
                             })
                             .collect::<Vec<_>>()
                     }),
                 )
                 .track_scroll(self.scroll.clone())
+                .w_full()
                 .h(px((count.min(12) as f32) * 30. + 8.))
                 .py(px(4.)),
             )

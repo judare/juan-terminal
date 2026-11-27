@@ -134,6 +134,10 @@ pub struct AssetView {
     player: Option<std::rc::Rc<crate::video_player::NativePlayer>>,
     /// What `img()` loads: the file itself, or a PNG converted with `sips` (HEIC/AVIF).
     display: PathBuf,
+    /// Click-drag panning of a zoomed image: (mouse at press, scroll offset at press).
+    pan: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Right-click menu position.
+    menu: Option<Point<Pixels>>,
 }
 
 impl EventEmitter<AssetEvent> for AssetView {}
@@ -190,6 +194,8 @@ impl AssetView {
             find_last: String::new(),
             player,
             display,
+            pan: None,
+            menu: None,
         };
         if kind == AssetKind::Pdf {
             let (p, f) = (this.path.clone(), this.focus.clone());
@@ -722,6 +728,90 @@ impl AssetView {
         self.zoom = Some(z1);
         self.scroll.set_offset(point(px(nx), px(ny)));
         cx.notify();
+    }
+
+    /// Image bytes for the clipboard (the converted PNG for HEIC/AVIF).
+    fn clipboard_image(&self) -> Option<gpui::Image> {
+        let ext = self.display.extension()?.to_str()?.to_ascii_lowercase();
+        let format = match ext.as_str() {
+            "png" => gpui::ImageFormat::Png,
+            "jpg" | "jpeg" => gpui::ImageFormat::Jpeg,
+            "webp" => gpui::ImageFormat::Webp,
+            "gif" => gpui::ImageFormat::Gif,
+            "svg" => gpui::ImageFormat::Svg,
+            "bmp" => gpui::ImageFormat::Bmp,
+            "tif" | "tiff" => gpui::ImageFormat::Tiff,
+            _ => return None,
+        };
+        Some(gpui::Image::from_bytes(format, std::fs::read(&self.display).ok()?))
+    }
+
+    fn render_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let position = self.menu?;
+        let item = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .text_size(px(13.))
+                .text_color(theme::rgb(theme::TEXT))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+                .child(label)
+        };
+        let close = |this: &mut Self, cx: &mut Context<Self>| {
+            this.menu = None;
+            cx.notify();
+        };
+        let path = self.path.clone();
+        let relative = path.ancestors().skip(1).find(|d| d.join(".git").exists()).and_then(|root| path.strip_prefix(root).ok()).map(|r| r.to_string_lossy().into_owned());
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .min_w(px(200.))
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(theme::rgb(theme::SIDEBAR_BG))
+            .border_1()
+            .border_color(theme::rgb(theme::BORDER))
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| close(this, cx)));
+        if self.kind == AssetKind::Image {
+            list = list.child(item("asset-m-copy", "Copiar imagen").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if let Some(image) = this.clipboard_image() {
+                    cx.write_to_clipboard(ClipboardItem::new_image(&image));
+                }
+                close(this, cx);
+            })));
+        }
+        // The file itself (pastes as a file in Finder, Mail, WhatsApp…).
+        list = list.child(item("asset-m-copy-file", "Copiar archivo").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            let p = this.path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = std::process::Command::new("osascript").args(["-e", &format!("set the clipboard to (POSIX file \"{p}\")")]).spawn();
+            close(this, cx);
+        })));
+        list = list.child(item("asset-m-copy-path", "Copiar ruta").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(this.path.to_string_lossy().into_owned()));
+            close(this, cx);
+        })));
+        if let Some(rel) = relative {
+            list = list.child(item("asset-m-copy-rel", "Copiar ruta relativa").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(rel.clone()));
+                close(this, cx);
+            })));
+        }
+        list = list
+            .child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(theme::rgb(theme::BORDER)))
+            .child(item("asset-m-finder", "Mostrar en Finder").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.reveal_path(&this.path);
+                close(this, cx);
+            })))
+            .child(item("asset-m-open", "Abrir con app predeterminada").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.open_with_system(&this.path);
+                close(this, cx);
+            })));
+        Some(gpui::deferred(gpui::anchored().position(position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
     }
 
     fn set_zoom(&mut self, zoom: Option<f32>, cx: &mut Context<Self>) {
@@ -1538,9 +1628,33 @@ impl Render for AssetView {
                     // Neutral background so transparent images are readable.
                     .bg(theme::rgb(0x1d1f23))
                     .on_hover(cx.listener(|this, h: &bool, _, _| this.hovered = *h))
-                    .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
+                    .when(self.zoom.is_some(), |d| d.cursor(if self.pan.is_some() { gpui::CursorStyle::ClosedHand } else { gpui::CursorStyle::OpenHand }))
+                    // Click-drag pans the zoomed image.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            if this.zoom.is_some() {
+                                this.pan = Some((e.position, this.scroll.offset()));
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
                         this.mouse = Some(e.position);
                         this.hovered = true;
+                        if let Some((start, off)) = this.pan {
+                            if e.pressed_button != Some(MouseButton::Left) {
+                                this.pan = None;
+                                cx.notify();
+                                return;
+                            }
+                            let max = this.scroll.max_offset();
+                            let d = e.position - start;
+                            let x = (off.x + d.x).clamp(-max.width, px(0.));
+                            let y = (off.y + d.y).clamp(-max.height, px(0.));
+                            this.scroll.set_offset(point(x, y));
+                            cx.notify();
+                        }
                     }))
                     // ⌘/Ctrl + wheel zooms (plain wheel scrolls the zoomed image).
                     .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
@@ -1554,9 +1668,14 @@ impl Render for AssetView {
                 match (self.zoom, self.natural) {
                     (Some(z), Some((w, h))) => base
                         .child(
+                            // Explicit size so the scroll area measures the whole image (with only
+                            // min_w_full the row stayed viewport-wide: no horizontal scroll/pan).
                             div()
+                                .w(px(w * z + 2. * PAD))
+                                .h(px(h * z + 2. * PAD))
                                 .min_w_full()
                                 .min_h_full()
+                                .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -1614,11 +1733,43 @@ impl Render for AssetView {
             .flex()
             .flex_col()
             .bg(theme::rgb(theme::EDITOR_BG))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
-            .child(header)
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.drag = None;
+                if this.pan.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.drag = None;
+                if this.pan.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            // Right-click: copy / copy path / reveal in Finder (tables keep it on the header only,
+            // their grid has its own selection).
+            .when(self.kind != AssetKind::Table, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                        this.menu = Some(e.position);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+            })
+            .child(header.when(self.kind == AssetKind::Table, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                        this.menu = Some(e.position);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+            }))
             .children(self.render_find(cx))
             .child(body)
+            .children(self.render_menu(cx))
             .on_action(cx.listener(|this, _: &ev::Find, window, cx| this.open_find(window, cx)));
         if self.kind == AssetKind::Table {
             self.bind_table_actions(root, cx)

@@ -171,6 +171,20 @@ fn signature(m: &ChatMessage) -> u64 {
     h.finish()
 }
 
+/// Popover for a phone number clicked in a message: checks WhatsApp and offers to open the chat.
+struct PhonePop {
+    position: Point<Pixels>,
+    label: String,
+    digits: String,
+    state: PhoneState,
+}
+
+enum PhoneState {
+    Checking,
+    Found(String),
+    Missing,
+}
+
 struct Menu {
     position: Point<Pixels>,
     msg: Rc<ChatMessage>,
@@ -265,6 +279,7 @@ pub struct ChatView {
     _swipe_end: Option<Task<()>>,
     /// Quick-reactions bar opened from a message's reaction button.
     react_bar: Option<(Rc<ChatMessage>, Point<Pixels>)>,
+    phone_pop: Option<PhonePop>,
     /// The quick-reactions bar shows the full emoji grid ("+").
     react_more: bool,
     /// Acted on (see `ChatEvent::Interacted`).
@@ -385,6 +400,7 @@ impl ChatView {
             drag: None,
             _swipe_end: None,
             react_bar: None,
+            phone_pop: None,
             react_more: false,
             thumbs: HashMap::new(),
             previews: HashMap::new(),
@@ -1852,7 +1868,7 @@ impl ChatView {
             // Block, not flex_col: a fit-content flex column measures its height with the text
             // unwrapped (one line), so long messages overflowed the bubble and got clipped.
             .block()
-            .max_w(px(if sticker { 200. } else { 540. }))
+            .max_w(px(if sticker { 200. } else { 420. }))
             .when(!sticker, |d| {
                 d.min_w(px(70.))
                     .rounded(radius)
@@ -1911,7 +1927,32 @@ impl ChatView {
                     cx.notify();
                 }))
         });
-        let (btn_left, btn_right) = if mine { (react_btn, None) } else { (None, react_btn) };
+        // Forward button next to it, also only while hovered.
+        let fwd_btn = hovered.then(|| {
+            let m = m.clone();
+            div()
+                .id(SharedString::from(format!("fwd-btn-{}", m.id)))
+                .size(px(28.))
+                .flex_none()
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .bg(theme::rgb(theme::SELECTED))
+                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                .child(wa_ui::icon("icons/wa-forward.svg", 15., theme::TEXT_MUTED))
+                .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Reenviar")).into())
+                .on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                    this.open_forward(m.clone(), w, cx);
+                    cx.stop_propagation();
+                }))
+        });
+        let (btn_left, btn_right) = if mine {
+            (fwd_btn.into_iter().chain(react_btn).collect::<Vec<_>>(), Vec::new())
+        } else {
+            (Vec::new(), react_btn.into_iter().chain(fwd_btn).collect::<Vec<_>>())
+        };
         let id_hover = m.id.clone();
         let id_wheel = m.id.clone();
         let id_move = m.id.clone();
@@ -2034,15 +2075,18 @@ impl ChatView {
 
     fn render_text(&self, id: &str, text: &str, color: u32, cx: &mut Context<Self>) -> AnyElement {
         let links = find_links(text);
+        let phones: Vec<(std::ops::Range<usize>, String)> =
+            find_phones(text, &own_country_code()).into_iter().filter(|(r, _)| !links.iter().any(|l| l.start < r.end && r.start < l.end)).collect();
         let matches = match &self.search {
             Some(s) if !s.query.is_empty() => find_matches(text, &s.query),
             _ => Vec::new(),
         };
         let link_style = HighlightStyle { color: Some(theme::rgb(0x53bdeb)), underline: Some(gpui::UnderlineStyle { thickness: px(1.), ..Default::default() }), ..Default::default() };
         let hit_style = HighlightStyle { background_color: Some(theme::rgb(theme::FIND_MATCH_CURRENT)), color: Some(gpui::white()), ..Default::default() };
-        let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = links.iter().map(|r| (r.clone(), link_style)).collect();
+        let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> =
+            links.iter().chain(phones.iter().map(|(r, _)| r)).map(|r| (r.clone(), link_style)).collect();
         for r in matches {
-            if !links.iter().any(|l| l.start < r.end && r.start < l.end) {
+            if !highlights.iter().any(|(l, _)| l.start < r.end && r.start < l.end) {
                 highlights.push((r, hit_style));
             }
         }
@@ -2077,17 +2121,98 @@ impl ChatView {
                     cx.notify();
                 }),
             );
-        if links.is_empty() {
+        if links.is_empty() && phones.is_empty() {
             return base.child(styled).into_any_element();
         }
         let urls: Vec<String> = links.iter().map(|r| text[r.clone()].to_string()).collect();
-        base.child(InteractiveText::new(SharedString::from(format!("txt-{id}")), styled).on_click(links, move |ix, _, cx| {
+        let phone_info: Vec<(String, String)> = phones.iter().map(|(r, d)| (text[r.clone()].to_string(), d.clone())).collect();
+        let ranges: Vec<_> = links.into_iter().chain(phones.into_iter().map(|(r, _)| r)).collect();
+        let view = cx.entity().downgrade();
+        base.child(InteractiveText::new(SharedString::from(format!("txt-{id}")), styled).on_click(ranges, move |ix, window, cx| {
             if let Some(u) = urls.get(ix) {
                 let u = if u.starts_with("http") { u.clone() } else { format!("https://{u}") };
                 cx.open_url(&u);
+            } else if let Some((label, digits)) = phone_info.get(ix - urls.len()) {
+                let position = window.mouse_position();
+                let (label, digits) = (label.clone(), digits.clone());
+                let _ = view.update(cx, |this, cx| this.open_phone(position, label, digits, cx));
             }
         }))
         .into_any_element()
+    }
+
+    fn open_phone(&mut self, position: Point<Pixels>, label: String, digits: String, cx: &mut Context<Self>) {
+        self.sel = None;
+        self.selecting = false;
+        let rx = WhatsApp::global().check_number(&digits);
+        self.phone_pop = Some(PhonePop { position, label, digits: digits.clone(), state: PhoneState::Checking });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let found = rx.await.ok().flatten();
+            let _ = this.update(cx, |this, cx| {
+                if let Some(p) = this.phone_pop.as_mut().filter(|p| p.digits == digits) {
+                    p.state = match found {
+                        Some(jid) => PhoneState::Found(jid),
+                        None => PhoneState::Missing,
+                    };
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn render_phone_pop(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pop = self.phone_pop.as_ref()?;
+        let item = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .text_size(px(13.))
+                .text_color(theme::rgb(theme::TEXT))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+                .child(label)
+        };
+        let note = |t: &'static str| div().px(px(12.)).py(px(5.)).text_size(px(12.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(t);
+        let title = format!("+{}", pop.digits);
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .min_w(px(210.))
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(theme::rgb(theme::SIDEBAR_BG))
+            .border_1()
+            .border_color(theme::rgb(theme::BORDER))
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.phone_pop = None;
+                cx.notify();
+            }))
+            .child(div().px(px(12.)).pt(px(5.)).pb(px(3.)).text_size(px(12.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_MUTED)).child(title));
+        list = match &pop.state {
+            PhoneState::Checking => list.child(note("Verificando WhatsApp…")),
+            PhoneState::Missing => list.child(note("No tiene WhatsApp")),
+            PhoneState::Found(jid) => {
+                let jid = jid.clone();
+                list.child(item("phone-chat", "Enviar mensaje").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    let name = WhatsApp::global().store().display_name(&jid);
+                    this.phone_pop = None;
+                    cx.emit(ChatEvent::OpenChat { jid: jid.clone(), name });
+                    cx.notify();
+                })))
+            }
+        };
+        let label = pop.label.clone();
+        list = list.child(item("phone-copy", "Copiar número").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(label.clone()));
+            this.phone_pop = None;
+            cx.notify();
+        })));
+        Some(gpui::deferred(gpui::anchored().position(pop.position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -3256,6 +3381,67 @@ fn word_at(text: &str, ix: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// Country code of my own number (digits before the last 10), "57" when unknown.
+pub(crate) fn own_country_code() -> String {
+    let own = WhatsApp::try_global().and_then(|w| w.own_jid()).unwrap_or_default();
+    let digits: String = own.split('@').next().unwrap_or("").chars().filter(char::is_ascii_digit).collect();
+    if digits.len() > 10 { digits[..digits.len() - 10].to_string() } else { "57".into() }
+}
+
+/// Phone numbers in a message: byte range and digits with country code. `+` numbers take
+/// 8–15 digits; bare ones must be 10 digits (local, `cc` is prepended) or `cc` + 10 digits.
+pub(crate) fn find_phones(text: &str, cc: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut out = Vec::new();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (start, c) = chars[i];
+        let prev_ok = i == 0 || !(chars[i - 1].1.is_alphanumeric() || "+-./_@$".contains(chars[i - 1].1));
+        if !prev_ok || !(c.is_ascii_digit() || (c == '+' && chars.get(i + 1).is_some_and(|n| n.1.is_ascii_digit()))) {
+            i += 1;
+            continue;
+        }
+        let plus = c == '+';
+        let mut j = if plus { i + 1 } else { i };
+        let mut digits = String::new();
+        let mut end = start;
+        while j < chars.len() {
+            let ch = chars[j].1;
+            if ch.is_ascii_digit() {
+                digits.push(ch);
+                end = chars[j].0 + 1;
+            } else {
+                // Up to two separators in a row ("(415) 555"), and a digit must follow.
+                let seps = chars[j..].iter().take_while(|n| " -.()".contains(n.1)).count();
+                if seps == 0 || seps > 2 || !chars.get(j + seps).is_some_and(|n| n.1.is_ascii_digit()) {
+                    break;
+                }
+                j += seps;
+                continue;
+            }
+            j += 1;
+        }
+        // A letter or digit glued right after means it's a code or id, not a phone.
+        let glued = chars.get(j).is_some_and(|n| n.1.is_alphanumeric());
+        let full = if glued {
+            None
+        } else if plus {
+            (8..=15).contains(&digits.len()).then(|| digits.clone())
+        } else if digits.len() == 10 {
+            Some(format!("{cc}{digits}"))
+        } else if digits.len() == cc.len() + 10 && digits.starts_with(cc) {
+            Some(digits.clone())
+        } else {
+            None
+        };
+        if let Some(d) = full {
+            out.push((start..end, d));
+        }
+        i = j.max(i + 1);
+    }
+    out
+}
+
 fn find_links(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -3481,12 +3667,25 @@ impl Render for ChatView {
             .children(self.render_forward(cx))
             .children(self.render_menu(cx))
             .children(self.render_react_bar(cx))
+            .children(self.render_phone_pop(cx))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{find_links, find_matches};
+    use super::{find_links, find_matches, find_phones};
+
+    #[test]
+    fn phones() {
+        let got = |t: &str| find_phones(t, "57").into_iter().map(|(r, d)| (t[r].to_string(), d)).collect::<Vec<_>>();
+        assert_eq!(got("llama al 300 123 4567 ya"), vec![("300 123 4567".into(), "573001234567".into())]);
+        assert_eq!(got("+57 310-555-1234."), vec![("+57 310-555-1234".into(), "573105551234".into())]);
+        assert_eq!(got("+1 (415) 555-2671"), vec![("+1 (415) 555-2671".into(), "14155552671".into())]);
+        assert_eq!(got("3001234567"), vec![("3001234567".into(), "573001234567".into())]);
+        assert!(got("valor $1.200.000 y ref 12345").is_empty());
+        assert!(got("pedido AB3001234567").is_empty());
+        assert!(got("27 nov 2026").is_empty());
+    }
 
     #[test]
     fn matches() {

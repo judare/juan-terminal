@@ -320,6 +320,29 @@ impl WhatsApp {
         self.shared.client().and_then(|c| c.pn().map(|j| j.to_non_ad().to_string()))
     }
 
+    /// Whether a phone number (digits with country code) has WhatsApp. Resolves to its chat JID
+    /// (phone-number form) when registered, `None` when not, offline, or on error.
+    pub fn check_number(&self, digits: &str) -> futures::channel::oneshot::Receiver<Option<String>> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let Some(client) = self.shared.client() else {
+            let _ = tx.send(None);
+            return rx;
+        };
+        let digits = digits.to_string();
+        self.rt.spawn(async move {
+            let jid = Jid::pn(&digits);
+            let found = match client.contacts().is_on_whatsapp(&[jid]).await {
+                Ok(r) => r.into_iter().find(|r| r.is_registered).map(|r| r.pn_jid.unwrap_or(r.jid).to_non_ad().to_string()),
+                Err(e) => {
+                    log::warn!("whatsapp check_number {digits}: {e}");
+                    None
+                }
+            };
+            let _ = tx.send(found);
+        });
+        rx
+    }
+
     /// Small profile picture of a person (group participant, or `ME` for ourselves). Cached on
     /// disk next to the chat pictures; when missing it's requested once per session in the
     /// background and `Update::Avatar(<that jid>)` is emitted when it arrives.

@@ -104,6 +104,7 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/archive.svg", include_bytes!("../assets/icons/archive.svg")),
     ("icons/offline.svg", include_bytes!("../assets/icons/offline.svg")),
     ("icons/wa-reply.svg", include_bytes!("../assets/icons/wa-reply.svg")),
+    ("icons/wa-forward.svg", include_bytes!("../assets/icons/wa-forward.svg")),
     ("icons/wa-alert.svg", include_bytes!("../assets/icons/wa-alert.svg")),
     ("icons/wa-audio.svg", include_bytes!("../assets/icons/wa-audio.svg")),
     ("icons/wa-check.svg", include_bytes!("../assets/icons/wa-check.svg")),

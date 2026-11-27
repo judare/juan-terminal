@@ -52,7 +52,26 @@ impl Filter {
     }
 }
 
+/// A phone number typed in the search that isn't a chat yet: whether it has WhatsApp.
+enum NewNumber {
+    Checking,
+    Found(String),
+    Missing,
+}
+
+/// Digits (with country code) when the whole search is a phone number.
+fn phone_query(q: &str) -> Option<String> {
+    let q = q.trim();
+    let phones = crate::chat_view::find_phones(q, &crate::chat_view::own_country_code());
+    match phones.as_slice() {
+        [(r, d)] if r.start == 0 && r.end == q.len() => Some(d.clone()),
+        _ => None,
+    }
+}
+
 pub struct WhatsAppPanel {
+    /// Search is a phone number: (digits, WhatsApp check).
+    new_number: Option<(String, NewNumber)>,
     status: Status,
     /// Every chat (matching the search), before the chip filter.
     all: Rc<Vec<ChatSummary>>,
@@ -131,7 +150,12 @@ impl WhatsAppPanel {
                 this.query.update(cx, |q, cx| q.set_text("", cx));
             }
             TextInputEvent::Submit { .. } => {
-                if let Some(c) = this.chats.first().cloned() {
+                if let Some((digits, NewNumber::Found(jid))) = &this.new_number
+                    && !this.all.iter().any(|c| c.jid.starts_with(&format!("{digits}@")))
+                {
+                    let name = WhatsApp::global().store().display_name(jid);
+                    cx.emit(WhatsAppPanelEvent::OpenChat { jid: jid.clone(), name });
+                } else if let Some(c) = this.chats.first().cloned() {
                     cx.emit(WhatsAppPanelEvent::OpenChat { jid: c.jid, name: c.name });
                 }
             }
@@ -196,6 +220,7 @@ impl WhatsAppPanel {
             archived_count: 0,
             unread_total: 0,
             hits: Rc::new(Vec::new()),
+            new_number: None,
             query,
             qr: None,
             reload_pending: false,
@@ -274,9 +299,90 @@ impl WhatsAppPanel {
         }));
     }
 
+    /// When the search is a phone number, ask WhatsApp whether it has an account.
+    fn check_number(&mut self, q: &str, cx: &mut Context<Self>) {
+        let Some(digits) = phone_query(q) else {
+            self.new_number = None;
+            return;
+        };
+        if self.new_number.as_ref().is_some_and(|(d, _)| *d == digits) {
+            return;
+        }
+        self.new_number = Some((digits.clone(), NewNumber::Checking));
+        let rx = WhatsApp::global().check_number(&digits);
+        cx.spawn(async move |this, cx| {
+            let found = rx.await.ok().flatten();
+            let _ = this.update(cx, |this, cx| {
+                if let Some((d, state)) = this.new_number.as_mut()
+                    && *d == digits
+                {
+                    *state = match found {
+                        Some(jid) => NewNumber::Found(jid),
+                        None => NewNumber::Missing,
+                    };
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Row offering to write to a searched number that has no chat yet.
+    fn render_new_number(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (digits, state) = self.new_number.as_ref()?;
+        if self.all.iter().any(|c| c.jid.starts_with(&format!("{digits}@"))) {
+            return None;
+        }
+        let (sub, jid) = match state {
+            NewNumber::Checking => ("Verificando WhatsApp…", None),
+            NewNumber::Found(j) => ("Enviar mensaje", Some(j.clone())),
+            NewNumber::Missing => ("No tiene WhatsApp", None),
+        };
+        let ok = jid.is_some();
+        Some(
+            div()
+                .id("wa-new-number")
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .mx(px(6.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .when(ok, |d| d.cursor_pointer().hover(|s| s.bg(theme::rgb(theme::HOVER))))
+                .child(
+                    div()
+                        .size(px(40.))
+                        .flex_none()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme::rgb(if ok { wa_ui::OWN_BUBBLE } else { theme::SELECTED }))
+                        .child(gpui::svg().path("icons/wa-contact.svg").size(px(18.)).text_color(theme::rgb(theme::TEXT))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(div().text_size(px(13.5)).text_color(theme::rgb(theme::TEXT)).child(format!("+{digits}")))
+                        .child(div().text_size(px(12.)).text_color(theme::rgb(if ok { theme::ACCENT } else { theme::TEXT_FAINT })).child(sub)),
+                )
+                .when_some(jid, |d, jid| {
+                    d.on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        let name = WhatsApp::global().store().display_name(&jid);
+                        cx.emit(WhatsAppPanelEvent::OpenChat { jid: jid.clone(), name });
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         let q = self.query.read(cx).content.trim().to_string();
         let searching = !q.is_empty();
+        self.check_number(&q, cx);
         let archived = self.archived_view;
         let task = cx.background_executor().spawn(async move {
             let store = WhatsApp::global().store();
@@ -1124,6 +1230,7 @@ impl Render for WhatsAppPanel {
                     }),
                 )
             })
+            .when(!full_card, |d| d.children(self.render_new_number(cx)))
             .when(!full_card, |d| {
                 d.child(
                     uniform_list("wa-chats", rows, cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()))
