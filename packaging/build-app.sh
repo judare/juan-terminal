@@ -1,6 +1,8 @@
 #!/bin/zsh
 # Build the release binary and install "Juan Terminal.app" into /Applications
 # (Finder, Spotlight, Raycast and the Dock can open it; no terminal needed).
+# CI (.github/workflows/release.yml) sets BUNDLE_ONLY=1 (build the bundle, don't install),
+# PROFILE=release and VERSION from the tag.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source "$HOME/.cargo/env" 2>/dev/null || true
@@ -8,15 +10,16 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 APP_NAME="Juan Terminal"
 DEST="/Applications/$APP_NAME.app"
 WORK="target/bundle/$APP_NAME.app"
-VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+VERSION=${VERSION:-$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')}
+PROFILE=${PROFILE:-fastrelease}
 
 # `fastrelease`: optimized without LTO, incremental — a rebuild after a change takes seconds.
 # Utility QoS: lower priority than what the user is doing, so the Mac stays responsive.
-/usr/sbin/taskpolicy -c utility cargo build --profile fastrelease -p juan-terminal
+/usr/sbin/taskpolicy -c utility cargo build --profile "$PROFILE" -p juan-terminal
 
 rm -rf "$WORK"
 mkdir -p "$WORK/Contents/MacOS" "$WORK/Contents/Resources"
-cp target/fastrelease/juan-terminal "$WORK/Contents/MacOS/juan-terminal"
+cp "target/$PROFILE/juan-terminal" "$WORK/Contents/MacOS/juan-terminal"
 
 # Icon: 1024 PNG (rounded photo) -> iconset -> icns.
 ICONSET=target/bundle/AppIcon.iconset
@@ -114,6 +117,8 @@ if security find-identity -p codesigning 2>/dev/null | grep -q "Juan Terminal De
 else
   codesign --force --deep --sign - "$WORK" >/dev/null
 fi
+
+if [[ -n "${BUNDLE_ONLY:-}" ]]; then echo "Built $WORK"; exit 0; fi
 
 # Replace the installed copy (quit it first).
 pkill -x juan-terminal 2>/dev/null || true

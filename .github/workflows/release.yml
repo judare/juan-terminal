@@ -1,0 +1,58 @@
+# On every pushed tag (vX.Y.Z): build "Juan Terminal.app" for Apple Silicon, pack it in a .dmg
+# and attach it to that tag's GitHub release (created here if it doesn't exist yet).
+name: Release DMG
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.2.1)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  dmg:
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Build app bundle
+        run: |
+          VERSION="${TAG#v}" PROFILE=release BUNDLE_ONLY=1 ./packaging/build-app.sh
+
+      - name: Create DMG
+        run: |
+          APP="target/bundle/Juan Terminal.app"
+          DMG="Juan-Terminal-${TAG}-arm64.dmg"
+          STAGE=$(mktemp -d)
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Juan Terminal" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
+          shasum -a 256 "$DMG" | tee "$DMG.sha256"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          gh release upload "$TAG" "$DMG" "$DMG.sha256" --clobber
