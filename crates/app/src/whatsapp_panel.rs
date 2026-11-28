@@ -8,6 +8,7 @@ use futures::StreamExt;
 use gpui::{ClickEvent, Context, Entity, EventEmitter, Focusable, Render, SharedString, Subscription, Task, Timer, Window, div, prelude::*, px, uniform_list};
 use whatsapp::{ChatMessage, ChatSummary, Label, MsgKind, Status, Update, WhatsApp};
 
+use crate::glass::GlassExt;
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme;
 use crate::wa_ui;
@@ -655,7 +656,7 @@ impl WhatsAppPanel {
                     .cursor_pointer()
                     .text_size(px(12.))
                     .when(active, |d| d.bg(theme::rgb(wa_ui::CHIP_ACTIVE_BG)).text_color(theme::rgb(wa_ui::CHIP_ACTIVE_TEXT)))
-                    .when(!active, |d| d.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::HOVER)).text_color(theme::rgb(theme::TEXT))))
+                    .when(!active, |d| d.glass_button().text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.glass_hover().text_color(theme::rgb(theme::TEXT))))
                     .children(color.map(|c| div().size(px(7.)).rounded_full().bg(theme::rgb(c))))
                     .child(label)
                     .when(count > 0, |d| d.child(div().text_size(px(10.5)).opacity(0.8).child(count.to_string())))
@@ -1016,8 +1017,8 @@ impl WhatsAppPanel {
                         .px(px(8.))
                         .flex()
                         .items_center()
-                        .rounded(px(5.))
-                        .bg(theme::rgb(theme::SELECTED))
+                        .rounded(px(14.))
+                        .glass()
                         .text_size(px(12.5))
                         .child(self.ask_input.clone()),
                 )
@@ -1088,8 +1089,8 @@ impl WhatsAppPanel {
                     .px(px(8.))
                     .flex()
                     .items_center()
-                    .rounded(px(5.))
-                    .bg(theme::rgb(theme::SELECTED))
+                    .rounded(px(13.))
+                    .glass()
                     .text_size(px(12.5))
                     .child(self.label_input.clone()),
             )
@@ -1185,12 +1186,12 @@ impl Render for WhatsAppPanel {
                         .child(
                             div()
                                 .flex_1()
-                                .h(px(28.))
-                                .px(px(8.))
+                                .h(px(30.))
+                                .px(px(12.))
                                 .flex()
                                 .items_center()
-                                .rounded(px(6.))
-                                .bg(theme::rgb(theme::SELECTED))
+                                .rounded(px(15.))
+                                .glass()
                                 .text_size(px(12.5))
                                 .child(div().flex_1().min_w_0().child(self.query.clone()))
                                 .when(!self.query.read(cx).content.is_empty(), |d| {

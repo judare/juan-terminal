@@ -14,6 +14,7 @@ use gpui::{
 };
 use whatsapp::{ChatMessage, MsgKind, Update, WhatsApp};
 
+use crate::glass::GlassExt;
 use crate::text_area::{TextArea, TextAreaEvent};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme;
@@ -820,7 +821,7 @@ impl ChatView {
                         // Clicks inside don't close it.
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(div().px(px(4.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("REENVIAR MENSAJE"))
-                        .child(div().h(px(30.)).px(px(8.)).flex().items_center().rounded(px(6.)).bg(theme::rgb(theme::SELECTED)).text_size(px(13.)).child(f.input.clone()))
+                        .child(div().h(px(30.)).px(px(12.)).flex().items_center().rounded(px(15.)).glass().text_size(px(13.)).child(f.input.clone()))
                         .child(list)
                         .child(
                             div()
@@ -896,7 +897,7 @@ impl ChatView {
                         .child(wa_ui::icon("icons/wa-spark.svg", 12., 0xd97757))
                         .child("PEDIR A CLAUDE"),
                 )
-                .child(div().h(px(30.)).px(px(8.)).flex().items_center().rounded(px(6.)).bg(theme::rgb(theme::SELECTED)).text_size(px(13.)).child(input.clone()))
+                .child(div().h(px(30.)).px(px(12.)).flex().items_center().rounded(px(15.)).glass().text_size(px(13.)).child(input.clone()))
                 .child(div().px(px(4.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Enter abre Claude Code con este chat (y el proyecto de su etiqueta) como contexto"))
                 .into_any_element(),
         )
@@ -986,7 +987,7 @@ impl ChatView {
                 .border_b_1()
                 .border_color(theme::rgb(theme::BORDER))
                 .child(gpui::svg().path("icons/search.svg").size(px(14.)).text_color(theme::rgb(theme::TEXT_MUTED)))
-                .child(div().flex_1().h(px(28.)).px(px(8.)).flex().items_center().rounded(px(6.)).bg(theme::rgb(theme::SELECTED)).text_size(px(13.)).child(s.input.clone()))
+                .child(div().flex_1().h(px(28.)).px(px(12.)).flex().items_center().rounded(px(14.)).glass().text_size(px(13.)).child(s.input.clone()))
                 .child(div().flex_none().min_w(px(70.)).text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_MUTED)).child(label))
                 .child(arrow("search-up", "icons/chevron-up.svg", true))
                 .child(arrow("search-down", "icons/chevron-down.svg", false))
@@ -1916,8 +1917,8 @@ impl ChatView {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .bg(theme::rgb(theme::SELECTED))
-                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                .glass_button()
+                .hover(|s| s.glass_hover())
                 .child(wa_ui::icon("icons/smile.svg", 16., theme::TEXT_MUTED))
                 .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Reaccionar")).into())
                 .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
@@ -1939,8 +1940,8 @@ impl ChatView {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .bg(theme::rgb(theme::SELECTED))
-                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                .glass_button()
+                .hover(|s| s.glass_hover())
                 .child(wa_ui::icon("icons/wa-forward.svg", 15., theme::TEXT_MUTED))
                 .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Reenviar")).into())
                 .on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
@@ -3108,7 +3109,7 @@ impl ChatView {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                .hover(|s| s.glass_hover())
                 .child(gpui::svg().path(icon).size(px(18.)).text_color(theme::rgb(theme::TEXT_MUTED)))
                 .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(tip)).into())
         };
@@ -3255,10 +3256,8 @@ impl ChatView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .bg(theme::rgb(theme::SELECTED))
-                            .border_1()
-                            .border_color(theme::rgb(theme::BORDER))
-                            .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                            .glass_button()
+                            .hover(|s| s.glass_hover())
                             .child(gpui::svg().path("icons/plus.svg").size(px(18.)).text_color(theme::rgb(theme::TEXT)))
                             .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Adjuntar archivos")).into())
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.attach(cx))),
@@ -3273,9 +3272,7 @@ impl ChatView {
                             .pl(px(16.))
                             .pr(px(4.))
                             .rounded(px(20.))
-                            .bg(theme::rgb(theme::SELECTED))
-                            .border_1()
-                            .border_color(theme::rgb(theme::BORDER))
+                            .glass()
                             .child(div().flex_1().min_w_0().py(px(10.)).text_size(px(14.)).child(self.composer.clone()))
                             .child(div().pb(px(3.)).child(round("wa-stickers", "icons/smile.svg", "Emojis y stickers").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.stickers_open = !this.stickers_open;
@@ -3292,15 +3289,13 @@ impl ChatView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .bg(theme::rgb(theme::SELECTED))
-                            .border_1()
-                            .border_color(theme::rgb(theme::BORDER))
+                            .glass_button()
                             .child(if busy {
                                 div().text_size(px(15.)).text_color(theme::rgb(0xd97757)).child("…").into_any_element()
                             } else {
                                 wa_ui::icon("icons/wa-spark.svg", 18., 0xd97757).into_any_element()
                             })
-                            .when(!busy, |d| d.cursor_pointer().hover(|s| s.bg(theme::rgb(theme::HOVER))))
+                            .when(!busy, |d| d.cursor_pointer().hover(|s| s.glass_hover()))
                             .tooltip(move |_, cx| {
                                 cx.new(|_| crate::git_panel::Tooltip(if busy { "Claude está escribiendo la respuesta…" } else { "Sugerir respuesta con Claude (usa lo escrito como indicación)" })).into()
                             })
@@ -3531,7 +3526,7 @@ impl Render for ChatView {
                 .justify_center()
                 .rounded_full()
                 .cursor_pointer()
-                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                .hover(|s| s.glass_hover())
                 .child(gpui::svg().path(icon).size(px(16.)).text_color(theme::rgb(theme::TEXT)))
                 .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(tip)).into())
         };
@@ -3619,14 +3614,12 @@ impl Render for ChatView {
                             .gap(px(2.))
                             .p(px(3.))
                             .rounded_full()
-                            .bg(theme::rgb(theme::SELECTED))
-                            .border_1()
-                            .border_color(theme::rgb(theme::BORDER))
+                            .glass()
                             .child(pill_btn("chat-ask-claude", "icons/wa-spark.svg", "Pedir a Claude…").on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.toggle_ask(w, cx))))
                             .child(pill_btn("chat-search", "icons/search.svg", "Buscar en el chat (⌘F)").on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.open_search(w, cx))))
                             .child(
                                 pill_btn("chat-info-btn", "icons/more.svg", if info_open { "Cerrar info." } else { "Info. del contacto" })
-                                    .when(info_open, |d| d.bg(theme::rgb(theme::HOVER)))
+                                    .when(info_open, |d| d.glass_button())
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_info(cx))),
                             ),
                     ),

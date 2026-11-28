@@ -12,8 +12,12 @@ pub struct Answer {
     pub value: String,
     /// What is shown big ("4,213.50 COP").
     pub display: String,
-    /// The interpreted question ("1 USD → COP · rate of 2026-11-27").
-    pub detail: String,
+    /// The interpreted question, shown big on the left ("1 USD", "5 * 3").
+    pub question: String,
+    /// Small caption under the question ("US Dollar", "Expresión").
+    pub question_label: String,
+    /// Small caption under the result ("Colombian Peso · 1 USD = 3,574.93 COP · 2026-11-27").
+    pub result_label: String,
 }
 
 // ---- expression evaluator ----------------------------------------------------------------
@@ -347,6 +351,26 @@ pub fn refresh_rates() -> bool {
     true
 }
 
+fn currency_name(code: &str) -> &str {
+    match code {
+        "USD" => "Dólar estadounidense",
+        "COP" => "Peso colombiano",
+        "EUR" => "Euro",
+        "GBP" => "Libra esterlina",
+        "MXN" => "Peso mexicano",
+        "BRL" => "Real brasileño",
+        "ARS" => "Peso argentino",
+        "CLP" => "Peso chileno",
+        "PEN" => "Sol peruano",
+        "JPY" => "Yen japonés",
+        "CAD" => "Dólar canadiense",
+        "AUD" => "Dólar australiano",
+        "CHF" => "Franco suizo",
+        "CNY" => "Yuan chino",
+        other => other,
+    }
+}
+
 fn currency_code(w: &str) -> Option<String> {
     let w = w.trim().to_lowercase();
     Some(String::from(match w.as_str() {
@@ -427,7 +451,9 @@ fn eval_currency(q: &str) -> Option<Answer> {
     Some(Answer {
         value: plain(v, if v.abs() >= 100. { 2 } else { 4 }),
         display: format!("{} {to}", pretty(v, if v.abs() >= 100. { 2 } else { 4 })),
-        detail: format!("{} {from} → {to} · 1 {from} = {} {to} · {date}", pretty(amount, 4), pretty(rate, if rate >= 100. { 2 } else { 6 })),
+        question: format!("{} {from}", pretty(amount, 4)),
+        question_label: currency_name(&from).to_string(),
+        result_label: format!("{} · 1 {from} = {} {to} · {date}", currency_name(&to), pretty(rate, if rate >= 100. { 2 } else { 6 })),
     })
 }
 
@@ -470,7 +496,7 @@ pub fn answer(q: &str) -> Option<Answer> {
         return Some(a);
     }
     let v = eval_math(q)?;
-    Some(Answer { value: plain(v, 10), display: pretty(v, 10), detail: q.to_string() })
+    Some(Answer { value: plain(v, 10), display: pretty(v, 10), question: q.to_string(), question_label: "Expresión".into(), result_label: "Resultado".into() })
 }
 
 #[cfg(test)]

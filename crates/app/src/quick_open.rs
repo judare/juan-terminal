@@ -11,6 +11,7 @@ use gpui::{
 use project_search::{IndexedFile, fuzzy_filter};
 
 use crate::text_input::{TextInput, TextInputEvent};
+use crate::glass::GlassExt;
 use crate::theme;
 
 actions!(quick_open, [SelectNext, SelectPrevious]);
@@ -126,10 +127,12 @@ impl Render for QuickOpen {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .px(px(12.))
-                    .h(px(42.))
-                    .border_b_1()
-                    .border_color(theme::rgb(theme::BORDER))
+                    .m(px(8.))
+                    .px(px(14.))
+                    .h(px(36.))
+                    .flex_none()
+                    .rounded(px(18.))
+                    .glass()
                     .child(gpui::svg().path("icons/search.svg").size(px(14.)).text_color(theme::rgb(theme::TEXT_FAINT)))
                     .child(self.input.clone()),
             )

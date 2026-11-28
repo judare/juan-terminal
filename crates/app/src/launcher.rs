@@ -294,6 +294,8 @@ pub enum Pick {
     App(PathBuf),
     File(PathBuf),
     Copy(String),
+    /// Play a downloaded song / podcast / video.
+    Media(crate::music::Track),
     Project(String, ProjectAction),
 }
 
@@ -429,8 +431,8 @@ fn build_cmds(projects: &[ProjectEntry]) -> Vec<Cmd> {
 #[derive(Clone)]
 enum Item {
     Header(SharedString),
-    /// Calculator / currency answer: (copied value, shown result, interpretation).
-    Calc(String, String, String),
+    /// Downloaded song / podcast / video.
+    Media(usize, Vec<usize>),
     Url(String),
     App(usize, Vec<usize>),
     Project(usize, Vec<usize>),
@@ -464,6 +466,12 @@ pub struct Launcher {
     _subs: Vec<Subscription>,
     _index_task: Option<gpui::Task<()>>,
     _dev_task: Option<gpui::Task<()>>,
+    /// Downloaded songs / podcasts / videos (snapshot when the launcher opened).
+    media: Vec<crate::music::Track>,
+    /// Calculator / currency answer for the query, shown as a big card above the list.
+    calc: Option<crate::calc::Answer>,
+    /// The calc card has the selection (Enter copies); ↓ moves into the list.
+    calc_selected: bool,
 }
 
 impl EventEmitter<LauncherEvent> for Launcher {}
@@ -574,6 +582,14 @@ impl Launcher {
             _subs: subs,
             _index_task: index_task,
             _dev_task: Some(dev_task),
+            media: crate::music::global(cx)
+                .map(|m| {
+                    let m = m.read(cx);
+                    crate::music::Mode::ALL.iter().flat_map(|&mode| m.downloaded_tracks(mode)).collect()
+                })
+                .unwrap_or_default(),
+            calc: None,
+            calc_selected: false,
         };
         this.update_items(cx);
         this
@@ -613,9 +629,6 @@ impl Launcher {
             };
             section(&mut items, title, v.into_iter().map(|(_, i)| Item::Cmd(i)).collect());
         } else {
-            if let Some(a) = crate::calc::answer(&query) {
-                items.push(Item::Calc(a.value, a.display, a.detail));
-            }
             if let Some(url) = as_url(&query) {
                 items.push(Item::Url(url));
             }
@@ -630,7 +643,7 @@ impl Launcher {
             // "ssh bemo", "claude api", "repos", "dev front"…
             let (first, rest) = query.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((query.as_str(), ""));
             let first_l = first.to_lowercase();
-            let keyword = (!empty && ALL_KEYWORDS.iter().any(|k| k.keywords().contains(&first_l.as_str()))).then_some(first_l);
+            let keyword = (!empty && ALL_KEYWORDS.iter().any(|k| k.keywords().contains(&first_l.as_str()))).then_some(first_l.clone());
 
             let cmds: Vec<usize> = if empty {
                 Vec::new()
@@ -686,6 +699,38 @@ impl Launcher {
                     section(&mut items, "Commands".into(), cmd_items);
                     section(&mut items, "Applications".into(), app_items);
                 }
+                // Downloaded media: "musica"/"podcast"/"videos" lists that kind, else match title / channel.
+                let mode_kw = match first_l.as_str() {
+                    "musica" | "música" | "music" | "canciones" | "songs" => Some(crate::music::Mode::Music),
+                    "podcast" | "podcasts" => Some(crate::music::Mode::Podcast),
+                    "video" | "videos" => Some(crate::music::Mode::Videos),
+                    _ => None,
+                };
+                let (mq, limit) = if mode_kw.is_some() { (rest, 40) } else { (query.as_str(), 8) };
+                let mut media: Vec<(i64, usize, Vec<usize>)> = self
+                    .media
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| mode_kw.is_none_or(|m| t.mode == m))
+                    .filter_map(|(i, t)| {
+                        let title = fuzzy_match(mq, &t.title);
+                        let channel = fuzzy_match(mq, &t.channel).map(|(s, _)| (s - 15, Vec::new()));
+                        let (s, p) = title.into_iter().chain(channel).max_by_key(|x| x.0)?;
+                        Some((s, i, p))
+                    })
+                    .collect();
+                if !mq.is_empty() {
+                    media.sort_by(|a, b| b.0.cmp(&a.0));
+                }
+                let media_items: Vec<Item> = media.into_iter().take(limit).map(|(_, i, p)| Item::Media(i, p)).collect();
+                if mode_kw.is_some() {
+                    // Asked for media explicitly: put it first.
+                    let rest_items = std::mem::take(&mut items);
+                    section(&mut items, "Descargados".into(), media_items);
+                    items.extend(rest_items);
+                } else {
+                    section(&mut items, "Descargados".into(), media_items);
+                }
                 let title = match &self.project_name {
                     Some(n) => format!("Files in {n}"),
                     None => "Files".into(),
@@ -693,6 +738,8 @@ impl Launcher {
                 section(&mut items, title, files.into_iter().map(|(i, p)| Item::File(i, p)).collect());
             }
         }
+        self.calc = if self.scope.is_none() { crate::calc::answer(&query) } else { None };
+        self.calc_selected = self.calc.is_some();
         self.items = items;
         // Background refreshes (dev scripts, file index) keep the selection when possible.
         let keep = prev_key.and_then(|k| self.items.iter().position(|i| self.item_key(i) == k));
@@ -708,7 +755,7 @@ impl Launcher {
         match item {
             Item::Header(t) => format!("h{t}"),
             Item::Url(u) => format!("u{u}"),
-            Item::Calc(..) => "calc".into(),
+            Item::Media(i, _) => format!("m{}", self.media[*i].id),
             Item::App(i, _) => format!("a{i}"),
             Item::Project(i, _) => format!("p{i}"),
             Item::File(i, _) => format!("f{i}"),
@@ -753,7 +800,7 @@ impl Launcher {
         Some(match self.items.get(ix)? {
             Item::Header(_) => return None,
             Item::Url(u) => Pick::Open(u.clone()),
-            Item::Calc(v, ..) => Pick::Copy(v.clone()),
+            Item::Media(i, _) => Pick::Media(self.media[*i].clone()),
             Item::App(i, _) => Pick::App(self.apps[*i].path.clone()),
             Item::Project(i, _) => Pick::Project(self.projects[*i].id.clone(), ProjectAction::Open),
             Item::File(i, _) => Pick::File(self.files[*i].path.clone()),
@@ -812,10 +859,33 @@ impl Launcher {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.calc_selected {
+            if let Some(a) = &self.calc {
+                cx.emit(LauncherEvent::Pick(Pick::Copy(a.value.clone())));
+                return;
+            }
+        }
         self.activate(self.selected, cx);
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let first = self.items.iter().position(|i| !matches!(i, Item::Header(_)));
+        if self.calc.is_some() {
+            if self.calc_selected {
+                if delta > 0 && let Some(f) = first {
+                    self.calc_selected = false;
+                    self.selected = f;
+                    self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                }
+                cx.notify();
+                return;
+            }
+            if delta < 0 && Some(self.selected) == first {
+                self.calc_selected = true;
+                cx.notify();
+                return;
+            }
+        }
         let n = self.items.len() as isize;
         if n == 0 {
             return;
@@ -894,17 +964,25 @@ impl Launcher {
         };
         let plain = |s: &str| StyledText::new(SharedString::from(s.to_string()));
         let svg_icon = |path: &'static str, color: u32| gpui::svg().path(path).size(px(18.)).flex_none().text_color(theme::rgb(color)).into_any_element();
-        let selected = ix == self.selected;
+        let selected = ix == self.selected && !self.calc_selected;
         let (icon, title, subtitle, kind, drill): (gpui::AnyElement, StyledText, String, &str, bool) = match item {
             Item::Header(_) => unreachable!(),
             Item::Url(u) => (svg_icon("icons/external.svg", theme::ACCENT), plain(&format!("Open {u}")), String::new(), "Website", false),
-            Item::Calc(_, shown, detail) => (
-                div().text_size(px(16.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::ACCENT)).child("=").into_any_element(),
-                StyledText::new(SharedString::from(shown.clone())).with_highlights([(0..shown.len(), HighlightStyle { font_weight: Some(gpui::FontWeight::SEMIBOLD), ..Default::default() })]),
-                detail.clone(),
-                "↵ copy",
-                false,
-            ),
+            Item::Media(i, p) => {
+                let t = &self.media[*i];
+                let thumb = t.thumb_path();
+                let icon = if thumb.exists() {
+                    gpui::img(thumb).w(px(22.)).h(px(22.)).rounded(px(4.)).flex_none().object_fit(gpui::ObjectFit::Cover).into_any_element()
+                } else {
+                    svg_icon(t.mode.icon(), t.mode.color())
+                };
+                let kind = match t.mode {
+                    crate::music::Mode::Music => "Song",
+                    crate::music::Mode::Podcast => "Podcast",
+                    crate::music::Mode::Videos => "Video",
+                };
+                (icon, hl(&t.title, p, 0), t.channel.clone(), kind, false)
+            }
             Item::App(i, p) => {
                 let a = &self.apps[*i];
                 let icon = if a.icon.exists() {
@@ -1071,7 +1149,42 @@ impl Render for Launcher {
                     .children(crumb)
                     .child(div().flex_1().min_w_0().child(self.input.clone())),
             )
-            .when(count == 0, |d| {
+            .children(self.calc.as_ref().map(|a| {
+                let side = |big: &str, size: f32, label: &str| {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.))
+                        .child(div().max_w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(size)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(big.to_string()))
+                        .child(div().max_w_full().overflow_hidden().whitespace_nowrap().text_ellipsis().px(px(8.)).py(px(2.)).rounded(px(5.)).bg(theme::rgb(theme::HOVER)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(label.to_string()))
+                };
+                let on = self.calc_selected;
+                div().flex_none().px(px(10.)).pt(px(10.)).child(
+                    div()
+                        .id("launcher-calc")
+                        .h(px(118.))
+                        .flex()
+                        .items_center()
+                        .px(px(16.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(theme::rgb(if on { theme::BRAND_EDGE } else { theme::BORDER }))
+                        .bg(theme::rgb(if on { theme::SELECTED } else { theme::APP_BG }))
+                        .cursor_pointer()
+                        .child(side(&a.question, 24., &a.question_label))
+                        .child(div().flex_none().px(px(12.)).text_size(px(22.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("→"))
+                        .child(side(&a.display, 32., &a.result_label))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.calc_selected = true;
+                            this.confirm(cx);
+                        })),
+                )
+            }))
+            .when(count == 0 && self.calc.is_none(), |d| {
                 d.child(div().px(px(18.)).py(px(14.)).text_size(px(13.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("No results"))
             })
             .child(
@@ -1097,7 +1210,7 @@ impl Render for Launcher {
                     .border_color(theme::rgb(theme::BORDER))
                     .text_size(px(11.))
                     .text_color(theme::rgb(theme::TEXT_FAINT))
-                    .child(hint("↵", "open"))
+                    .child(hint("↵", if self.calc_selected { "copy" } else { "open" }))
                     .child(hint("⇥", "actions"))
                     .when(self.scope.is_some(), |d| d.child(hint("esc", "back")))
                     .child(div().flex_1())
@@ -1287,6 +1400,20 @@ fn run(pick: Pick, cx: &mut App) {
         Pick::Open(u) => open(u.as_ref()),
         Pick::App(p) => open(p.as_os_str()),
         Pick::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
+        Pick::Media(track) => {
+            let Some(music) = crate::music::global(cx) else { return };
+            let video = track.mode == crate::music::Mode::Videos;
+            music.update(cx, |m, cx| {
+                m.play_queue(vec![track], 0, cx);
+                if video {
+                    m.set_video(true, cx);
+                }
+            });
+            // Videos need the player on screen; songs and podcasts keep playing in the background.
+            if video {
+                open_music(cx);
+            }
+        }
         Pick::Project(id, action) => {
             // The window that has the project open, else the last used one.
             let Some(ws) = crate::workspace::window_with_project(&id, None, cx).or_else(|| last_workspace(cx)) else { return };

@@ -13,6 +13,7 @@ use gpui::{
 use project_search::{IndexedFile, SearchMatch, SearchOptions, replace_in_file, search};
 
 use crate::text_input::{TextInput, TextInputEvent};
+use crate::glass::GlassExt;
 use crate::theme;
 
 const MAX_MATCHES: usize = 5000;
@@ -269,15 +270,15 @@ fn opt_toggle(id: &'static str, label: &'static str, on: bool, tip: &'static str
         .flex()
         .items_center()
         .justify_center()
-        .w(px(22.))
-        .h(px(20.))
-        .rounded(px(4.))
+        .w(px(24.))
+        .h(px(22.))
+        .rounded(px(11.))
         .cursor_pointer()
         .text_size(px(11.))
         .font_family(theme::MONO_FONT)
         .border_1()
-        .when(on, |d| d.bg(theme::rgb(theme::BRAND_DEEP)).border_color(theme::rgb(theme::BRAND_EDGE)).text_color(theme::rgb(theme::TEXT)))
-        .when(!on, |d| d.border_color(gpui::transparent_black()).text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::SELECTED))))
+        .when(on, |d| d.glass_active().text_color(theme::rgb(theme::TEXT)))
+        .when(!on, |d| d.border_color(gpui::transparent_black()).text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.glass_hover()))
         .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(tip)).into())
         .child(label)
 }
@@ -289,13 +290,11 @@ fn field() -> gpui::Div {
         .min_w_0()
         .items_center()
         .gap(px(4.))
-        .pl(px(8.))
-        .pr(px(3.))
-        .h(px(28.))
-        .rounded(px(6.))
-        .bg(theme::rgb(theme::EDITOR_BG))
-        .border_1()
-        .border_color(theme::rgb(theme::BORDER))
+        .pl(px(11.))
+        .pr(px(4.))
+        .h(px(30.))
+        .rounded(px(15.))
+        .glass()
 }
 
 impl Render for SearchPanel {

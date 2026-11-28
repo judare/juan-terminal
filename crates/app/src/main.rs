@@ -20,6 +20,7 @@ mod command_palette;
 mod diff_view;
 mod editor_view;
 mod git_panel;
+mod glass;
 mod hotkey;
 mod hover_preview;
 mod language_servers;
