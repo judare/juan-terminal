@@ -102,6 +102,7 @@ actions!(
         ExtendProjectHours,
         ShowUsage,
         ToggleMusic,
+        ShowPlugins,
     ]
 );
 
@@ -220,6 +221,7 @@ enum SidebarMode {
     Servers,
     WhatsApp,
     Claude,
+    Plugins,
 }
 
 pub struct Workspace {
@@ -252,6 +254,8 @@ pub struct Workspace {
     pub(crate) ide: Option<claude_ide::IdeServer>,
     servers_panel: Option<Entity<crate::servers_panel::ServersPanel>>,
     whatsapp_panel: Option<Entity<crate::whatsapp_panel::WhatsAppPanel>>,
+    /// Plugins view (switch on/off, settings, install / update external plugins).
+    plugins_panel: Option<Entity<crate::plugins::panel::PluginsPanel>>,
     /// GitHub Actions section under the file tree (hidden when no repo has workflows).
     actions_panel: Option<Entity<crate::actions_panel::ActionsPanel>>,
     /// Release tags section under GitHub Actions.
@@ -368,20 +372,7 @@ impl Workspace {
                 }
             }),
         ];
-        let (music_card, music_theater) = match crate::music::global(cx) {
-            Some(music) => {
-                use crate::music_ui::{MusicCard, MusicCardEvent, MusicTheater, TheaterEvent};
-                let card = cx.new(|cx| MusicCard::new(music.clone(), cx));
-                let theater = cx.new(|cx| MusicTheater::new(music, cx));
-                subscriptions.push(cx.subscribe_in(&card, window, |this, _, event, window, cx| match event {
-                    MusicCardEvent::OpenSearch => this.toggle_music(&ToggleMusic, window, cx),
-                    MusicCardEvent::OpenTheater => this.open_theater(window, cx),
-                }));
-                subscriptions.push(cx.subscribe_in(&theater, window, |this, _, _: &TheaterEvent, window, cx| this.focus_main(window, cx)));
-                (Some(card), Some(theater))
-            }
-            None => (None, None),
-        };
+        let (music_card, music_theater) = Self::music_views(&mut subscriptions, window, cx);
         let sidebar_width = state.sidebar_width.unwrap_or(260.).clamp(MIN_SIDEBAR, MAX_SIDEBAR);
         let terminal_width = state.terminal_panel_width.unwrap_or(520.).max(240.);
         let font_size = state.font_size.unwrap_or(theme::DEFAULT_FONT_SIZE);
@@ -405,6 +396,7 @@ impl Workspace {
             ide: None,
             servers_panel: None,
             whatsapp_panel: None,
+            plugins_panel: None,
             actions_panel: None,
             tags_panel: None,
             actions_height: 300.,
@@ -524,7 +516,7 @@ impl Workspace {
         })
         .detach();
         // Linked WhatsApp: the panel exists from the start so the mode tab shows unread chats.
-        if whatsapp::data_dir().join("session.db").exists() {
+        if crate::plugins::enabled(crate::plugins::WHATSAPP) && whatsapp::data_dir().join("session.db").exists() {
             this.ensure_whatsapp_panel(cx);
         }
         // Manual testing: open the music search at launch.
@@ -1036,6 +1028,9 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if !crate::plugins::enabled(crate::plugins::AI_USAGE) {
+            return;
+        }
         let prev = window.focused(cx);
         let view = cx.new(|cx| UsageView::new(window, cx));
         let sub = cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
@@ -1053,6 +1048,9 @@ impl Workspace {
                 None => self.focus_main(window, cx),
             }
             cx.notify();
+            return;
+        }
+        if !crate::plugins::enabled(crate::plugins::MEDIA) {
             return;
         }
         let Some(music) = crate::music::global(cx) else { return };
@@ -1114,9 +1112,11 @@ impl Workspace {
                 Some(p) => window.focus(&p),
                 None => this.focus_main(window, cx),
             }
-            if let PaletteEvent::Run(action) = event {
+            match event {
                 // Runs on the element that had focus before the palette opened.
-                window.dispatch_action(action.boxed_clone(), cx);
+                PaletteEvent::Run(action) => window.dispatch_action(action.boxed_clone(), cx),
+                PaletteEvent::RunPlugin(id, ix) => this.run_plugin_command(id, *ix, window, cx),
+                PaletteEvent::Dismiss => {}
             }
             cx.notify();
         });
@@ -1273,7 +1273,145 @@ impl Workspace {
         sp.update(cx, |p, cx| p.set_dev(dev, running, cx));
     }
 
+    /// Sidebar view with every plugin (⌘⇧P → "Plugins", View › Plugins, puzzle icon).
+    fn show_plugins(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_mode = SidebarMode::Plugins;
+        self.sidebar_visible = true;
+        cx.notify();
+    }
+
+    /// Created on first visit (needs the window for its events).
+    fn ensure_plugins_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<crate::plugins::panel::PluginsPanel> {
+        if let Some(p) = &self.plugins_panel {
+            return p.clone();
+        }
+        use crate::plugins::panel::{PluginsPanel, PluginsPanelEvent};
+        let panel = cx.new(PluginsPanel::new);
+        let sub = cx.subscribe_in(&panel, window, |this, _, e: &PluginsPanelEvent, window, cx| match e {
+            PluginsPanelEvent::Changed => {
+                this.plugins_changed(true, window, cx);
+                let me = window.window_handle();
+                for w in workspace_windows(cx) {
+                    if AnyWindowHandle::from(w) != me {
+                        let _ = w.update(cx, |ws, window, cx| ws.plugins_changed(false, window, cx));
+                    }
+                }
+            }
+            PluginsPanelEvent::OpenSettings => this.open_settings(&OpenSettings, window, cx),
+        });
+        self._subscriptions.push(sub);
+        self.plugins_panel = Some(panel.clone());
+        panel
+    }
+
+    fn show_plugins_action(&mut self, _: &ShowPlugins, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_plugins(cx);
+    }
+
+    /// Music card + theater of this window (when the media plugin is on and its player exists).
+    fn music_views(
+        subscriptions: &mut Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Option<Entity<crate::music_ui::MusicCard>>, Option<Entity<crate::music_ui::MusicTheater>>) {
+        let Some(music) = crate::music::global(cx).filter(|_| crate::plugins::enabled(crate::plugins::MEDIA)) else { return (None, None) };
+        use crate::music_ui::{MusicCard, MusicCardEvent, MusicTheater, TheaterEvent};
+        let card = cx.new(|cx| MusicCard::new(music.clone(), cx));
+        let theater = cx.new(|cx| MusicTheater::new(music, cx));
+        subscriptions.push(cx.subscribe_in(&card, window, |this, _, event, window, cx| match event {
+            MusicCardEvent::OpenSearch => this.toggle_music(&ToggleMusic, window, cx),
+            MusicCardEvent::OpenTheater => this.open_theater(window, cx),
+        }));
+        subscriptions.push(cx.subscribe_in(&theater, window, |this, _, _: &TheaterEvent, window, cx| this.focus_main(window, cx)));
+        (Some(card), Some(theater))
+    }
+
+    /// A plugin was switched on/off or reconfigured (from any window): bring this window in
+    /// line. `app_wide` also applies the process-wide parts (players, services, /etc/hosts);
+    /// it runs once, in the window where the change was made.
+    pub(crate) fn plugins_changed(&mut self, app_wide: bool, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::plugins::{self, AI_USAGE, MEDIA, WHATSAPP};
+        let media = plugins::enabled(MEDIA);
+        if app_wide {
+            if media {
+                if crate::music::global(cx).is_none() {
+                    crate::music::init(cx);
+                }
+                crate::launcher::ensure_music_hotkey(cx);
+            } else if let Some(m) = crate::music::global(cx) {
+                m.update(cx, |m, cx| {
+                    m.set_theater(false, cx);
+                    m.stop(cx);
+                });
+            }
+            if plugins::enabled(WHATSAPP) {
+                crate::wa_bridge::init(cx);
+            } else {
+                crate::wa_bridge::refresh_dock();
+            }
+        }
+        // Media: card / theater / search follow the switch.
+        if media && self.music_card.is_none() {
+            let mut subs = Vec::new();
+            let (card, theater) = Self::music_views(&mut subs, window, cx);
+            self._subscriptions.extend(subs);
+            self.music_card = card;
+            self.music_theater = theater;
+        } else if !media {
+            self.music_card = None;
+            self.music_theater = None;
+            if self.music_search.take().is_some() {
+                self.focus_main(window, cx);
+            }
+        }
+        if !plugins::enabled(AI_USAGE) && self.usage.take().is_some() {
+            self.focus_main(window, cx);
+        }
+        if plugins::enabled(WHATSAPP) {
+            if whatsapp::data_dir().join("session.db").exists() {
+                self.ensure_whatsapp_panel(cx);
+            }
+        } else {
+            self.whatsapp_panel = None;
+            if self.sidebar_mode == SidebarMode::WhatsApp {
+                self.sidebar_mode = SidebarMode::Plugins;
+            }
+        }
+        if let Some(sp) = self.servers_panel.clone() {
+            sp.update(cx, |_, cx| cx.notify());
+        }
+        if let Some(pp) = self.plugins_panel.clone() {
+            pp.update(cx, |p, cx| p.reload(cx));
+        }
+        if self.primary {
+            self.apply_blocked_websites(cx);
+        }
+        cx.notify();
+    }
+
+    /// Run command `index` of the external plugin `id` in a new terminal tab.
+    fn run_plugin_command(&mut self, id: &str, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = crate::plugins::manifest(id).filter(|m| crate::plugins::enabled(&m.id)) else { return };
+        let Some(cmd) = m.commands.get(index).cloned() else { return };
+        let mut script = String::new();
+        for (k, v) in crate::plugins::plugin_env(&m) {
+            script.push_str(&format!("export {k}={}; ", crate::terminal_view::shell_quote(&v)));
+        }
+        script.push_str(&cmd.run);
+        // Keep the tab open with a shell afterwards, so the output stays readable.
+        script.push_str("; echo; exec \"${SHELL:-/bin/zsh}\" -l");
+        let cwd = self.active_terminal().and_then(|t| t.read(cx).current_cwd()).or_else(|| self.active_project().and_then(|p| p.default_cwd()));
+        if let Some(view) = self.spawn_terminal_with(cwd, None, Some(("/bin/zsh".into(), vec!["-c".into(), script])), window, cx) {
+            view.update(cx, |t, _| t.label = Some(format!("{} · {}", m.name, cmd.title)));
+        }
+        self.terminal_visible = true;
+        cx.notify();
+    }
+
     fn show_whatsapp(&mut self, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::WHATSAPP) {
+            return self.show_plugins(cx);
+        }
         self.ensure_whatsapp_panel(cx);
         self.sidebar_mode = SidebarMode::WhatsApp;
         self.sidebar_visible = true;
@@ -2354,7 +2492,7 @@ impl Workspace {
 
     fn schedule_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Only the primary window touches /etc/hosts and the Brave guard on the tick.
-        if self.primary && self.applied_hosts.as_ref() != Some(&self.settings.hosts_file().0) {
+        if self.primary && self.applied_hosts.as_ref() != Some(&self.blocking_settings().hosts_file().0) {
             self.apply_blocked_websites(cx);
         }
         let changed = self.refresh_locks();
@@ -2435,15 +2573,33 @@ impl Workspace {
     fn push_brave_rules(&self) {
         let (now, offset) = clock_now();
         let locked: Vec<String> = self.locked.iter().cloned().collect();
+        let s = self.blocking_settings();
         crate::brave_guard::set_rules(crate::brave_guard::Rules {
-            blocked: self.settings.brave_blocked_at(now, offset, &locked),
-            no_video: self.settings.brave_no_video(),
+            blocked: s.brave_blocked_at(now, offset, &locked),
+            no_video: s.brave_no_video(),
+            adult_filter: crate::plugins::setting(crate::plugins::WEBSITE_BLOCKER, "adult_filter"),
         });
+    }
+
+    /// settings.toml as the website blocker plugin applies it: lists of the parts that are off
+    /// are left out (project schedules and their `websites` are core, they stay).
+    fn blocking_settings(&self) -> Settings {
+        use crate::plugins::{WEBSITE_BLOCKER, setting};
+        let mut s = self.settings.clone();
+        if !setting(WEBSITE_BLOCKER, "system_hosts") {
+            s.blocked_websites.clear();
+        }
+        if !setting(WEBSITE_BLOCKER, "brave") {
+            s.brave_blocked_websites.clear();
+            s.brave_no_video_websites.clear();
+            s.website_schedules.clear();
+        }
+        s
     }
 
     fn apply_blocked_websites(&mut self, cx: &mut Context<Self>) {
         self.push_brave_rules();
-        let (hosts, release) = self.settings.hosts_file();
+        let (hosts, release) = self.blocking_settings().hosts_file();
         self.applied_hosts = Some(hosts.clone());
         cx.spawn(async move |this, cx| {
             let res = cx.background_executor().spawn(async move { crate::website_block::apply(&hosts, &release) }).await;
@@ -2861,6 +3017,10 @@ impl Workspace {
                 let cwd = this.active_terminal().and_then(|t| t.read(cx).current_cwd()).or_else(|| this.active_project().and_then(|p| p.default_cwd()));
                 this.open_claude(cwd, None, w, cx);
             })));
+        // SSH servers plugin off: Terminal and Claude Code only.
+        if !crate::plugins::enabled(crate::plugins::SSH) {
+            return Some(gpui::deferred(gpui::anchored().position(position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element());
+        }
         list = list.child(div().h(px(1.)).my(px(4.)).bg(theme::rgb(theme::BORDER))).child(
             div().px(px(10.)).py(px(3.)).text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child("SSH"),
         );
@@ -3663,6 +3823,11 @@ impl Workspace {
         let ports_panel = (self.sidebar_mode == SidebarMode::Ports).then(|| self.ports_panel.clone()).flatten();
         let servers_panel = (self.sidebar_mode == SidebarMode::Servers).then(|| self.servers_panel.clone()).flatten();
         let whatsapp_panel = (self.sidebar_mode == SidebarMode::WhatsApp).then(|| self.whatsapp_panel.clone()).flatten();
+        let plugins_panel = (self.sidebar_mode == SidebarMode::Plugins).then(|| self.ensure_plugins_panel(window, cx));
+        let (media_on, usage_button, wa_on) = {
+            use crate::plugins::{AI_USAGE, MEDIA, WHATSAPP, enabled, setting};
+            (enabled(MEDIA), setting(AI_USAGE, "sidebar_button"), enabled(WHATSAPP))
+        };
         let wa_unread = self.whatsapp_panel.as_ref().map(|p| p.read(cx).total_unread()).unwrap_or(0);
         let claude_needs = self.claude_needs_you(window, cx);
         let claude_board = (self.sidebar_mode == SidebarMode::Claude).then(|| self.render_claude_board(window, cx));
@@ -3774,15 +3939,28 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap(px(4.))
-                            .child(
+                            .when(media_on, |d| d.child(
                                 icon_button("music", "icons/music.svg")
                                     .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Música, podcasts y videos (⌘⇧M)")).into())
                                     .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.toggle_music(&ToggleMusic, w, cx))),
-                            )
-                            .child(
+                            ))
+                            .when(usage_button, |d| d.child(
                                 icon_button("usage-stats", "icons/chart.svg")
                                     .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Agent usage (⌘⇧U)")).into())
                                     .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.toggle_usage(&ShowUsage, w, cx))),
+                            ))
+                            .child(
+                                icon_button("plugins", "icons/plugin.svg")
+                                    .when(self.sidebar_mode == SidebarMode::Plugins, |d| d.bg(theme::rgb(theme::SELECTED)))
+                                    .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Plugins")).into())
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if this.sidebar_mode == SidebarMode::Plugins {
+                                            this.sidebar_mode = SidebarMode::Files;
+                                            cx.notify();
+                                        } else {
+                                            this.show_plugins(cx);
+                                        }
+                                    })),
                             )
                             .child(
                                 icon_button("add-project", "icons/plus.svg")
@@ -3827,9 +4005,9 @@ impl Workspace {
                     })))
                     .child(mode_tab("mode-ports", "icons/ports.svg", "Ports", self.sidebar_mode == SidebarMode::Ports).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_ports(cx))))
                     .child(mode_tab("mode-servers", "icons/server.svg", "Servers", self.sidebar_mode == SidebarMode::Servers).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_servers(w, cx))))
-                    .child(mode_tab("mode-whatsapp", "icons/whatsapp.svg", "WhatsApp", self.sidebar_mode == SidebarMode::WhatsApp).when(wa_unread > 0, |d| d.child(
+                    .when(wa_on, |d| d.child(mode_tab("mode-whatsapp", "icons/whatsapp.svg", "WhatsApp", self.sidebar_mode == SidebarMode::WhatsApp).when(wa_unread > 0, |d| d.child(
                         mode_badge(wa_unread, 0x1f9d55, 0xffffff),
-                    )).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_whatsapp(cx)))),
+                    )).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_whatsapp(cx))))),
             )
             .when_some(search_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when_some(git_panel, |d, gp| d.child(div().flex_1().min_h_0().child(gp)))
@@ -3837,6 +4015,7 @@ impl Workspace {
             .when_some(ports_panel, |d, pp| d.child(div().flex_1().min_h_0().child(pp)))
             .when_some(servers_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when_some(whatsapp_panel, |d, wp| d.child(div().flex_1().min_h_0().child(wp)))
+            .when_some(plugins_panel, |d, pp| d.child(div().flex_1().min_h_0().child(pp)))
             .when_some(claude_board, |d, b| d.child(div().flex_1().min_h_0().child(b)))
             .when(self.sidebar_mode == SidebarMode::Files, |d| d.child(
                 uniform_list(
@@ -4354,6 +4533,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::toggle_usage))
             .on_action(cx.listener(Self::toggle_music))
+            .on_action(cx.listener(Self::show_plugins_action))
             .on_action(cx.listener(Self::close_diff))
             .on_action(cx.listener(|this, _: &ShowGit, w, cx| this.show_git(w, cx)))
             .on_action(cx.listener(|this, _: &ShowTools, w, cx| this.show_tools(w, cx)))

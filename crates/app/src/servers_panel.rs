@@ -1279,6 +1279,21 @@ impl Render for ServersPanel {
         if let Some(dev) = self.render_dev(cx) {
             list = list.child(dev);
         }
+        // Plugins: the SSH servers and 2FA sections can each be switched off.
+        if crate::plugins::enabled(crate::plugins::SSH) {
+            list = self.render_servers(list, cx);
+        }
+        if crate::plugins::enabled(crate::plugins::TWO_FACTOR) {
+            self.ensure_totp(cx);
+            list = list.child(self.render_totp(cx));
+        }
+        list
+    }
+}
+
+impl ServersPanel {
+    /// "SERVERS" section: the project's SSH servers with their remote file browsers.
+    fn render_servers(&self, mut list: gpui::Stateful<gpui::Div>, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         list = list.child(
             div()
                 .flex()
@@ -1426,8 +1441,7 @@ impl Render for ServersPanel {
                 list = list.children(rows);
             }
         }
-        self.ensure_totp(cx);
-        list.child(self.render_totp(cx))
+        list
     }
 }
 

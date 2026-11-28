@@ -23,6 +23,13 @@ Planned crates (see ROADMAP.md): `editor`, `git_engine`, `diff_engine`, `code_qu
 `claude_integration`, `moli_integration`, `settings`. Each one only depends on what it needs;
 the `app` crate composes them. No IPC or serialization between in-process modules.
 
+## Plugins
+
+Optional features (music/videos, WhatsApp, 2FA, SSH servers, AI usage metrics, website blocker)
+are plugins under `crates/app/src/plugins/<plugin>/`, switched on/off and configured from the
+Plugins view; external plugins live in `<state>/plugins/<plugin>/plugin.json`. See
+[docs/PLUGINS.md](docs/PLUGINS.md).
+
 ## Data flow: terminal
 
 ```

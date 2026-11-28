@@ -2,7 +2,7 @@
 //! element (so editor commands apply to the editor you were in).
 
 use gpui::{
-    Action, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
+    Action, App, ClickEvent, SharedString, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
     ScrollStrategy, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
     uniform_list,
 };
@@ -13,13 +13,36 @@ use crate::text_input::{TextInput, TextInputEvent};
 use crate::{editor_view as e, terminal_view as t, theme, workspace as w};
 
 pub struct Command {
-    pub label: &'static str,
+    pub label: SharedString,
     pub shortcut: &'static str,
-    pub action: Box<dyn Action>,
+    pub run: Run,
 }
 
+pub enum Run {
+    Action(Box<dyn Action>),
+    /// Command `index` of the external plugin `id` (see `plugins`).
+    Plugin(String, usize),
+}
+
+/// App commands (minus those of plugins that are off) plus the commands of external plugins.
 pub fn commands() -> Vec<Command> {
-    let c = |label, shortcut, action: Box<dyn Action>| Command { label, shortcut, action };
+    use crate::plugins;
+    let mut v = builtin_commands();
+    v.retain(|c| match &c.run {
+        Run::Action(a) if a.partial_eq(&w::ShowUsage) => plugins::enabled(plugins::AI_USAGE),
+        Run::Action(a) if a.partial_eq(&w::ToggleMusic) => plugins::enabled(plugins::MEDIA),
+        _ => true,
+    });
+    for m in plugins::external().into_iter().filter(|m| plugins::enabled(&m.id)) {
+        for (i, cmd) in m.commands.iter().enumerate() {
+            v.push(Command { label: format!("{}: {}", m.name, cmd.title).into(), shortcut: "", run: Run::Plugin(m.id.clone(), i) });
+        }
+    }
+    v
+}
+
+fn builtin_commands() -> Vec<Command> {
+    let c = |label: &'static str, shortcut, action: Box<dyn Action>| Command { label: label.into(), shortcut, run: Run::Action(action) };
     vec![
         c("File: Go to File…", "⌘P", Box::new(w::ToggleQuickOpen)),
         c("File: Open Project Folder…", "⌘O", Box::new(w::OpenProject)),
@@ -64,6 +87,8 @@ pub fn commands() -> Vec<Command> {
         c("View: Increase Font Size", "⌘=", Box::new(w::IncreaseFontSize)),
         c("View: Decrease Font Size", "⌘-", Box::new(w::DecreaseFontSize)),
         c("View: Reset Font Size", "⌘0", Box::new(w::ResetFontSize)),
+        c("View: Música, podcasts y videos", "⌘⇧M", Box::new(w::ToggleMusic)),
+        c("App: Plugins (activar, configurar, instalar)", "", Box::new(w::ShowPlugins)),
         c("App: Settings (schedules, blocked websites)", "⌘,", Box::new(w::OpenSettings)),
         c("Project: Keep Project Open 1 More Hour (emergency)", "", Box::new(w::ExtendProjectHours)),
         c("App: Quit", "⌘Q", Box::new(w::Quit)),
@@ -72,6 +97,7 @@ pub fn commands() -> Vec<Command> {
 
 pub enum PaletteEvent {
     Run(Box<dyn Action>),
+    RunPlugin(String, usize),
     Dismiss,
 }
 
@@ -106,7 +132,7 @@ impl CommandPalette {
             .commands
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| project_search::fuzzy_match(&q, c.label).map(|(s, _)| (s, i)))
+            .filter_map(|(i, c)| project_search::fuzzy_match(&q, &c.label).map(|(s, _)| (s, i)))
             .collect();
         if !q.trim().is_empty() {
             scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -119,7 +145,10 @@ impl CommandPalette {
 
     fn confirm(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(&ci) = self.results.get(ix) {
-            cx.emit(PaletteEvent::Run(self.commands[ci].action.boxed_clone()));
+            match &self.commands[ci].run {
+                Run::Action(a) => cx.emit(PaletteEvent::Run(a.boxed_clone())),
+                Run::Plugin(id, i) => cx.emit(PaletteEvent::RunPlugin(id.clone(), *i)),
+            }
         }
     }
 
@@ -193,7 +222,7 @@ impl Render for CommandPalette {
                                         .when(selected, |d| d.bg(theme::rgb(theme::SELECTED)))
                                         .hover(|s| s.bg(theme::rgb(theme::HOVER)))
                                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.confirm(ix, cx)))
-                                        .child(div().flex_1().text_size(px(13.)).text_color(theme::rgb(theme::TEXT)).child(c.label))
+                                        .child(div().flex_1().text_size(px(13.)).text_color(theme::rgb(theme::TEXT)).child(c.label.clone()))
                                         .child(div().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(c.shortcut)),
                                 )
                             })

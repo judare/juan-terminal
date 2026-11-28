@@ -81,7 +81,13 @@ fn builtin_groups() -> Vec<Group> {
 /// Tool names of our MCP server that are switched off (read by `--mcp-servers`).
 pub fn hidden_builtin_tools() -> Vec<String> {
     let off = disabled();
-    builtin_groups().into_iter().filter(|g| off.contains(&g.id)).flat_map(|g| g.items).collect()
+    // Plugins switched off hide their tools too (WhatsApp, SSH servers).
+    let plugin_off = |id: &str| match id {
+        "whatsapp" => !crate::plugins::enabled(crate::plugins::WHATSAPP),
+        "ssh" => !crate::plugins::enabled(crate::plugins::SSH),
+        _ => false,
+    };
+    builtin_groups().into_iter().filter(|g| off.contains(&g.id) || plugin_off(&g.id)).flat_map(|g| g.items).collect()
 }
 
 fn skill_dirs(dir: &Path) -> Vec<String> {

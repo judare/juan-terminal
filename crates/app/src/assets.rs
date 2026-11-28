@@ -132,6 +132,7 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/table.svg", include_bytes!("../assets/icons/table.svg")),
     ("icons/font.svg", include_bytes!("../assets/icons/font.svg")),
     ("icons/database.svg", include_bytes!("../assets/icons/database.svg")),
+    ("icons/plugin.svg", include_bytes!("../assets/icons/plugin.svg")),
 ];
 
 pub struct Assets;

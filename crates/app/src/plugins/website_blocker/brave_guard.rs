@@ -25,6 +25,8 @@ pub struct Rules {
     pub blocked: Vec<String>,
     /// Domains whose videos are hidden.
     pub no_video: Vec<String>,
+    /// Blank pages with many adult keywords, whatever the URL.
+    pub adult_filter: bool,
 }
 
 static RULES: Mutex<Option<Rules>> = Mutex::new(None);
@@ -56,7 +58,10 @@ fn run() {
         let (running, front) = brave_state();
         if running {
             let rules = RULES.lock().unwrap().clone().unwrap_or_default();
-            tick(&rules);
+            // Nothing to enforce (website blocker plugin off): don't touch Brave at all.
+            if rules.adult_filter || !rules.blocked.is_empty() || !rules.no_video.is_empty() {
+                tick(&rules);
+            }
         }
         std::thread::sleep(Duration::from_millis(if front { 1000 } else { 3000 }));
     }
@@ -87,7 +92,7 @@ fn brave_state() -> (bool, bool) {
 }
 
 fn tick(rules: &Rules) {
-    let js = guard_js(&rules.no_video);
+    let js = guard_js(&rules.no_video, rules.adult_filter);
     // One line per tab: window id, tab id, URL, guard result (active tabs only).
     let script = format!(
         r#"on run argv
@@ -129,7 +134,7 @@ end run"#
         let [w, t, url, res] = f[..] else { continue };
         no_js |= res == "nojs";
         let host = url_host(url);
-        if res == "adult" || host.is_some_and(|h| is_blocked(&h, &rules.blocked)) {
+        if (res == "adult" && rules.adult_filter) || host.is_some_and(|h| is_blocked(&h, &rules.blocked)) {
             blank.push(format!("{w}/{t}"));
         }
     }
@@ -170,8 +175,8 @@ fn is_blocked(host: &str, domains: &[String]) -> bool {
     domains.iter().any(|d| host == d || host.strip_suffix(d.as_str()).is_some_and(|p| p.ends_with('.')))
 }
 
-fn guard_js(no_video: &[String]) -> String {
-    GUARD_JS.replace("__NO_VIDEO__", &serde_json::to_string(no_video).unwrap_or_else(|_| "[]".into()))
+fn guard_js(no_video: &[String], adult_filter: bool) -> String {
+    GUARD_JS.replace("__NO_VIDEO__", &serde_json::to_string(no_video).unwrap_or_else(|_| "[]".into())).replace("__ADULT__", if adult_filter { "true" } else { "false" })
 }
 
 /// Returns "ok", or "adult" once the page was flagged (it blanks itself too). Idempotent: a
@@ -191,7 +196,7 @@ const GUARD_JS: &str = r#"(() => {
     'sexo (?:anal|oral|expl[ií]cito|en vivo)', 'webcam sex', 'nopor', 'chicas webcam', 'videos? (?:porno|xxx)'];
   const RE = new RegExp('(?<![\\p{L}\\p{N}])(' + WORDS.join('|') + ')(?![\\p{L}\\p{N}])', 'giu');
   const check = () => {
-    if (g.state !== 'ok') return;
+    if (g.state !== 'ok' || !__ADULT__) return;
     const rating = [...document.querySelectorAll('meta[name="rating" i],meta[http-equiv="rating" i]')].map(m => (m.content || '').toLowerCase()).join(' ');
     if (/rta-5042-1996-1400-1577-rta|\badult\b/.test(rating)) return blank();
     const meta = [...document.querySelectorAll('meta[name="description" i],meta[name="keywords" i]')].map(m => m.content || '').join(' ');
@@ -243,6 +248,6 @@ mod tests {
         assert!(is_blocked("app.work.example", &d));
         assert!(!is_blocked("notyoutube.com", &d));
         assert!(!is_blocked("work.example.evil.io", &d));
-        assert!(guard_js(&["x.com".into()]).contains(r#"on(["x.com"])"#));
+        assert!(guard_js(&["x.com".into()], true).contains(r#"on(["x.com"])"#));
     }
 }

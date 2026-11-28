@@ -20,7 +20,26 @@ fn app_is_active() -> bool {
     }
 }
 
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Unread count for the Dock badge (0 while the plugin or its Dock setting is off).
+fn dock_unread() -> usize {
+    if !crate::plugins::setting(crate::plugins::WHATSAPP, "dock_badge") {
+        return 0;
+    }
+    WhatsApp::try_global().map(|wa| wa.store().total_unread() as usize).unwrap_or(0)
+}
+
+/// The WhatsApp plugin or its settings changed: repaint the Dock badge.
+pub fn refresh_dock() {
+    crate::claude_bridge::set_dock_count(DOCK_OWNER, dock_unread());
+}
+
+/// Idempotent: also called when the WhatsApp plugin is switched on.
 pub fn init(cx: &mut App) {
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return refresh_dock();
+    }
     // Only start the service when a device was linked before (no cost otherwise).
     let wa_dir = whatsapp::data_dir();
     if !wa_dir.join("session.db").exists() {
@@ -46,16 +65,13 @@ fn start_lazy(cx: &mut App) {
 fn listen(cx: &mut App) {
     let wa = WhatsApp::global();
     let mut rx = wa.subscribe();
-    crate::claude_bridge::set_dock_count(DOCK_OWNER, wa.store().total_unread() as usize);
+    refresh_dock();
     cx.spawn(async move |cx| {
         while let Some(u) = rx.next().await {
             match u {
-                Update::Chats => {
-                    let n = WhatsApp::global().store().total_unread() as usize;
-                    crate::claude_bridge::set_dock_count(DOCK_OWNER, n);
-                }
+                Update::Chats => refresh_dock(),
                 Update::Notify { chat, title, body } => {
-                    if !(app_is_active() && crate::chat_view::is_chat_open(&chat)) {
+                    if crate::plugins::setting(crate::plugins::WHATSAPP, "notifications") && !(app_is_active() && crate::chat_view::is_chat_open(&chat)) {
                         crate::notify::notify(crate::notify::Source::WhatsApp, "WhatsApp", &title, &body);
                     }
                 }

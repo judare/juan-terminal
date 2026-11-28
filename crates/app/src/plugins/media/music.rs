@@ -292,6 +292,10 @@ pub fn init(cx: &mut App) {
     }
     cx.spawn(async move |cx| {
         while let Some(ev) = rx.next().await {
+            // Plugin switched off: the global keys stay registered until restart, do nothing.
+            if !crate::plugins::enabled(crate::plugins::MEDIA) {
+                continue;
+            }
             if music.update(cx, |m, cx| m.remote(ev, cx)).is_err() {
                 break;
             }
@@ -1418,7 +1422,37 @@ fn parse(e: &Value, mode: Mode) -> Option<Track> {
 }
 
 /// Search results with the mode's automatic filter (`filtered`). Shorts never qualify.
+/// Music and podcasts come from YouTube Music's catalog (songs / podcast episodes only), so a
+/// search never mixes in lectures, cartoons or reaction videos; videos search all of YouTube.
 pub fn search(mode: Mode, query: &str, filtered: bool) -> Result<Vec<Track>, String> {
+    match mode {
+        Mode::Music => match ytm_songs(query.trim()) {
+            Ok(list) if !list.is_empty() => Ok(list.into_iter().filter(|t| keep(t, mode, filtered)).collect()),
+            _ => yt_search(mode, query, filtered),
+        },
+        Mode::Podcast => match ytm_episodes(query.trim()) {
+            Ok(mut list) if !list.is_empty() => {
+                // YouTube Music doesn't say how long or how watched an episode is.
+                std::thread::scope(|s| {
+                    for t in &mut list {
+                        s.spawn(move || {
+                            if let Some((duration, views, channel_url)) = video_details(&t.id) {
+                                t.duration = duration.or(t.duration);
+                                t.views = views.or(t.views);
+                                t.channel_url = channel_url.or(t.channel_url.take());
+                            }
+                        });
+                    }
+                });
+                Ok(list.into_iter().filter(|t| keep(t, mode, filtered)).collect())
+            }
+            _ => yt_search(mode, query, filtered),
+        },
+        Mode::Videos => yt_search(mode, query, filtered),
+    }
+}
+
+fn yt_search(mode: Mode, query: &str, filtered: bool) -> Result<Vec<Track>, String> {
     let q = query.trim();
     let (q, n) = match mode {
         Mode::Music => (q.to_string(), 40),
@@ -1458,9 +1492,211 @@ fn keep(t: &Track, mode: Mode, filtered: bool) -> bool {
     if !filtered {
         return true;
     }
-    let views_ok = mode.min_views().is_none_or(|min| t.views.is_some_and(|v| v >= min));
-    let length_ok = mode != Mode::Podcast || dur >= 600.;
+    // Podcast episodes the regular search didn't cover come without views / length: they're
+    // already podcasts, so only what is known is filtered.
+    let lenient = mode == Mode::Podcast && t.views.is_none();
+    let views_ok = lenient || mode.min_views().is_none_or(|min| t.views.is_some_and(|v| v >= min));
+    let length_ok = mode != Mode::Podcast || t.duration.is_none() || dur >= 600.;
     views_ok && length_ok
+}
+
+// ---- YouTube Music catalog search --------------------------------------------------------------
+
+/// `params` of YouTube Music's search filters ("songs", "episodes").
+const YTM_SONGS: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
+const YTM_EPISODES: &str = "EgWKAQJIAWoKEAkQBRAKEAMQBA%3D%3D";
+
+fn ytm_search(query: &str, params: &str, hl: &str) -> Result<Vec<Value>, String> {
+    let body = serde_json::json!({
+        "context": { "client": { "clientName": "WEB_REMIX", "clientVersion": "1.20241127.01.00", "hl": hl, "gl": "CO" } },
+        "query": query,
+        "params": params,
+    });
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(12))).build().into();
+    let text = agent
+        .post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false")
+        .header("Content-Type", "application/json")
+        .header("Origin", "https://music.youtube.com")
+        .send(body.to_string())
+        .map_err(|e| format!("YouTube Music: {e}"))?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("YouTube Music: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("respuesta inválida: {e}"))?;
+    let mut out = Vec::new();
+    collect_items(&v, &mut out);
+    Ok(out)
+}
+
+fn collect_items(v: &Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(r) = m.get("musicResponsiveListItemRenderer") {
+                out.push(r.clone());
+                return;
+            }
+            m.values().for_each(|x| collect_items(x, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_items(x, out)),
+        _ => {}
+    }
+}
+
+/// The text runs of flex column `i` of a result row.
+fn ytm_runs(r: &Value, i: usize) -> Vec<&Value> {
+    r.pointer(&format!("/flexColumns/{i}/musicResponsiveListItemFlexColumnRenderer/text/runs")).and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default()
+}
+
+fn ytm_text(runs: &[&Value]) -> String {
+    runs.iter().filter_map(|r| r.get("text").and_then(Value::as_str)).collect()
+}
+
+fn ytm_channel_url(run: &Value) -> Option<String> {
+    let id = run.pointer("/navigationEndpoint/browseEndpoint/browseId")?.as_str()?;
+    id.starts_with("UC").then(|| format!("https://www.youtube.com/channel/{id}"))
+}
+
+/// Length, views and channel of a video, from the player endpoint (one small request).
+fn video_details(id: &str) -> Option<(Option<f64>, Option<u64>, Option<String>)> {
+    let body = serde_json::json!({
+        "context": { "client": { "clientName": "WEB", "clientVersion": "2.20241126.01.00", "hl": "es" } },
+        "videoId": id,
+    });
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(8))).build().into();
+    let text = agent
+        .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let d = v.get("videoDetails")?;
+    let num = |k: &str| d.get(k).and_then(Value::as_str).and_then(|x| x.parse::<u64>().ok());
+    let channel = d.get("channelId").and_then(Value::as_str).map(|c| format!("https://www.youtube.com/channel/{c}"));
+    Some((num("lengthSeconds").map(|n| n as f64), num("viewCount"), channel))
+}
+
+/// Songs: "Artist, Artist • Album • 3:01" and "5,9 M reproducciones".
+fn ytm_songs(query: &str) -> Result<Vec<Track>, String> {
+    let rows = ytm_search(query, YTM_SONGS, "es")?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.pointer("/playlistItemData/videoId")?.as_str()?.to_string();
+            let title = ytm_text(&ytm_runs(r, 0));
+            let info = ytm_runs(r, 1);
+            let parts: Vec<String> = ytm_text(&info).split(" • ").map(str::to_string).collect();
+            let duration = parts.last().and_then(|d| parse_clock(d));
+            // Artists are everything before the first " • ".
+            let artists = parts.first().cloned().unwrap_or_default();
+            let channel_url = info.first().and_then(|r| ytm_channel_url(r));
+            let views = parse_count(&ytm_text(&ytm_runs(r, 2)));
+            (id.len() == 11 && !title.is_empty()).then(|| Track { id, title, channel: artists, channel_url, duration, views, mode: Mode::Music, topic: None, published: None })
+        })
+        .collect())
+}
+
+/// Episodes: "8 mar • Anomalías Podcast" (date • podcast).
+fn ytm_episodes(query: &str) -> Result<Vec<Track>, String> {
+    let rows = ytm_search(query, YTM_EPISODES, "es")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.pointer("/playlistItemData/videoId")?.as_str()?.to_string();
+            let title = ytm_text(&ytm_runs(r, 0));
+            let info = ytm_text(&ytm_runs(r, 1));
+            let (date, show) = info.split_once(" • ").unwrap_or(("", info.as_str()));
+            (id.len() == 11 && !title.is_empty()).then(|| Track {
+                id,
+                title,
+                channel: show.to_string(),
+                channel_url: None,
+                duration: None,
+                views: None,
+                mode: Mode::Podcast,
+                topic: None,
+                published: parse_es_date(date, now),
+            })
+        })
+        .collect())
+}
+
+/// "3:01" / "1:02:03" → seconds.
+fn parse_clock(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if !s.contains(':') {
+        return None;
+    }
+    s.split(':').try_fold(0., |acc, p| p.trim().parse::<f64>().ok().map(|n| acc * 60. + n))
+}
+
+/// "5,9 M reproducciones" / "20 K" / "147 reproducciones" / "1,2 mil M" → count.
+fn parse_count(s: &str) -> Option<u64> {
+    let s = s.replace('\u{a0}', " ").to_lowercase();
+    let num: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.').collect();
+    if num.is_empty() {
+        return None;
+    }
+    let rest = s[num.len()..].trim_start();
+    let mult = if rest.starts_with("mil m") || rest.starts_with('b') {
+        1e9
+    } else if rest.starts_with('m') && !rest.starts_with("mil") {
+        1e6
+    } else if rest.starts_with('k') || rest.starts_with("mil") {
+        1e3
+    } else {
+        1.
+    };
+    let n: f64 = if mult == 1. { num.replace(['.', ','], "").parse().ok()? } else { num.replace(',', ".").parse().ok()? };
+    Some((n * mult) as u64)
+}
+
+/// "8 mar" / "6 ago 2024" / "hace 2 días" → unix seconds (approximate).
+fn parse_es_date(s: &str, now: i64) -> Option<i64> {
+    let s = s.trim().to_lowercase();
+    if let Some(rest) = s.strip_prefix("hace ") {
+        let mut it = rest.split_whitespace();
+        let n: i64 = it.next()?.parse().ok()?;
+        let unit = it.next()?;
+        let secs = if unit.starts_with("min") {
+            60
+        } else if unit.starts_with("hora") {
+            3600
+        } else if unit.starts_with("día") || unit.starts_with("dia") {
+            86_400
+        } else if unit.starts_with("semana") {
+            7 * 86_400
+        } else if unit.starts_with("mes") {
+            30 * 86_400
+        } else if unit.starts_with("año") {
+            365 * 86_400
+        } else {
+            return None;
+        };
+        return Some(now - n * secs);
+    }
+    const MONTHS: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"];
+    let mut it = s.split_whitespace();
+    let day: i64 = it.next()?.parse().ok()?;
+    let mon = it.next()?.trim_end_matches('.');
+    let month = MONTHS.iter().position(|m| mon.starts_with(m) || m.starts_with(mon))? as i64 + 1;
+    let this_year = 1970 + now / 31_556_952;
+    let year: i64 = it.next().and_then(|y| y.parse().ok()).unwrap_or(this_year);
+    let ts = days_from_civil(year, month, day) * 86_400;
+    // No year means this year, unless that date is still ahead.
+    Some(if ts > now + 86_400 { days_from_civil(year - 1, month, day) * 86_400 } else { ts })
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// What to show before typing: a few topics from `preferences.json` (rotating by `seed`),
@@ -1507,8 +1743,8 @@ fn suggest(mode: Mode, exclude: &HashSet<String>, seed: u64) -> Result<Suggestio
 
 // ---- preferences & progress files ------------------------------------------------------------
 
-const DEFAULT_PREFERENCES: &str = include_str!("../assets/music-preferences.json");
-const RENEW_SCRIPT: &str = include_str!("../assets/music-update-preferences.sh");
+const DEFAULT_PREFERENCES: &str = include_str!("../../../assets/music-preferences.json");
+const RENEW_SCRIPT: &str = include_str!("../../../assets/music-update-preferences.sh");
 
 pub fn preferences_file() -> PathBuf {
     music_dir().join("preferences.json")
@@ -1928,6 +2164,33 @@ pub fn fmt_views(v: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_ytm_counts_clock_and_dates() {
+        assert_eq!(parse_count("5,9\u{a0}M reproducciones"), Some(5_900_000));
+        assert_eq!(parse_count("20 K reproducciones"), Some(20_000));
+        assert_eq!(parse_count("147 reproducciones"), Some(147));
+        assert_eq!(parse_count("1,2 mil M reproducciones"), Some(1_200_000_000));
+        assert_eq!(parse_clock("3:01"), Some(181.));
+        assert_eq!(parse_clock("1:02:03"), Some(3723.));
+        let now = days_from_civil(2026, 11, 28) * 86_400;
+        assert_eq!(parse_es_date("6 ago 2024", now), Some(days_from_civil(2024, 8, 6) * 86_400));
+        assert_eq!(parse_es_date("8 mar", now), Some(days_from_civil(2026, 3, 8) * 86_400));
+        assert_eq!(parse_es_date("20 dic", now), Some(days_from_civil(2025, 12, 20) * 86_400));
+        assert_eq!(parse_es_date("hace 2 días", now), Some(now - 2 * 86_400));
+    }
+
+    #[test]
+    #[ignore = "network"]
+    fn live_ytm_search() {
+        for (mode, q) in [(Mode::Music, "materia gris"), (Mode::Podcast, "finanzas personales")] {
+            let r = search(mode, q, false).unwrap();
+            assert!(!r.is_empty());
+            for t in r.iter().take(6) {
+                eprintln!("{:?} {} | {} | {:?} {:?} {:?}", mode, t.title, t.channel, t.duration, t.views, t.published);
+            }
+        }
+    }
+
     use super::*;
 
     fn t(views: Option<u64>, duration: f64) -> Track {

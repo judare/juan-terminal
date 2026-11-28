@@ -206,96 +206,6 @@ fn seek_bar(music: &Entity<Music>, m: &Music, id: &'static str) -> gpui::Statefu
         )
 }
 
-/// Thin progress bar (click to seek) with elapsed / total time.
-fn progress(music: &Entity<Music>, m: &Music, id: &'static str) -> gpui::Div {
-    let frac = if m.duration > 0. { (m.position / m.duration).clamp(0., 1.) as f32 } else { 0. };
-    let accent = m.current().map(|t| t.mode.color()).unwrap_or(theme::ACCENT);
-    let bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
-    let b2 = bounds.clone();
-    let music = music.clone();
-    let duration = m.duration;
-    let status: Option<String> = if let Some(e) = &m.error {
-        Some(e.clone())
-    } else if m.resolving {
-        Some("Cargando…".into())
-    } else if m.buffering {
-        Some("Cargando…".into())
-    } else {
-        None
-    };
-    let error = m.error.is_some();
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(3.))
-        .child(
-            div()
-                .id(id)
-                .relative()
-                .h(px(10.))
-                .flex()
-                .items_center()
-                .cursor_pointer()
-                .group("progress")
-                .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _, cx| {
-                    if let Some(b) = b2.get() {
-                        let x = f32::from(e.position.x - b.origin.x) / f32::from(b.size.width).max(1.);
-                        if duration > 0. {
-                            music.update(cx, |m, cx| m.seek_to(duration * x.clamp(0., 1.) as f64, cx));
-                        }
-                    }
-                })
-                .child(canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {}).absolute().size_full())
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(3.))
-                        .group_hover("progress", |s| s.h(px(5.)))
-                        .rounded_full()
-                        .bg(gpui::hsla(0., 0., if theme::is_light() { 0. } else { 1. }, 0.12))
-                        .child(div().h_full().rounded_full().bg(theme::rgb(accent)).w(gpui::relative(frac))),
-                )
-                // Scrubber knob, shown on hover.
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(1.))
-                        .left(gpui::relative(frac))
-                        .ml(px(-5.))
-                        .size(px(10.))
-                        .rounded_full()
-                        .bg(gpui::white())
-                        .shadow(crate::glass::shadow_sm())
-                        .invisible()
-                        .group_hover("progress", |s| s.visible()),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .text_size(px(10.))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme::rgb(theme::TEXT_FAINT))
-                .child(fmt_time(m.position))
-                .when_some(status, |d, st| {
-                    d.child(
-                        div()
-                            .flex_1()
-                            .mx(px(6.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .flex()
-                            .justify_center()
-                            .text_color(theme::rgb(if error { theme::DELETED } else { theme::TEXT_MUTED }))
-                            .child(st),
-                    )
-                })
-                .child(if m.duration > 0. { fmt_time(m.duration) } else { "--:--".into() }),
-        )
-}
-
 // ---- search overlay ------------------------------------------------------------------------------
 
 pub enum MusicSearchEvent {
@@ -552,10 +462,17 @@ impl Render for MusicSearch {
                 status = Some(("Preparando sugerencias…".into(), false));
             }
         } else {
+            // Downloads that match show from the first keystroke (they play offline), on top
+            // of the search results once those arrive.
+            let q = key.1.clone();
+            let local: Vec<Track> = music.downloaded_tracks(self.mode).into_iter().filter(|t| t.title.to_lowercase().contains(&q) || t.channel.to_lowercase().contains(&q)).collect();
+            let local_ids: std::collections::HashSet<String> = local.iter().map(|t| t.id.clone()).collect();
+            let n_local = local.len();
             match self.cache.get(&key) {
                 Some(Ok(tracks)) => {
-                    self.visible = tracks.clone();
-                    if tracks.is_empty() {
+                    self.visible = local;
+                    self.visible.extend(tracks.iter().filter(|t| !local_ids.contains(&t.id)).cloned());
+                    if self.visible.is_empty() {
                         status = Some((
                             if key.2 { "Nada supera el filtro de reproducciones. Desactívalo para ver todo." } else { "Sin resultados." }.into(),
                             false,
@@ -563,17 +480,21 @@ impl Render for MusicSearch {
                     }
                 }
                 Some(Err(e)) => {
-                    self.visible.clear();
-                    status = Some((e.clone(), true));
+                    self.visible = local;
+                    if self.visible.is_empty() {
+                        status = Some((e.clone(), true));
+                    }
                 }
                 None => {
-                    // Keep showing the previous list while typing; the spinner says it's coming.
+                    // Only the matching downloads until the search answers.
+                    self.visible = local;
                 }
             }
+            let downloaded = if n_local > 0 { format!(" · {n_local} descargados") } else { String::new() };
             if self.searching.is_some() || self._debounce.is_some() {
-                header = Some("Buscando…".into());
+                header = Some(format!("Buscando…{downloaded}"));
             } else if !self.visible.is_empty() {
-                header = Some(format!("{} resultados", self.visible.len()));
+                header = Some(format!("{} resultados{downloaded}", self.visible.len()));
             }
         }
         if self.selected >= self.visible.len() {
@@ -1244,47 +1165,90 @@ impl Render for MusicCard {
             return self.render_video(&music, &track, window, cx);
         }
         m.video_view.set_overlay(None);
+        const ART: f32 = 76.;
+        const BADGE: f32 = 24.;
+        let mode_color = theme::rgb(track.mode.color());
+        let play_icon = if m.playing { "icons/pause.svg" } else { "icons/play.svg" };
+        let subtitle = player_status(m).unwrap_or_else(|| {
+            let total = if m.duration > 0. { fmt_time(m.duration) } else { "--:--".into() };
+            format!("{} · {} / {}", track.mode.label(), fmt_time(m.position), total)
+        });
+        let plain_button = |id: &'static str, path: &'static str, size: f32| {
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(28.))
+                .rounded(px(14.))
+                .cursor_pointer()
+                .hover(|s| s.glass_hover())
+                .child(icon(path, size, theme::TEXT))
+        };
         div()
             .flex()
             .flex_col()
             .flex_none()
-            .gap(px(10.))
+            .gap(px(8.))
             .mx(px(8.))
             .mb(px(8.))
-            .px(px(12.))
-            .pt(px(12.))
-            .pb(px(10.))
-            .rounded(px(16.))
+            .px(px(10.))
+            .pt(px(10.))
+            .pb(px(8.))
+            .relative()
+            .rounded(px(18.))
             .glass()
             .group("music-card")
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(px(12.))
                     .child(
+                        // Artwork with the mode badge (music / podcast / video) on its corner.
                         div()
                             .id("music-card-thumb")
                             .relative()
+                            .flex_none()
+                            .size(px(ART + BADGE / 3.))
                             .cursor_pointer()
                             .group("thumb")
-                            .rounded(px(8.))
-                            .shadow(crate::glass::shadow())
-                            .child(thumb_el(m, &track, 44., 44., 8.))
+                            .child(div().rounded(px(14.)).shadow(crate::glass::shadow()).child(thumb_el(m, &track, ART, ART, 14.)))
                             .child(
                                 div()
                                     .absolute()
                                     .top_0()
                                     .left_0()
-                                    .size(px(44.))
-                                    .rounded(px(8.))
+                                    .size(px(ART))
+                                    .rounded(px(14.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .bg(gpui::hsla(0., 0., 0., 0.55))
                                     .invisible()
                                     .group_hover("thumb", |s| s.visible())
-                                    .child(gpui::svg().path(if m.video_on { "icons/close.svg" } else { "icons/video.svg" }).size(px(16.)).text_color(gpui::white())),
+                                    .child(gpui::svg().path(if m.video_on { "icons/close.svg" } else { "icons/video.svg" }).size(px(18.)).text_color(gpui::white())),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .bottom_0()
+                                    .size(px(BADGE))
+                                    .rounded(px(6.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(gpui::linear_gradient(
+                                        180.,
+                                        gpui::linear_color_stop(gpui::Hsla { l: (mode_color.l + 0.08).min(1.), ..mode_color }, 0.),
+                                        gpui::linear_color_stop(mode_color, 1.),
+                                    ))
+                                    .border_1()
+                                    .border_color(gpui::hsla(0., 0., 1., 0.22))
+                                    .shadow(vec![gpui::BoxShadow { color: gpui::hsla(0., 0., 0., 0.35), offset: gpui::point(px(0.), px(2.)), blur_radius: px(6.), spread_radius: px(0.) }])
+                                    .child(gpui::svg().path(track.mode.icon()).size(px(14.)).text_color(gpui::white())),
                             )
                             .tooltip(tip("Ver / ocultar video"))
                             .on_click(on(|m, cx| m.toggle_video(cx))),
@@ -1295,41 +1259,62 @@ impl Render for MusicCard {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(1.))
-                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(track.title.clone()))
-                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_MUTED)).child(track.channel.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .flex_none()
-                            .opacity(0.55)
-                            .group_hover("music-card", |s| s.opacity(1.))
-                            .children([true, false].map(|good| {
-                                let rating = m.rating(&track.id);
-                                let (path, label) = rate_icon(good, rating);
-                                let music = music.clone();
-                                let t = track.clone();
+                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(14.)).font_weight(gpui::FontWeight::BOLD).text_color(theme::rgb(theme::TEXT)).child(track.title.clone()))
+                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.)).font_weight(gpui::FontWeight::MEDIUM).text_color(theme::rgb(theme::TEXT_MUTED)).child(track.channel.clone()))
+                            .child(
                                 div()
-                                    .id(if good { "music-card-up" } else { "music-card-down" })
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(11.))
+                                    .text_color(theme::rgb(if m.error.is_some() { theme::DELETED } else { theme::TEXT_FAINT }))
+                                    .child(subtitle),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(4.))
+                                    .ml(px(-6.))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .size(px(22.))
-                                    .rounded(px(11.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.glass_hover())
-                                    .child(icon(path, 12., if rating == Some(good) { theme::ACCENT } else { theme::TEXT }))
-                                    .tooltip(tip(label))
-                                    .on_click(move |_: &ClickEvent, _, cx| music.update(cx, |m, cx| m.rate(&t, good, cx)))
-                            }))
-                            .child(round_button("music-card-search", "icons/search.svg", 22., 12.).tooltip(tip("Buscar (⌘⇧M)")).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(MusicCardEvent::OpenSearch))))
-                            .child(round_button("music-card-close", "icons/close.svg", 22., 12.).tooltip(tip("Cerrar reproductor")).on_click(on(|m, cx| m.stop(cx)))),
+                                    .gap(px(4.))
+                                    .child(plain_button("card-prev", "icons/skip-prev.svg", 13.).tooltip(tip("Anterior (⌃⌥⇧←)")).on_click(on(|m, cx| m.previous(cx))))
+                                    .child(plain_button("card-play", play_icon, 17.).tooltip(tip("Reproducir / pausa (⌃⌥Space)")).on_click(on(|m, cx| m.toggle(cx))))
+                                    .child(plain_button("card-next", "icons/skip-next.svg", 13.).when(!m.has_next(), |d| d.opacity(0.4)).tooltip(tip("Siguiente (⌃⌥⇧→)")).on_click(on(|m, cx| m.next(cx)))),
+                            ),
                     ),
             )
-            .child(progress(&music, m, "music-card-progress"))
-            .child(transport(&music, m, false, "card"))
+            .child(seek_bar(&music, m, "music-card-progress"))
+            // Rate / search / close: top-right, shown on hover.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(6.))
+                    .flex()
+                    .items_center()
+                    .invisible()
+                    .group_hover("music-card", |s| s.visible())
+                    .children([true, false].map(|good| {
+                        let rating = m.rating(&track.id);
+                        let (path, label) = rate_icon(good, rating);
+                        let music = music.clone();
+                        let t = track.clone();
+                        div()
+                            .id(if good { "music-card-up" } else { "music-card-down" })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(22.))
+                            .rounded(px(11.))
+                            .cursor_pointer()
+                            .hover(|s| s.glass_hover())
+                            .child(icon(path, 12., if rating == Some(good) { theme::ACCENT } else { theme::TEXT }))
+                            .tooltip(tip(label))
+                            .on_click(move |_: &ClickEvent, _, cx| music.update(cx, |m, cx| m.rate(&t, good, cx)))
+                    }))
+                    .child(round_button("music-card-search", "icons/search.svg", 22., 12.).tooltip(tip("Buscar (⌘⇧M)")).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(MusicCardEvent::OpenSearch))))
+                    .child(round_button("music-card-close", "icons/close.svg", 22., 12.).tooltip(tip("Cerrar reproductor")).on_click(on(|m, cx| m.stop(cx)))),
+            )
             .into_any_element()
     }
 }

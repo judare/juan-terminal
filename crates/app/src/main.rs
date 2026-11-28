@@ -10,7 +10,6 @@ mod pdf_view;
 mod pptx_view;
 mod brave;
 mod calc;
-mod chat_view;
 mod claude_board;
 mod claude_bridge;
 mod claude_sessions;
@@ -27,10 +26,14 @@ mod language_servers;
 mod launcher;
 mod markdown_live;
 mod moli;
-mod music;
-mod music_engine;
-mod music_proxy;
-mod music_ui;
+mod plugins;
+// Built-in plugins live in `plugins/<plugin>/`; re-exported here so `crate::<module>` paths
+// keep working across the app.
+use plugins::ai_usage::{usage_stats, usage_view};
+use plugins::media::{music, music_engine, music_proxy, music_ui};
+use plugins::two_factor::totp;
+use plugins::website_blocker::{brave_guard, website_block};
+use plugins::whatsapp::{chat_view, voice, wa_bridge, wa_gate, wa_mcp, wa_reply, wa_ui, whatsapp_panel};
 mod ports;
 mod power;
 mod quick_open;
@@ -45,21 +48,9 @@ mod text_area;
 mod text_input;
 mod theme;
 mod tools_panel;
-mod totp;
-mod usage_stats;
-mod usage_view;
 mod video_player;
-mod voice;
-mod wa_bridge;
-mod wa_gate;
-mod wa_mcp;
-mod wa_reply;
 mod net;
 mod notify;
-mod wa_ui;
-mod website_block;
-mod brave_guard;
-mod whatsapp_panel;
 mod workspace;
 mod zoom_view;
 
@@ -91,13 +82,16 @@ pub(crate) fn servers_mcp_config(project: &workspace_state::Project) -> Option<s
     std::fs::create_dir_all(&dir).ok()?;
     let safe: String = project.id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     let path = dir.join(format!("{safe}.json"));
-    let body = serde_json::json!({"mcpServers": {"juan-terminal": {
+    let mut servers = serde_json::Map::new();
+    servers.insert("juan-terminal".into(), serde_json::json!({
         "type": "stdio",
         "command": exe.display().to_string(),
         "args": ["--mcp-servers"],
         "env": {"JT_PROJECT_ID": project.id, "JT_APP_PID": std::process::id().to_string()},
-    }}})
-    .to_string();
+    }));
+    // MCP servers of the active external plugins.
+    servers.extend(plugins::mcp_servers());
+    let body = serde_json::json!({"mcpServers": servers}).to_string();
     if std::fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
         std::fs::write(&path, body).ok()?;
     }
@@ -134,11 +128,13 @@ fn main() {
                 .unwrap_or_default();
             ports::dev_servers_report(app_pid, &roots)
         };
-        let tools = brave::tools().into_iter().chain(wa_mcp::tools()).collect();
-        let call = |name: &str, args: &serde_json::Value| brave::call(name, args).or_else(|| wa_mcp::call(name, args));
+        // Plugins switched off take their tools (and instructions) with them.
+        let wa_on = plugins::enabled(plugins::WHATSAPP);
+        let tools = brave::tools().into_iter().chain(if wa_on { wa_mcp::tools() } else { Vec::new() }).collect();
+        let call = move |name: &str, args: &serde_json::Value| brave::call(name, args).or_else(|| if wa_on { wa_mcp::call(name, args) } else { None });
         let hidden = claude_tools::hidden_builtin_tools();
         let off = claude_tools::disabled();
-        let instructions = format!("{}{}", if off.contains("brave") { "" } else { brave::INSTRUCTIONS }, if off.contains("whatsapp") { "" } else { wa_mcp::INSTRUCTIONS });
+        let instructions = format!("{}{}", if off.contains("brave") { "" } else { brave::INSTRUCTIONS }, if off.contains("whatsapp") || !wa_on { "" } else { wa_mcp::INSTRUCTIONS });
         ssh_remote::mcp::serve_stdio_with(&ssh_remote::mcp::Extra { dev_servers: &dev_servers, tools, call: &call, instructions: &instructions, hidden: &hidden });
         return;
     }
@@ -177,9 +173,13 @@ fn main() {
         })
         .detach();
         bind_keys(cx);
-        wa_bridge::init(cx);
+        if plugins::enabled(plugins::WHATSAPP) {
+            wa_bridge::init(cx);
+        }
         net::init(cx);
-        music::init(cx);
+        if plugins::enabled(plugins::MEDIA) {
+            music::init(cx);
+        }
         music_ui::bind_keys(cx);
         text_input::bind_keys(cx);
         chat_view::bind_keys(cx);
@@ -248,6 +248,7 @@ fn main() {
                     MenuItem::action("Toggle Light / Dark Theme", workspace::ToggleTheme),
                     MenuItem::action("Agent Usage", workspace::ShowUsage),
                     MenuItem::action("Música, podcasts y videos…", workspace::ToggleMusic),
+                    MenuItem::action("Plugins", workspace::ShowPlugins),
                     MenuItem::action("Command Palette…", workspace::ToggleCommandPalette),
                     MenuItem::action("Go to File…", workspace::ToggleQuickOpen),
                     MenuItem::action("Search in Project", workspace::SearchInProject),

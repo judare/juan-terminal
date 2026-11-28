@@ -583,6 +583,7 @@ impl Launcher {
             _index_task: index_task,
             _dev_task: Some(dev_task),
             media: crate::music::global(cx)
+                .filter(|_| crate::plugins::setting(crate::plugins::MEDIA, "launcher_results"))
                 .map(|m| {
                     let m = m.read(cx);
                     crate::music::Mode::ALL.iter().flat_map(|&mode| m.downloaded_tracks(mode)).collect()
@@ -1242,18 +1243,7 @@ pub fn init(workspace: WindowHandle<Workspace>, cx: &mut App) {
         }
         Err(e) => crate::startup_log(&format!("launcher hotkey: {e}")),
     }
-    // ⌘⇧M system-wide: music / podcasts / videos search, also from other apps.
-    match crate::hotkey::register(crate::hotkey::KVK_M, crate::hotkey::CMD_KEY | crate::hotkey::SHIFT_KEY, "⌘⇧M") {
-        Ok(mut rx) => {
-            cx.spawn(async move |cx| {
-                while rx.next().await.is_some() {
-                    let _ = cx.update(toggle_music);
-                }
-            })
-            .detach();
-        }
-        Err(e) => crate::startup_log(&format!("music search hotkey: {e}")),
-    }
+    ensure_music_hotkey(cx);
     // Manual testing without the hotkey.
     if std::env::var_os("JT_LAUNCHER_AT_START").is_some() {
         toggle(cx);
@@ -1364,6 +1354,34 @@ pub fn toggle(cx: &mut App) {
             cx.global_mut::<LauncherGlobal>().window = Some(handle);
         }
         Err(e) => crate::startup_log(&format!("launcher window: {e:#}")),
+    }
+}
+
+/// ⌘⇧M system-wide: music / podcasts / videos search, also from other apps. Registered once,
+/// when the media plugin and its "global hotkey" setting are on (also when switched on later).
+pub fn ensure_music_hotkey(cx: &mut App) {
+    static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::plugins::setting(crate::plugins::MEDIA, "global_hotkey") || REGISTERED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    match crate::hotkey::register(crate::hotkey::KVK_M, crate::hotkey::CMD_KEY | crate::hotkey::SHIFT_KEY, "⌘⇧M") {
+        Ok(mut rx) => {
+            cx.spawn(async move |cx| {
+                while rx.next().await.is_some() {
+                    let _ = cx.update(|cx| {
+                        // Switched off since: let the app in front handle it (inside juan-terminal
+                        // the local ⌘⇧M binding still toggles the search).
+                        if crate::plugins::setting(crate::plugins::MEDIA, "global_hotkey") {
+                            toggle_music(cx);
+                        } else if crate::plugins::enabled(crate::plugins::MEDIA) && cx.active_window().is_some() {
+                            toggle_music(cx);
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+        Err(e) => crate::startup_log(&format!("music search hotkey: {e}")),
     }
 }
 
