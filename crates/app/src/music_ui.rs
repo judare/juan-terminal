@@ -85,6 +85,27 @@ fn round_button(id: impl Into<gpui::ElementId>, path: &'static str, size: f32, i
         .child(icon(path, icon_size, theme::TEXT))
 }
 
+/// Filter chip: glass pill, accent-tinted when on.
+fn chip(id: &'static str, on: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .px(px(10.))
+        .h(px(24.))
+        .rounded_full()
+        .cursor_pointer()
+        .text_size(px(11.5))
+        .when(on, |d| d.glass_active().text_color(theme::rgb(theme::ACCENT)))
+        .when(!on, |d| d.glass_button().text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.glass_hover().text_color(theme::rgb(theme::TEXT))))
+}
+
+/// Selected list row / grid cell: soft brand-red glass.
+fn selected_glass<E: Styled>(d: E) -> E {
+    d.bg(theme::rgb(theme::ACCENT).opacity(0.12)).border_color(gpui::Hsla { a: 0.35, ..theme::rgb(theme::ACCENT) })
+}
+
 fn tip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
     move |_, cx| cx.new(|_| crate::git_panel::Tooltip(label)).into()
 }
@@ -576,61 +597,44 @@ impl Render for MusicSearch {
         let filtered = self.is_filtered(self.mode);
         let mode = self.mode;
 
-        let mode_tabs = div().flex().items_center().gap(px(4.)).children(Mode::ALL.iter().enumerate().map(|(i, &m)| {
+        let mode_tabs = div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .p(px(3.))
+            .rounded_full()
+            .bg(gpui::hsla(0., 0., 0., if theme::is_light() { 0.05 } else { 0.25 }))
+            .border_1()
+            .border_color(crate::glass::edge())
+            .children(Mode::ALL.iter().enumerate().map(|(i, &m)| {
             let active = m == mode;
             div()
                 .id(("music-mode", i))
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .px(px(10.))
-                .h(px(26.))
-                .rounded(px(13.))
+                .px(px(12.))
+                .h(px(24.))
+                .rounded_full()
                 .cursor_pointer()
                 .text_size(px(12.5))
-                .when(active, |d| d.bg(theme::rgb(m.color())).text_color(gpui::white()).font_weight(gpui::FontWeight::SEMIBOLD))
-                .when(!active, |d| d.text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::HOVER))))
-                .child(gpui::svg().path(m.icon()).size(px(13.)).text_color(if active { gpui::white() } else { theme::rgb(theme::TEXT_MUTED) }))
+                .when(active, |d| d.glass_button().text_color(theme::rgb(theme::TEXT)).font_weight(gpui::FontWeight::MEDIUM))
+                .when(!active, |d| d.text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.text_color(theme::rgb(theme::TEXT))))
+                .child(gpui::svg().path(m.icon()).size(px(12.)).text_color(theme::rgb(if active { theme::ACCENT } else { theme::TEXT_FAINT })))
                 .child(m.label())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_mode(m, cx)))
         }));
 
-        let downloaded_chip = div()
-            .id("music-only-downloaded")
-            .flex()
-            .items_center()
-            .gap(px(5.))
-            .px(px(8.))
-            .h(px(22.))
-            .rounded(px(11.))
-            .cursor_pointer()
-            .text_size(px(11.5))
-            .border_1()
-            .when(only_downloaded, |d| d.border_color(theme::rgb(mode.color())).text_color(theme::rgb(mode.color())))
-            .when(!only_downloaded, |d| d.border_color(theme::rgb(theme::BORDER)).text_color(theme::rgb(theme::TEXT_FAINT)))
-            .hover(|s| s.bg(theme::rgb(theme::HOVER)))
-            .child(icon(if only_downloaded { "icons/check.svg" } else { "icons/pull.svg" }, 11., if only_downloaded { mode.color() } else { theme::TEXT_FAINT }))
+        let downloaded_chip = chip("music-only-downloaded", only_downloaded)
+            .child(icon(if only_downloaded { "icons/check.svg" } else { "icons/pull.svg" }, 11., if only_downloaded { theme::ACCENT } else { theme::TEXT_MUTED }))
             .child("Descargados")
             .tooltip(tip("Ver solo lo que suena sin internet en esta categoría"))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_only_downloaded(cx)));
 
         let filter_chip = (!only_downloaded).then_some(()).and(mode.min_views()).map(|min| {
             let label = if min >= 1_000_000 { "+1M reproducciones" } else { "+5k reproducciones" };
-            div()
-                .id("music-filter")
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .px(px(8.))
-                .h(px(22.))
-                .rounded(px(11.))
-                .cursor_pointer()
-                .text_size(px(11.5))
-                .border_1()
-                .when(filtered, |d| d.border_color(theme::rgb(mode.color())).text_color(theme::rgb(mode.color())))
-                .when(!filtered, |d| d.border_color(theme::rgb(theme::BORDER)).text_color(theme::rgb(theme::TEXT_FAINT)).line_through())
-                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
-                .when(filtered, |d| d.child(icon("icons/check.svg", 11., mode.color())))
+            chip("music-filter", filtered)
+                .child(icon(if filtered { "icons/check.svg" } else { "icons/close.svg" }, 10., if filtered { theme::ACCENT } else { theme::TEXT_FAINT }))
                 .child(label)
                 .tooltip(tip("Filtro automático por popularidad (clic para quitarlo)"))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_filter(cx)))
@@ -648,21 +652,31 @@ impl Render for MusicSearch {
             .w(px(PANEL_W))
             .flex()
             .flex_col()
-            .bg(theme::rgb(theme::SIDEBAR_BG))
+            .bg({
+                let base = theme::rgb(theme::SIDEBAR_BG);
+                gpui::linear_gradient(180., gpui::linear_color_stop(gpui::Hsla { l: (base.l + 0.03).min(1.), a: 0.97, ..base }, 0.), gpui::linear_color_stop(gpui::Hsla { a: 0.97, ..base }, 1.))
+            })
             .border_1()
-            .border_color(theme::rgb(theme::BORDER))
-            .rounded(px(12.))
-            .shadow_lg()
+            .border_color(crate::glass::edge())
+            .rounded(px(18.))
+            .shadow(vec![
+                gpui::BoxShadow { color: gpui::hsla(0., 0., 0., 0.45), offset: gpui::point(px(0.), px(18.)), blur_radius: px(48.), spread_radius: px(0.) },
+                gpui::BoxShadow { color: gpui::hsla(0., 0., 0., 0.25), offset: gpui::point(px(0.), px(2.)), blur_radius: px(6.), spread_radius: px(0.) },
+            ])
             .overflow_hidden()
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .px(px(14.))
-                    .h(px(46.))
-                    .child(icon("icons/search.svg", 15., theme::TEXT_FAINT))
-                    .child(div().flex_1().text_size(px(14.)).child(self.input.clone())),
+                div().px(px(12.)).pt(px(12.)).pb(px(10.)).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(14.))
+                        .h(px(40.))
+                        .rounded_full()
+                        .glass()
+                        .child(icon("icons/search.svg", 15., theme::TEXT_MUTED))
+                        .child(div().flex_1().text_size(px(14.)).child(self.input.clone())),
+                ),
             )
             .child(
                 div()
@@ -671,8 +685,6 @@ impl Render for MusicSearch {
                     .justify_between()
                     .px(px(12.))
                     .pb(px(10.))
-                    .border_b_1()
-                    .border_color(theme::rgb(theme::BORDER))
                     .child(mode_tabs)
                     .child(
                         div()
@@ -703,19 +715,30 @@ impl Render for MusicSearch {
                             ),
                     ),
             )
-            .child(
+            .child({
+                // "Para ti · tema · tema…": the label, then each topic as a small glass chip.
+                let text = header.unwrap_or_else(|| if key.1.is_empty() { "Sugerencias".into() } else { String::new() });
+                let suggesting_row = key.1.is_empty() && !only_downloaded;
+                let mut parts = text.split(" · ").map(str::to_string);
+                let first = parts.next().unwrap_or_default();
+                let rest: Vec<String> = if suggesting_row { parts.collect() } else { Vec::new() };
+                let label = if suggesting_row { first } else { text.clone() };
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.))
                     .px(px(16.))
-                    .pt(px(10.))
-                    .pb(px(4.))
-                    .text_size(px(11.))
-                    .text_color(theme::rgb(theme::TEXT_FAINT))
-                    .when(key.1.is_empty() && !only_downloaded, |d| d.child(icon("icons/sparkle.svg", 11., mode.color())))
-                    .child(header.unwrap_or_else(|| if key.1.is_empty() { "Sugerencias".into() } else { String::new() })),
-            )
+                    .pt(px(8.))
+                    .pb(px(6.))
+                    .border_t_1()
+                    .border_color(crate::glass::edge())
+                    .overflow_hidden()
+                    .text_size(px(11.5))
+                    .text_color(theme::rgb(theme::TEXT_MUTED))
+                    .when(suggesting_row, |d| d.child(icon("icons/sparkle.svg", 11., theme::ACCENT)))
+                    .child(div().flex_none().font_weight(gpui::FontWeight::MEDIUM).text_color(theme::rgb(theme::TEXT)).child(label))
+                    .children(rest.into_iter().map(|t| div().flex_none().px(px(8.)).py(px(1.)).rounded_full().glass_button().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(t)))
+            })
             .when_some(status, |d, (st, err)| {
                 d.child(div().px(px(16.)).py(px(14.)).text_size(px(12.5)).text_color(theme::rgb(if err { theme::DELETED } else { theme::TEXT_MUTED })).child(st))
             })
@@ -751,6 +774,13 @@ impl Render for MusicSearch {
                                 if let Some(v) = t.views {
                                     meta.push(format!("{} reproducciones", fmt_views(v)));
                                 }
+                                if !playing && progress.as_ref().is_some_and(|p| p.finished) {
+                                    meta.push("Visto".into());
+                                }
+                                // The preferences topic it came from, folded into the same line.
+                                if let Some(topic) = &t.topic {
+                                    meta.push(topic.clone());
+                                }
                                 Some(
                                     div()
                                         .id(ix)
@@ -761,17 +791,22 @@ impl Render for MusicSearch {
                                         // Fixed width: the list's rows would otherwise size to their content.
                                         .w(px(ROW_W))
                                         .h(px(ROW_H))
-                                        .px(px(10.))
+                                        .px(px(8.))
                                         .mx(px(6.))
-                                        .rounded(px(8.))
+                                        .rounded(px(12.))
+                                        .border_1()
+                                        .border_color(gpui::transparent_black())
                                         .cursor_pointer()
-                                        .when(selected, |d| d.bg(theme::rgb(theme::SELECTED)))
-                                        .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                                        .when(selected, selected_glass)
+                                        .when(!selected, |d| d.hover(|s| s.glass_hover()))
                                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.play(ix, cx)))
                                         .child(
                                             div()
                                                 .relative()
-                                                .child(thumb_el(music, t, 76., 43., 6.))
+                                                .rounded(px(8.))
+                                                .overflow_hidden()
+                                                .shadow(crate::glass::shadow_sm())
+                                                .child(thumb_el(music, t, 76., 43., 8.))
                                                 .when_some(progress.as_ref().filter(|p| !p.finished).map(|p| p.fraction()), |d, f| {
                                                     d.child(
                                                         div()
@@ -805,16 +840,24 @@ impl Render for MusicSearch {
                                                 .min_w_0()
                                                 .flex()
                                                 .flex_col()
-                                                .gap(px(3.))
+                                                .gap(px(2.))
                                                 .child(
                                                     div()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .text_size(px(13.))
-                                                        .text_color(theme::rgb(if playing { t.mode.color() } else { theme::TEXT }))
-                                                        .when(playing, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
-                                                        .child(t.title.clone()),
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(6.))
+                                                        .min_w_0()
+                                                        .when(playing, |d| d.child(icon("icons/music.svg", 11., theme::ACCENT)))
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .text_size(px(13.))
+                                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                                .text_color(theme::rgb(if playing { theme::ACCENT } else { theme::TEXT }))
+                                                                .child(t.title.clone()),
+                                                        ),
                                                 )
                                                 .child(
                                                     div()
@@ -827,57 +870,27 @@ impl Render for MusicSearch {
                                                 ),
                                         )
                                         .child({
-                                            // Right column: status, or the preferences topic it came from (✕ on hover).
-                                            let col = div().flex().flex_none().items_center().justify_end().gap(px(4.)).w(px(124.)).text_size(px(11.));
-                                            if playing {
-                                                col.text_color(theme::rgb(t.mode.color())).child(icon("icons/music.svg", 11., t.mode.color())).child("Sonando").into_any_element()
-                                            } else if progress.as_ref().is_some_and(|p| p.finished) {
-                                                col.text_color(theme::rgb(theme::TEXT_FAINT)).child(icon("icons/check.svg", 11., theme::TEXT_FAINT)).child("Visto").into_any_element()
-                                            } else if let Some(topic) = t.topic.clone() {
-                                                let mode = t.mode;
-                                                let music = this.music.clone();
-                                                col.text_color(theme::rgb(theme::TEXT_FAINT))
-                                                    .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(topic.clone()))
-                                                    .child(
-                                                        div()
-                                                            .id(("music-drop-topic", ix))
-                                                            .flex()
-                                                            .flex_none()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .size(px(18.))
-                                                            .rounded(px(9.))
-                                                            .cursor_pointer()
-                                                            .invisible()
-                                                            .group_hover("music-row", |s| s.visible())
-                                                            .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
-                                                            .child(icon("icons/close.svg", 10., theme::TEXT_MUTED))
-                                                            .tooltip(tip("No sugerir más este tema"))
-                                                            .on_click(move |_: &ClickEvent, _, cx| {
-                                                                cx.stop_propagation();
-                                                                music.update(cx, |m, cx| m.drop_topic(mode, &topic, cx));
-                                                            }),
-                                                    )
-                                                    .into_any_element()
-                                            } else {
-                                                col.into_any_element()
-                                            }
-                                        })
-                                        .child({
                                             // 👍 / 👎 (the chosen one stays visible) and 🗑 for local copies.
                                             let rate = [true, false].map(|good| {
                                                 let music = this.music.clone();
                                                 let track = t.clone();
                                                 let (path, label) = rate_icon(good, rating);
-                                                let color = if rating == Some(good) { t.mode.color() } else { theme::TEXT_MUTED };
+                                                let color = if rating == Some(good) { theme::ACCENT } else { theme::TEXT_MUTED };
                                                 row_action((if good { "music-row-up" } else { "music-row-down" }, ix), path, label, color, rating == Some(good)).on_click(move |_: &ClickEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     music.update(cx, |m, cx| m.rate(&track, good, cx));
                                                 })
                                             });
+                                            let drop_topic = t.topic.clone().map(|topic| {
+                                                let (mode, music) = (t.mode, this.music.clone());
+                                                row_action(("music-drop-topic", ix), "icons/close.svg", "No sugerir más este tema", theme::TEXT_MUTED, false).on_click(move |_: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    music.update(cx, |m, cx| m.drop_topic(mode, &topic, cx));
+                                                })
+                                            });
                                             let music = this.music.clone();
                                             let id = t.id.clone();
-                                            div().flex().flex_none().items_center().gap(px(2.)).children(rate).when(local, |d| {
+                                            div().flex().flex_none().items_center().gap(px(2.)).children(rate).children(drop_topic).when(local, |d| {
                                                 d.child(row_action(("music-row-trash", ix), "icons/trash.svg", "Borrar la descarga (libera espacio)", theme::TEXT_MUTED, false).on_click(move |_: &ClickEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     music.update(cx, |m, cx| m.remove_download(&id, cx));
@@ -898,17 +911,18 @@ impl Render for MusicSearch {
                 div()
                     .flex()
                     .items_center()
-                    .justify_end()
                     .px(px(14.))
-                    .h(px(30.))
+                    .h(px(32.))
                     .border_t_1()
-                    .border_color(theme::rgb(theme::BORDER))
-                    .text_size(px(11.))
+                    .border_color(crate::glass::edge())
+                    .text_size(px(10.5))
                     .text_color(theme::rgb(theme::TEXT_FAINT))
                     .child(
                         div()
+                            .flex_1()
                             .flex()
                             .items_center()
+                            .justify_between()
                             .gap(px(10.))
                             .when_some(usage.filter(|b| *b > 0), |d, bytes| {
                                 let confirming = self.confirm_clear;
@@ -920,9 +934,9 @@ impl Render for MusicSearch {
                                         .gap(px(4.))
                                         .px(px(6.))
                                         .h(px(20.))
-                                        .rounded(px(5.))
+                                        .rounded_full()
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                                        .hover(|s| s.glass_hover())
                                         .when(confirming, |d| d.text_color(theme::rgb(theme::DELETED)))
                                         .child(icon("icons/trash.svg", 11., if confirming { theme::DELETED } else { theme::TEXT_FAINT }))
                                         .child(if confirming { format!("¿Borrar {}? (no toca «Ver después»)", fmt_bytes(bytes)) } else { format!("{} descargados", fmt_bytes(bytes)) })
@@ -1024,10 +1038,12 @@ fn grid_cell(this: &MusicSearch, ix: usize, current_id: Option<&str>, cx: &mut C
         .w(px(CELL_W))
         .h(px(GRID_ROW_H - 6.))
         .p(px(6.))
-        .rounded(px(10.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(gpui::transparent_black())
         .cursor_pointer()
-        .when(selected, |d| d.bg(theme::rgb(theme::SELECTED)))
-        .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+        .when(selected, selected_glass)
+        .when(!selected, |d| d.hover(|s| s.glass_hover()))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.play(ix, cx)))
         .child(thumb)
         .child(
@@ -1174,7 +1190,7 @@ fn row_action(id: (&'static str, usize), path: &'static str, label: &'static str
         .rounded(px(11.))
         .cursor_pointer()
         .when(!always, |d| d.invisible().group_hover("music-row", |s| s.visible()))
-        .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
+        .hover(|s| s.glass_hover())
         .child(icon(path, 12., color))
         .tooltip(tip(label))
 }
