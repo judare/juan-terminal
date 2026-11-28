@@ -1402,7 +1402,7 @@ impl EditorView {
         let text = self.doc.line(line).to_string();
         let text = text.trim_end_matches(['\n', '\r']).to_string();
         if let Some(url) = crate::terminal_view::url_at(std::slice::from_ref(&text), &[false], 0, col) {
-            cx.open_url(&url);
+            crate::music::open_url(&url, cx);
             return true;
         }
         let chars: Vec<char> = text.chars().collect();

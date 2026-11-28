@@ -863,7 +863,7 @@ impl TerminalView {
                 .map(|r| self.snapshot.row(r).last().is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE)))
                 .collect();
             if let Some(url) = url_at(&rows, &wrapped, row, col) {
-                cx.open_url(&url);
+                crate::music::open_url(&url, cx);
                 return;
             }
             let cwd = self.current_cwd();

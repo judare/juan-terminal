@@ -1369,7 +1369,7 @@ impl ChatView {
                                 )
                                 .on_click(move |_: &ClickEvent, _, cx| {
                                     let u = if url.starts_with("http") { url.clone() } else { format!("https://{url}") };
-                                    cx.open_url(&u);
+                                    crate::music::open_url(&u, cx);
                                 })
                                 .on_mouse_down(
                                     MouseButton::Right,
@@ -2181,7 +2181,7 @@ impl ChatView {
         base.child(InteractiveText::new(SharedString::from(format!("txt-{id}")), styled).on_click(ranges, move |ix, window, cx| {
             if let Some(u) = urls.get(ix) {
                 let u = if u.starts_with("http") { u.clone() } else { format!("https://{u}") };
-                cx.open_url(&u);
+                crate::music::open_url(&u, cx);
             } else if let Some((label, digits)) = phone_info.get(ix - urls.len()) {
                 let position = window.mouse_position();
                 let (label, digits) = (label.clone(), digits.clone());

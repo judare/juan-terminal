@@ -5,6 +5,10 @@
 //!   several different words, to avoid false positives) or an adult rating meta tag;
 //! * on `brave_no_video_websites` (x.com) hides and stops every video (images stay).
 //!
+//! With the media plugin's `open_links` on, tabs on a YouTube video are closed and the link is
+//! handed to Fragua's player instead (before any blocking). YouTube Music stays browsable even
+//! when youtube.com is blocked: playing a song pauses it there, goes back and plays it in Fragua.
+//!
 //! Polls every second while Brave is frontmost, every 3 s otherwise, and does nothing (no
 //! process spawned) while Brave isn't running. The guard needs Brave's
 //! View › Developer › Allow JavaScript from Apple Events; URL blocking works without it.
@@ -30,6 +34,14 @@ pub struct Rules {
 }
 
 static RULES: Mutex<Option<Rules>> = Mutex::new(None);
+/// Where YouTube video links found in Brave go (the media player).
+static HANDOFF: Mutex<Option<futures::channel::mpsc::UnboundedSender<String>>> = Mutex::new(None);
+impl Rules {
+    fn enforces(&self) -> bool {
+        self.adult_filter || !self.blocked.is_empty() || !self.no_video.is_empty()
+    }
+}
+
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// Brave refused to run the guard script (JavaScript from Apple Events is off).
 static NO_JS: AtomicBool = AtomicBool::new(false);
@@ -37,9 +49,25 @@ static NO_JS: AtomicBool = AtomicBool::new(false);
 /// Set the rules; the first call starts the watcher thread.
 pub fn set_rules(rules: Rules) {
     *RULES.lock().unwrap() = Some(rules);
+    start();
+}
+
+/// Send YouTube video links opened in Brave to `tx` (their tabs are closed).
+pub fn set_youtube_handoff(tx: futures::channel::mpsc::UnboundedSender<String>) {
+    *HANDOFF.lock().unwrap() = Some(tx);
+    start();
+}
+
+fn start() {
     if !STARTED.swap(true, Ordering::SeqCst) {
         let _ = std::thread::Builder::new().name("brave-guard".into()).spawn(run);
     }
+}
+
+/// The player wants YouTube links right now.
+fn handoff() -> Option<futures::channel::mpsc::UnboundedSender<String>> {
+    let tx = HANDOFF.lock().unwrap().clone()?;
+    crate::plugins::setting(crate::plugins::MEDIA, "open_links").then_some(tx)
 }
 
 /// True (once per change) when Brave has JavaScript from Apple Events turned off.
@@ -58,9 +86,11 @@ fn run() {
         let (running, front) = brave_state();
         if running {
             let rules = RULES.lock().unwrap().clone().unwrap_or_default();
-            // Nothing to enforce (website blocker plugin off): don't touch Brave at all.
-            if rules.adult_filter || !rules.blocked.is_empty() || !rules.no_video.is_empty() {
-                tick(&rules);
+            let handoff = handoff();
+            // Nothing to enforce (website blocker plugin off, no YouTube hand-off): don't touch
+            // Brave at all.
+            if rules.enforces() || handoff.is_some() {
+                tick(&rules, handoff.as_ref());
             }
         }
         std::thread::sleep(Duration::from_millis(if front { 1000 } else { 3000 }));
@@ -91,8 +121,9 @@ fn brave_state() -> (bool, bool) {
     })
 }
 
-fn tick(rules: &Rules) {
-    let js = guard_js(&rules.no_video, rules.adult_filter);
+fn tick(rules: &Rules, handoff: Option<&futures::channel::mpsc::UnboundedSender<String>>) {
+    // Only the YouTube hand-off: no guard script in pages.
+    let js = if rules.enforces() { guard_js(&rules.no_video, rules.adult_filter) } else { String::new() };
     // One line per tab: window id, tab id, URL, guard result (active tabs only).
     let script = format!(
         r#"on run argv
@@ -108,7 +139,7 @@ fn tick(rules: &Rules) {
         set ti to ti + 1
         set u to URL of t
         set r to ""
-        if ti = act and u starts with "http" then
+        if js is not "" and ti = act and u starts with "http" then
           try
             set r to (execute t javascript js) as text
           on error
@@ -127,38 +158,74 @@ end run"#
         return;
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    let mut blank: Vec<String> = Vec::new();
+    // "b:<window>/<tab>" to blank, "c:<window>/<tab>" to close (handed to the player).
+    let mut act: Vec<String> = Vec::new();
     let mut no_js = false;
     for line in raw.lines() {
         let f: Vec<&str> = line.splitn(4, '\t').collect();
         let [w, t, url, res] = f[..] else { continue };
         no_js |= res == "nojs";
         let host = url_host(url);
-        if (res == "adult" && rules.adult_filter) || host.is_some_and(|h| is_blocked(&h, &rules.blocked)) {
-            blank.push(format!("{w}/{t}"));
+        let ytm = handoff.is_some() && host.as_deref() == Some(YTM_HOST);
+        if let Some((tx, (_, music))) = handoff.zip(crate::music::youtube_link(url)) {
+            if first_handoff(url) {
+                let _ = tx.unbounded_send(url.to_string());
+            }
+            // A YouTube Music tab stays open (back to where the song was picked).
+            act.push(format!("{}:{w}/{t}", if music && ytm { "m" } else { "c" }));
+            continue;
+        }
+        if (res == "adult" && rules.adult_filter) || (!ytm && host.is_some_and(|h| is_blocked(&h, &rules.blocked))) {
+            act.push(format!("b:{w}/{t}"));
         }
     }
-    NO_JS.store(no_js, Ordering::Relaxed);
-    if !blank.is_empty() {
+    NO_JS.store(no_js && !js.is_empty(), Ordering::Relaxed);
+    if !act.is_empty() {
         // Tab ids (~2e9) overflow AppleScript integers (`tab id N` fails): match them as text.
+        // Backwards, so closing a tab doesn't shift the ones still to visit.
         let script = format!(
             r#"on run argv
   tell application "{APP}"
     repeat with w in windows
       set wid to (id of w) as text
-      repeat with t in tabs of w
-        if argv contains (wid & "/" & ((id of t) as text)) then
-          try
+      repeat with i from (count of tabs of w) to 1 by -1
+        set t to tab i of w
+        set k to wid & "/" & ((id of t) as text)
+        try
+          if argv contains ("c:" & k) then
+            close t
+          else if argv contains ("m:" & k) then
+            try
+              execute t javascript "document.querySelectorAll('video,audio').forEach(v => v.pause()); history.back(); 'ok'"
+            on error
+              set URL of t to "https://{YTM_HOST}/"
+            end try
+          else if argv contains ("b:" & k) then
             set URL of t to "about:blank"
-          end try
-        end if
+          end if
+        end try
       end repeat
     end repeat
   end tell
 end run"#
         );
-        let _ = Command::new("/usr/bin/osascript").arg("-e").arg(&script).args(&blank).output();
+        let _ = Command::new("/usr/bin/osascript").arg("-e").arg(&script).args(&act).output();
     }
+}
+
+const YTM_HOST: &str = "music.youtube.com";
+
+/// False for a link already handed off in the last 15 s (its tab didn't close yet).
+fn first_handoff(url: &str) -> bool {
+    use std::time::Instant;
+    static RECENT: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+    let mut recent = RECENT.lock().unwrap();
+    recent.retain(|(_, at)| at.elapsed() < Duration::from_secs(15));
+    if recent.iter().any(|(u, _)| u == url) {
+        return false;
+    }
+    recent.push((url.to_string(), Instant::now()));
+    true
 }
 
 /// Lowercase host of an http(s) URL.

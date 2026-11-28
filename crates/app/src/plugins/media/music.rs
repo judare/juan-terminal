@@ -244,6 +244,18 @@ pub fn init(cx: &mut App) {
     });
     cx.set_global(MusicGlobal(music.clone()));
 
+    // YouTube links opened in Brave play here (their tabs are closed).
+    let (link_tx, mut link_rx) = futures::channel::mpsc::unbounded::<String>();
+    crate::brave_guard::set_youtube_handoff(link_tx);
+    cx.spawn(async move |cx| {
+        while let Some(url) = link_rx.next().await {
+            if cx.update(|cx| open_link(&url, cx)).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<Remote>();
     music_engine::install_remote_commands(tx.clone());
     // System-wide shortcuts (work from any app): ⌃⌥Space, ⌃⌥←/→, ⌃⌥⇧←/→.
@@ -1652,6 +1664,14 @@ fn ytm_channel_url(run: &Value) -> Option<String> {
 
 /// Length, views and channel of a video, from the player endpoint (one small request).
 fn video_details(id: &str) -> Option<(Option<f64>, Option<u64>, Option<String>)> {
+    let d = video_info(id)?;
+    let num = |k: &str| d.get(k).and_then(Value::as_str).and_then(|x| x.parse::<u64>().ok());
+    let channel = d.get("channelId").and_then(Value::as_str).map(|c| format!("https://www.youtube.com/channel/{c}"));
+    Some((num("lengthSeconds").map(|n| n as f64), num("viewCount"), channel))
+}
+
+/// `videoDetails` of the player endpoint.
+fn video_info(id: &str) -> Option<Value> {
     let body = serde_json::json!({
         "context": { "client": { "clientName": "WEB", "clientVersion": "2.20241126.01.00", "hl": "es" } },
         "videoId": id,
@@ -1665,11 +1685,74 @@ fn video_details(id: &str) -> Option<(Option<f64>, Option<u64>, Option<String>)>
         .body_mut()
         .read_to_string()
         .ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    let d = v.get("videoDetails")?;
-    let num = |k: &str| d.get(k).and_then(Value::as_str).and_then(|x| x.parse::<u64>().ok());
-    let channel = d.get("channelId").and_then(Value::as_str).map(|c| format!("https://www.youtube.com/channel/{c}"));
-    Some((num("lengthSeconds").map(|n| n as f64), num("viewCount"), channel))
+    let mut v: Value = serde_json::from_str(&text).ok()?;
+    Some(v.get_mut("videoDetails")?.take())
+}
+
+// ---- YouTube links ------------------------------------------------------------------------------
+
+/// Video id of a YouTube / YouTube Music link (watch, youtu.be, shorts, live, embed) and whether
+/// it is a YouTube Music one. Playlists without a video and channel pages give `None`.
+pub fn youtube_link(url: &str) -> Option<(String, bool)> {
+    let rest = url.trim().strip_prefix("https://").or_else(|| url.trim().strip_prefix("http://")).unwrap_or(url.trim());
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).unwrap_or(&host);
+    let path = path.split('#').next().unwrap_or("");
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let param = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('='))).map(str::to_string);
+    let id = match host {
+        "youtu.be" => path.split('/').next().map(str::to_string),
+        "youtube.com" | "music.youtube.com" | "youtube-nocookie.com" => match path.split('/').collect::<Vec<_>>()[..] {
+            ["watch", ..] | ["watch"] => param("v"),
+            ["shorts" | "live" | "embed" | "v", id, ..] => Some(id.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    let ok = id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then(|| (id, host == "music.youtube.com"))
+}
+
+/// Track for a linked video: title and channel from the player endpoint (a placeholder title
+/// when offline). YouTube Music links play as songs, the rest as videos.
+fn link_track(id: &str, music: bool) -> Track {
+    let d = video_info(id);
+    let s = |k: &str| d.as_ref().and_then(|d| d.get(k)).and_then(Value::as_str);
+    let num = |k: &str| s(k).and_then(|x| x.parse::<u64>().ok());
+    Track {
+        id: id.to_string(),
+        title: s("title").unwrap_or("Video de YouTube").to_string(),
+        channel: s("author").unwrap_or_default().trim_end_matches(" - Topic").to_string(),
+        channel_url: s("channelId").map(|c| format!("https://www.youtube.com/channel/{c}")),
+        duration: num("lengthSeconds").map(|n| n as f64),
+        views: num("viewCount"),
+        mode: if music { Mode::Music } else { Mode::Videos },
+        topic: None,
+        published: None,
+    }
+}
+
+/// Plays a YouTube / YouTube Music link in the player. False when it isn't a video link or the
+/// plugin is off (the caller opens it in the browser then).
+pub fn open_link(url: &str, cx: &mut App) -> bool {
+    if !crate::plugins::setting(crate::plugins::MEDIA, "open_links") {
+        return false;
+    }
+    let (Some((id, music)), Some(player)) = (youtube_link(url), global(cx)) else { return false };
+    cx.spawn(async move |cx| {
+        let track = cx.background_executor().spawn(async move { link_track(&id, music) }).await;
+        let _ = player.update(cx, |m, cx| m.play_queue(vec![track], 0, cx));
+    })
+    .detach();
+    true
+}
+
+/// `cx.open_url`, except that YouTube video links play in the player.
+pub fn open_url(url: &str, cx: &mut App) {
+    if !open_link(url, cx) {
+        cx.open_url(url);
+    }
 }
 
 /// Songs: "Artist, Artist • Album • 3:01" and "5,9 M reproducciones".
@@ -2261,6 +2344,20 @@ pub fn fmt_views(v: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_youtube_links() {
+        let id = |u: &str| super::youtube_link(u);
+        let v = |m: bool| Some(("dQw4w9WgXcQ".to_string(), m));
+        assert_eq!(id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s"), v(false));
+        assert_eq!(id("https://youtu.be/dQw4w9WgXcQ?si=abc"), v(false));
+        assert_eq!(id("https://m.youtube.com/shorts/dQw4w9WgXcQ"), v(false));
+        assert_eq!(id("youtube.com/live/dQw4w9WgXcQ"), v(false));
+        assert_eq!(id("https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDAMVM"), v(true));
+        assert_eq!(id("https://www.youtube.com/playlist?list=PL123"), None);
+        assert_eq!(id("https://www.youtube.com/@canal"), None);
+        assert_eq!(id("https://notyoutube.com/watch?v=dQw4w9WgXcQ"), None);
+    }
+
     #[test]
     fn parses_ytm_counts_clock_and_dates() {
         assert_eq!(parse_count("5,9\u{a0}M reproducciones"), Some(5_900_000));

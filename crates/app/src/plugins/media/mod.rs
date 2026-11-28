@@ -20,6 +20,9 @@ Busca y reproduce música, podcasts y videos de YouTube sin abrir el navegador (
 - Tarjeta \"sonando ahora\" al pie de la barra lateral y vista grande para videos.
 - **Ver después** guarda podcasts y videos y los descarga para verlos sin conexión.
 - Las canciones que suenan quedan en caché para repetirlas sin red.
+- Los links de YouTube y YouTube Music se reproducen aquí: los que abres en Fragua y los
+  que llegan a Brave (la pestaña se cierra). YouTube Music se puede navegar en Brave aunque
+  YouTube esté bloqueado: al dar play, la canción suena aquí.
 - Las descargas aparecen en el launcher (⌘Space): escribe `musica`, `podcast` o `video`.
 
 ## Descargas
@@ -33,6 +36,7 @@ pub fn manifest() -> Manifest {
         "icons/music.svg",
         "Busca y reproduce música, podcasts y videos de YouTube (yt-dlp), con descargas offline, tarjeta en la barra lateral y controles globales (⌃⌥Space, ⌃⌥←/→).",
         vec![
+            spec("open_links", "Abrir links de YouTube aquí", "Los links de YouTube y YouTube Music (desde Fragua o Brave) suenan en el reproductor"),
             spec("global_hotkey", "Atajo global ⌘⇧M", "Abre la búsqueda también desde otras apps"),
             spec("launcher_results", "Descargas en el launcher (⌘Space)", "Canciones, podcasts y videos descargados como resultados"),
             spec("autoplay", "Seguir reproduciendo al terminar", "Cuando se acaba la cola suena una sugerencia o algo del mismo artista / canal"),
