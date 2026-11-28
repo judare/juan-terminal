@@ -1544,7 +1544,7 @@ fn button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
         .text_size(px(12.5))
         .bg(theme::rgb(theme::SELECTED))
         .text_color(theme::rgb(theme::TEXT))
-        .hover(|s| s.bg(theme::rgb(0x2b4a7a)))
+        .hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP)))
         .child(label)
 }
 

@@ -11,6 +11,8 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/action-rerun.svg", include_bytes!("../assets/icons/action-rerun.svg")),
     ("icons/action-workflow.svg", include_bytes!("../assets/icons/action-workflow.svg")),
     ("icons/tag.svg", include_bytes!("../assets/icons/tag.svg")),
+    ("icons/fragua-mark-a.svg", include_bytes!("../assets/icons/fragua-mark-a.svg")),
+    ("icons/fragua-mark-b.svg", include_bytes!("../assets/icons/fragua-mark-b.svg")),
     ("icons/whatsapp.svg", include_bytes!("../assets/icons/whatsapp.svg")),
     ("icons/tail-in.svg", include_bytes!("../assets/icons/tail-in.svg")),
     ("icons/tail-out.svg", include_bytes!("../assets/icons/tail-out.svg")),
@@ -258,4 +260,12 @@ pub fn claude_logo(size: f32) -> gpui::Div {
         .items_center()
         .justify_center()
         .child(gpui::svg().path("icons/claude-spark.svg").size(px(size * 0.78)).text_color(crate::theme::rgb(0xfbf1ec)))
+}
+
+/// The Fragua logo mark: two interlocking corners in the logo's two reds. `a`/`b` are the
+/// (dark-theme) colors of the top-left and bottom-right pieces.
+pub fn fragua_mark(size: f32, a: u32, b: u32) -> gpui::Div {
+    use gpui::{div, px, ParentElement, Styled};
+    let piece = |path: &'static str, color: u32| gpui::svg().path(path).absolute().top_0().left_0().size(px(size)).text_color(crate::theme::rgb(color));
+    div().relative().flex_none().size(px(size)).child(piece("icons/fragua-mark-a.svg", a)).child(piece("icons/fragua-mark-b.svg", b))
 }

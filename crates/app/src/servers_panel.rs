@@ -221,8 +221,8 @@ impl ServersPanel {
                         .items_center()
                         .rounded(px(4.))
                         .cursor_pointer()
-                        .bg(theme::rgb(0x1e2a3d))
-                        .hover(|st| st.bg(theme::rgb(0x2b4a7a)))
+                        .bg(theme::rgb(theme::BRAND_TINT))
+                        .hover(|st| st.bg(theme::rgb(theme::BRAND_DEEP)))
                         .text_size(px(11.))
                         .font_family(theme::MONO_FONT)
                         .text_color(theme::rgb(theme::ACCENT))
@@ -927,8 +927,8 @@ impl ServersPanel {
                     .justify_center()
                     .rounded(px(5.))
                     .cursor_pointer()
-                    .bg(theme::rgb(0x1e2a3d))
-                    .hover(|s| s.bg(theme::rgb(0x2b4a7a)))
+                    .bg(theme::rgb(theme::BRAND_TINT))
+                    .hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP)))
                     .text_size(px(11.))
                     .text_color(theme::rgb(theme::ACCENT))
                     .tooltip(move |_, cx| cx.new(|_| Tooltip(tip)).into())
@@ -970,7 +970,7 @@ impl ServersPanel {
                                 this.totp.form = None;
                                 cx.notify();
                             })))
-                            .child(div().id("totp-save").px(px(12.)).h(px(24.)).flex().items_center().rounded(px(5.)).cursor_pointer().bg(theme::rgb(0x2b4a7a)).hover(|s| s.bg(theme::rgb(0x355a92))).text_size(px(12.)).child("Add").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_totp_form(cx)))),
+                            .child(div().id("totp-save").px(px(12.)).h(px(24.)).flex().items_center().rounded(px(5.)).cursor_pointer().bg(theme::rgb(theme::BRAND_DEEP)).hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP_HOVER))).text_size(px(12.)).child("Add").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_totp_form(cx)))),
                     ),
             );
         }
@@ -1135,7 +1135,7 @@ impl ServersPanel {
                                 cx.notify();
                             })),
                         )
-                        .child(div().id("srv-save").px(px(12.)).h(px(24.)).flex().items_center().rounded(px(5.)).cursor_pointer().bg(theme::rgb(0x2b4a7a)).hover(|s| s.bg(theme::rgb(0x355a92))).text_size(px(12.)).child("Save").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_form(cx)))),
+                        .child(div().id("srv-save").px(px(12.)).h(px(24.)).flex().items_center().rounded(px(5.)).cursor_pointer().bg(theme::rgb(theme::BRAND_DEEP)).hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP_HOVER))).text_size(px(12.)).child("Save").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_form(cx)))),
                 )
                 .into_any_element(),
         )
@@ -1357,8 +1357,8 @@ impl Render for ServersPanel {
                             .h(px(22.))
                             .rounded(px(4.))
                             .cursor_pointer()
-                            .bg(theme::rgb(0x1e2a3d))
-                            .hover(|st| st.bg(theme::rgb(0x2b4a7a)))
+                            .bg(theme::rgb(theme::BRAND_TINT))
+                            .hover(|st| st.bg(theme::rgb(theme::BRAND_DEEP)))
                             .text_size(px(11.))
                             .text_color(theme::rgb(theme::ACCENT))
                             .tooltip(|_, cx| cx.new(|_| Tooltip("Open an SSH terminal")).into())

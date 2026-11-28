@@ -247,7 +247,7 @@ impl Workspace {
         let since = a.since.map(|s| now.saturating_duration_since(s)).unwrap_or_default();
         let (dot, label, right) = match a.state {
             Some(ClaudeState::NeedsInput) => (0xe5c07b, "Te necesita".to_string(), short_duration(since)),
-            Some(ClaudeState::Working) => (0x7aa2f7, "Trabajando".to_string(), short_duration(a.turn_start.map(|t| now.saturating_duration_since(t)).unwrap_or(since))),
+            Some(ClaudeState::Working) => (theme::INFO, "Trabajando".to_string(), short_duration(a.turn_start.map(|t| now.saturating_duration_since(t)).unwrap_or(since))),
             Some(ClaudeState::Done) => (
                 0x98c379,
                 match a.last_turn {
@@ -305,7 +305,7 @@ impl Workspace {
             .when_some(detail, |d, t| d.child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.5)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_FAINT)).child(t)))
             .when_some(status, |d, st| {
                 let pct = st.ctx_pct.clamp(0., 100.);
-                let bar = if pct >= 85. { 0xe06c75 } else if pct >= 65. { 0xe5c07b } else { 0x7aa2f7 };
+                let bar = if pct >= 85. { 0xe06c75 } else if pct >= 65. { 0xe5c07b } else { theme::INFO };
                 d.child(
                     div()
                         .flex()

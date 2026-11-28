@@ -40,9 +40,9 @@ impl Palette {
                 rgb(0xf2f4f8), // bright white
             ],
             foreground: rgb(0xd7dae0),
-            background: rgb(0x141518),
-            cursor: rgb(0xd7dae0),
-            selection: rgb(0x2f3d55),
+            background: rgb(0x141416),
+            cursor: rgb(0xff5a5f),
+            selection: rgb(0x4a2a30),
         }
     }
 
@@ -69,8 +69,8 @@ impl Palette {
             ],
             foreground: rgb(0x24292f),
             background: rgb(0xfcfcfd),
-            cursor: rgb(0x24292f),
-            selection: rgb(0xc8daf6),
+            cursor: rgb(0xd81e28),
+            selection: rgb(0xf9d3d6),
         }
     }
 

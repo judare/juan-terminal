@@ -276,7 +276,7 @@ fn opt_toggle(id: &'static str, label: &'static str, on: bool, tip: &'static str
         .text_size(px(11.))
         .font_family(theme::MONO_FONT)
         .border_1()
-        .when(on, |d| d.bg(theme::rgb(0x2b4a7a)).border_color(theme::rgb(0x3d6bb0)).text_color(theme::rgb(theme::TEXT)))
+        .when(on, |d| d.bg(theme::rgb(theme::BRAND_DEEP)).border_color(theme::rgb(theme::BRAND_EDGE)).text_color(theme::rgb(theme::TEXT)))
         .when(!on, |d| d.border_color(gpui::transparent_black()).text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::SELECTED))))
         .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(tip)).into())
         .child(label)

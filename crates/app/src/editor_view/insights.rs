@@ -329,7 +329,7 @@ impl EditorView {
                         .text_size(font_size)
                         .text_color(theme::rgb(theme::TEXT))
                         .child(StyledText::new(SharedString::from(code)).with_highlights(hl));
-                    col = col.child(if first { el } else { el.p(px(6.)).rounded(px(4.)).bg(theme::rgb(0x1a1c20)) });
+                    col = col.child(if first { el } else { el.p(px(6.)).rounded(px(4.)).bg(theme::rgb(theme::CURRENT_LINE)) });
                 }
                 MdPiece::Text(t) => {
                     if !first {

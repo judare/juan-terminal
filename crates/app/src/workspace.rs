@@ -2673,7 +2673,7 @@ impl Workspace {
                 .cursor_pointer()
                 .text_size(px(12.5))
                 .text_color(theme::rgb(theme::TEXT))
-                .hover(|s| s.bg(theme::rgb(0x2b4a7a)))
+                .hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP)))
                 .child(if icon_path == "icons/claude.svg" {
                     crate::assets::claude_logo(14.).into_any_element()
                 } else {
@@ -2766,7 +2766,7 @@ impl Workspace {
                 .cursor_pointer()
                 .text_size(px(12.5))
                 .text_color(theme::rgb(theme::TEXT))
-                .hover(|s| s.bg(theme::rgb(0x2b4a7a)))
+                .hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP)))
                 .child(icon_el)
                 .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(label))
                 .when_some(detail, |d, t| d.child(div().flex_none().max_w(px(120.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(t)))
@@ -4051,6 +4051,7 @@ fn empty_state(title: &'static str, hint: &'static str) -> gpui::Div {
         .items_center()
         .justify_center()
         .bg(theme::rgb(theme::EDITOR_BG))
+        .child(div().mb(px(14.)).opacity(0.9).child(crate::assets::fragua_mark(44., theme::MARK_A, theme::MARK_B)))
         .child(div().text_size(px(13.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(title))
         .child(div().text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(hint))
 }
@@ -4094,7 +4095,7 @@ fn mode_tab(id: &'static str, icon_path: &'static str, label: &'static str, acti
         .text_size(px(14.))
         .when(active, |d| d.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT)))
         .when(!active, |d| d.text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::HOVER))))
-        .child(gpui::svg().path(icon_path).size(px(20.)).flex_none().text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })))
+        .child(gpui::svg().path(icon_path).size(px(20.)).flex_none().text_color(theme::rgb(if active { theme::ACCENT } else { theme::TEXT_MUTED })))
         .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip(label)).into())
 }
 
@@ -4162,8 +4163,9 @@ fn tab_chip_with(id: impl Into<gpui::ElementId>, lead: gpui::AnyElement, title: 
         .pl(px(10.))
         .pr(px(6.))
         .rounded_t(px(6.))
+        .relative()
         .cursor_pointer()
-        .when(active, |d| d.bg(theme::rgb(theme::EDITOR_BG)))
+        .when(active, |d| d.bg(theme::rgb(theme::EDITOR_BG)).child(div().absolute().top_0().left(px(8.)).right(px(8.)).h(px(2.)).rounded_b(px(2.)).bg(theme::rgb(theme::ACCENT))))
         .when(!active, |d| d.hover(|s| s.bg(theme::rgb(theme::HOVER))))
         .child(lead)
         .child(

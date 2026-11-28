@@ -256,7 +256,7 @@ pub fn render(p: &Preview, max_w: f32, max_h: f32) -> gpui::AnyElement {
                         .gap(px(10.))
                         .px(px(4.))
                         .rounded(px(3.))
-                        .when(on, |d| d.bg(theme::rgb(0x2f3d55)))
+                        .when(on, |d| d.bg(theme::rgb(theme::SELECTION)))
                         .child(div().w(px(30.)).flex_none().flex().justify_end().text_color(theme::rgb(if on { theme::TEXT } else { theme::GUTTER_TEXT })).child(n.to_string()))
                         .child(div().whitespace_nowrap().overflow_hidden().text_color(theme::rgb(theme::TEXT)).child(StyledText::new(SharedString::from(text.clone())).with_highlights(highlights))),
                 );

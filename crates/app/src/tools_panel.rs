@@ -535,7 +535,7 @@ fn tool_button(id: impl Into<gpui::ElementId>, label: &'static str, primary: boo
         .rounded(px(5.))
         .cursor_pointer()
         .text_size(px(11.5))
-        .when(primary, |d| d.bg(theme::rgb(0x2b4a7a)).text_color(theme::rgb(theme::TEXT)).hover(|s| s.bg(theme::rgb(0x355a92))))
+        .when(primary, |d| d.bg(theme::rgb(theme::BRAND_DEEP)).text_color(theme::rgb(theme::TEXT)).hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP_HOVER))))
         .when(!primary, |d| d.bg(theme::rgb(theme::HOVER)).text_color(theme::rgb(theme::TEXT_MUTED)).hover(|s| s.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT))))
         .child(label)
 }

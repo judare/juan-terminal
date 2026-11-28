@@ -426,9 +426,9 @@ impl Render for DiffView {
                             .items_center()
                             .rounded(px(5.))
                             .cursor_pointer()
-                            .bg(theme::rgb(0x2b4a7a))
+                            .bg(theme::rgb(theme::BRAND_DEEP))
                             .text_color(theme::rgb(theme::TEXT))
-                            .hover(|s| s.bg(theme::rgb(0x355a92)))
+                            .hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP_HOVER)))
                             .child("Accept  ⌘↵")
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(DiffViewEvent::Resolve(true)))),
                     )

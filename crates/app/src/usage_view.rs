@@ -21,7 +21,7 @@ static LAST_RANGE: AtomicU8 = AtomicU8::new(1);
 
 const RANGES: [(Range, &str); 4] = [(Range::Days7, "7 days"), (Range::Days30, "30 days"), (Range::Days90, "90 days"), (Range::All, "All")];
 
-const CARD_BG: u32 = 0x1a1b1f;
+const CARD_BG: u32 = theme::SIDEBAR_BG;
 const INPUT_BAR: u32 = 0x5c6168;
 const OUTPUT_BAR: u32 = 0x4c9bf5;
 const GREEN: u32 = 0x98c379;

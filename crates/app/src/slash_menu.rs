@@ -235,7 +235,7 @@ impl EditorView {
                             .rounded(px(5.))
                             .border_1()
                             .border_color(theme::rgb(0x33363d))
-                            .bg(theme::rgb(0x1a1b1f))
+                            .bg(theme::rgb(theme::SIDEBAR_BG))
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme::rgb(theme::TEXT_MUTED))

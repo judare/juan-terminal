@@ -52,20 +52,33 @@ pub const EDITOR_FONT_BONUS: f32 = 2.0;
 /// Terminals render 1px larger than the base font size.
 pub const TERM_FONT_BONUS: f32 = 1.0;
 
-pub const TERM_BG: u32 = 0x141518;
-pub const APP_BG: u32 = 0x141518;
-pub const SIDEBAR_BG: u32 = 0x1a1b1f;
-pub const TABBAR_BG: u32 = 0x1a1b1f;
-pub const BORDER: u32 = 0x26282d;
-pub const HOVER: u32 = 0x24262b;
-pub const SELECTED: u32 = 0x2a2d34;
+pub const TERM_BG: u32 = 0x141416;
+pub const APP_BG: u32 = 0x141416;
+pub const SIDEBAR_BG: u32 = 0x1a1a1d;
+pub const TABBAR_BG: u32 = 0x1a1a1d;
+pub const BORDER: u32 = 0x262629;
+pub const HOVER: u32 = 0x232326;
+pub const SELECTED: u32 = 0x2a2a2f;
 pub const TEXT: u32 = 0xd7dae0;
 pub const TEXT_MUTED: u32 = 0x8a8f98;
 pub const TEXT_FAINT: u32 = 0x5c6168;
-pub const ACCENT: u32 = 0x7aa2f7;
-pub const SELECTION: u32 = 0x2f3d55;
-pub const EDITOR_BG: u32 = 0x141518;
-pub const CURRENT_LINE: u32 = 0x1a1c20;
+/// Fragua coral, the light end of the logo's red gradient.
+pub const ACCENT: u32 = 0xff5a5f;
+/// Logo deep red: primary buttons and menu highlights.
+pub const BRAND_DEEP: u32 = 0x7a1219;
+pub const BRAND_DEEP_HOVER: u32 = 0x95161f;
+/// Logo red as an outline on deep-red controls.
+pub const BRAND_EDGE: u32 = 0xb3262f;
+/// Faint red wash behind "ours"/active chips.
+pub const BRAND_TINT: u32 = 0x2e1a1d;
+/// Muted logo pieces for the empty-state watermark (top-left / bottom-right corner).
+pub const MARK_A: u32 = 0x4a2428;
+pub const MARK_B: u32 = 0x5e1c22;
+/// Informational blue that used to be the accent (progress, links-as-data, folders).
+pub const INFO: u32 = 0x7aa2f7;
+pub const SELECTION: u32 = 0x4a2a30;
+pub const EDITOR_BG: u32 = 0x141416;
+pub const CURRENT_LINE: u32 = 0x1b1b1e;
 pub const GUTTER_TEXT: u32 = 0x4b5058;
 pub const GUTTER_TEXT_ACTIVE: u32 = 0xa9aeb6;
 pub const FIND_MATCH: u32 = 0x3d3a22;
@@ -127,13 +140,13 @@ pub fn map(hex: u32) -> u32 {
 fn light(hex: u32) -> u32 {
     match hex {
         // Surfaces.
-        0x141518 => 0xfcfcfd, // APP_BG / EDITOR_BG / TERM_BG
-        0x1a1b1f => 0xf3f4f6, // SIDEBAR_BG / TABBAR_BG
-        0x26282d => 0xe1e3e8, // BORDER
-        0x24262b => 0xe8eaee, // HOVER
-        0x2a2d34 => 0xdde2ea, // SELECTED
-        0x1a1c20 => 0xf1f3f6, // CURRENT_LINE
-        0x2f3d55 => 0xc8daf6, // SELECTION
+        0x141416 => 0xfcfcfd, // APP_BG / EDITOR_BG / TERM_BG
+        0x1a1a1d => 0xf3f4f6, // SIDEBAR_BG / TABBAR_BG
+        0x262629 => 0xe1e3e8, // BORDER
+        0x232326 => 0xe8eaee, // HOVER
+        0x2a2a2f => 0xe2e2e8, // SELECTED
+        0x1b1b1e => 0xf1f3f6, // CURRENT_LINE
+        0x4a2a30 => 0xf9d3d6, // SELECTION
         0x3d3a22 => 0xfbe9a6, // FIND_MATCH
         0x6b5d1c => 0xf3c33f, // FIND_MATCH_CURRENT
         // Text.
@@ -149,7 +162,8 @@ fn light(hex: u32) -> u32 {
         0xe8eaee => 0x16191d,
         0xffffff => 0x000000,
         // Accent / status (also syntax colors sharing the same hex).
-        0x7aa2f7 => 0x2f6fdf, // ACCENT
+        0xff5a5f => 0xd81e28, // ACCENT
+        0x7aa2f7 => 0x2f6fdf, // INFO
         0xe5c07b => 0x9a6700, // MODIFIED / type
         0x98c379 => 0x2f8a3c, // ADDED / string
         0xe06c75 => 0xcf2f3d, // DELETED / tag
@@ -179,9 +193,12 @@ fn light(hex: u32) -> u32 {
         0x39d353 => 0x216e39,
         0x1e2a3d => 0xe2ebfa, // info
         0x1f2a40 => 0xdde8fb,
-        0x2b4a7a => 0xc7daf7, // primary button / hover
-        0x355a92 => 0xb3cdf3,
-        0x3d6bb0 => 0x6d9be0,
+        0x7a1219 => 0xfbd5d7, // BRAND_DEEP: primary button / menu hover
+        0x95161f => 0xf7bfc3, // BRAND_DEEP_HOVER
+        0xb3262f => 0xe0646b, // BRAND_EDGE
+        0x2e1a1d => 0xfdeced, // BRAND_TINT
+        0x4a2428 => 0xf6c9cc, // MARK_A
+        0x5e1c22 => 0xefa9ae, // MARK_B
         0x1b2230 => 0xe7eef9, // diff hunk header
         0x1c2b20 => 0xe3f5e6, // diff added line
         0x2e1d20 => 0xfce6e8, // diff removed line

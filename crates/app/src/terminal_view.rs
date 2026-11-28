@@ -101,7 +101,7 @@ fn resets_in(ts: i64) -> String {
 
 fn usage_meter(id: &'static str, label: &'static str, w: (f32, i64)) -> gpui::Stateful<gpui::Div> {
     let (pct, reset) = (w.0.clamp(0., 100.), w.1);
-    let color = if pct >= 90. { 0xe06c75 } else if pct >= 70. { 0xe5c07b } else { 0x7aa2f7 };
+    let color = if pct >= 90. { 0xe06c75 } else if pct >= 70. { 0xe5c07b } else { theme::INFO };
     let tip = format!("{label}: {pct:.0}% used · resets in {}", resets_in(reset));
     div()
         .id(id)
@@ -411,7 +411,7 @@ impl TerminalView {
         let st = self.claude_status.clone().unwrap_or_default();
         let pct = st.ctx_pct.clamp(0., 100.);
         let steps = ((pct / 100. * 12.).round() as usize).min(12);
-        let ring_color = if pct >= 85. { 0xe06c75 } else if pct >= 60. { 0xe5c07b } else { 0x7aa2f7 };
+        let ring_color = if pct >= 85. { 0xe06c75 } else if pct >= 60. { 0xe5c07b } else { theme::INFO };
         let chip = |id: &'static str, label: String, active: bool| {
             div()
                 .id(id)
@@ -477,7 +477,7 @@ impl TerminalView {
                     .cursor_pointer()
                     .text_size(px(11.5))
                     .text_color(theme::rgb(if self.picking { theme::ACCENT } else { theme::TEXT_MUTED }))
-                    .when(self.picking, |d| d.bg(theme::rgb(0x1e2a3d)))
+                    .when(self.picking, |d| d.bg(theme::rgb(theme::BRAND_TINT)))
                     .hover(|s| s.bg(theme::rgb(theme::HOVER)).text_color(theme::rgb(theme::TEXT)))
                     .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip("Pick an element in Brave and send it to Claude")).into())
                     .child(gpui::svg().path("icons/inspect.svg").size(px(12.)).text_color(theme::rgb(if self.picking { theme::ACCENT } else { theme::TEXT_MUTED })))

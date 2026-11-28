@@ -1138,9 +1138,9 @@ impl Render for GitPanel {
                             .text_size(px(12.))
                             .when(staged_count > 0, |d| {
                                 d.cursor_pointer()
-                                    .bg(theme::rgb(0x2b4a7a))
+                                    .bg(theme::rgb(theme::BRAND_DEEP))
                                     .text_color(theme::rgb(theme::TEXT))
-                                    .hover(|s| s.bg(theme::rgb(0x355a92)))
+                                    .hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP_HOVER)))
                                     .child(gpui::svg().path("icons/check.svg").size(px(12.)).text_color(theme::rgb(theme::TEXT)))
                             })
                             .when(staged_count == 0, |d| d.bg(theme::rgb(theme::HOVER)).text_color(theme::rgb(theme::TEXT_FAINT)))
