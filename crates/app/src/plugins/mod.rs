@@ -14,12 +14,17 @@
 //!   blocked site: no impulse unblocking. Turning it on is immediate.
 
 //!
-//! Layout: one folder per built-in plugin, `plugins/<plugin>/mod.rs` with its `manifest()` and
-//! its code (`media/`, `whatsapp/`, `two_factor/`, `ssh/`, `ai_usage/`, `website_blocker/`);
-//! `panel.rs` is the Plugins view. The host (workspace, launcher, MCP server) asks
+//! Layout: one folder per built-in plugin, `plugins/<plugin>/mod.rs` with its `manifest()`, an
+//! `ABOUT` text for its page and its code (`media/`, `whatsapp/`, `google/`, `http/`,
+//! `clipboard/`, `two_factor/`, `ssh/`, `ai_usage/`, `website_blocker/`); `panel.rs` is the
+//! Plugins list in the sidebar and `detail.rs` the page each plugin opens in a tab. The host (workspace, launcher, MCP server) asks
 //! `plugins::enabled(id)` / `plugins::setting(id, key)` at each integration point.
 
 pub mod ai_usage;
+pub mod clipboard;
+pub mod detail;
+pub mod google;
+pub mod http;
 pub mod media;
 pub mod panel;
 pub mod ssh;
@@ -39,6 +44,9 @@ pub const TWO_FACTOR: &str = "2fa";
 pub const SSH: &str = "ssh";
 pub const AI_USAGE: &str = "ai-usage";
 pub const WEBSITE_BLOCKER: &str = "website-blocker";
+pub const CLIPBOARD: &str = "clipboard";
+pub const GOOGLE: &str = "google";
+pub const HTTP: &str = "http";
 
 /// Turning these off only takes effect after this long.
 const OFF_DELAY_SECS: i64 = 24 * 3600;
@@ -51,6 +59,28 @@ pub struct SettingSpec {
     pub help: String,
     #[serde(default = "yes")]
     pub default: bool,
+    /// A choice instead of an on/off switch: the values it can take (the first one is the
+    /// default unless `default_choice` says otherwise).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<Choice>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_choice: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Choice {
+    pub value: String,
+    pub label: String,
+}
+
+impl SettingSpec {
+    pub fn is_choice(&self) -> bool {
+        !self.choices.is_empty()
+    }
+
+    fn default_value(&self) -> String {
+        if self.choices.iter().any(|c| c.value == self.default_choice) { self.default_choice.clone() } else { self.choices.first().map(|c| c.value.clone()).unwrap_or_default() }
+    }
 }
 
 fn yes() -> bool {
@@ -108,7 +138,21 @@ pub struct Manifest {
 
 /// A boolean setting, on by default.
 pub(crate) fn spec(key: &str, label: &str, help: &str) -> SettingSpec {
-    SettingSpec { key: key.into(), label: label.into(), help: help.into(), default: true }
+    SettingSpec { key: key.into(), label: label.into(), help: help.into(), default: true, choices: Vec::new(), default_choice: String::new() }
+}
+
+/// A boolean setting, off by default.
+pub(crate) fn spec_off(key: &str, label: &str, help: &str) -> SettingSpec {
+    SettingSpec { default: false, ..spec(key, label, help) }
+}
+
+/// A choice setting: `choices` are (value, label); `default` is one of the values.
+pub(crate) fn choice(key: &str, label: &str, help: &str, choices: &[(&str, &str)], default: &str) -> SettingSpec {
+    SettingSpec {
+        choices: choices.iter().map(|(v, l)| Choice { value: v.to_string(), label: l.to_string() }).collect(),
+        default_choice: default.into(),
+        ..spec(key, label, help)
+    }
 }
 
 /// Manifest of a plugin that ships with the app (its version is the app's).
@@ -132,7 +176,17 @@ pub(crate) fn builtin(id: &str, name: &str, icon: &'static str, description: &st
 
 /// Built-in plugins, in the order the Plugins view lists them.
 pub fn builtins() -> Vec<Manifest> {
-    vec![media::manifest(), whatsapp::manifest(), two_factor::manifest(), ssh::manifest(), ai_usage::manifest(), website_blocker::manifest()]
+    vec![
+        media::manifest(),
+        whatsapp::manifest(),
+        google::manifest(),
+        http::manifest(),
+        clipboard::manifest(),
+        two_factor::manifest(),
+        ssh::manifest(),
+        ai_usage::manifest(),
+        website_blocker::manifest(),
+    ]
 }
 
 pub fn plugins_dir() -> PathBuf {
@@ -171,6 +225,39 @@ pub fn read_manifest(dir: &Path) -> Option<Manifest> {
     Some(m)
 }
 
+/// Long description of a built-in plugin for its page (Markdown).
+pub fn about(id: &str) -> &'static str {
+    match id {
+        MEDIA => media::ABOUT,
+        WHATSAPP => whatsapp::ABOUT,
+        TWO_FACTOR => two_factor::ABOUT,
+        SSH => ssh::ABOUT,
+        AI_USAGE => ai_usage::ABOUT,
+        WEBSITE_BLOCKER => website_blocker::ABOUT,
+        CLIPBOARD => clipboard::ABOUT,
+        GOOGLE => google::ABOUT,
+        HTTP => http::ABOUT,
+        _ => "",
+    }
+}
+
+/// The plugin's own settings view, shown under its switches on its page.
+pub fn config_view(id: &str, ws: gpui::WeakEntity<crate::workspace::Workspace>, window: &mut gpui::Window, cx: &mut gpui::App) -> Option<gpui::AnyView> {
+    use gpui::AppContext;
+    match id {
+        GOOGLE => Some(cx.new(|cx| google::config::GoogleConfig::new(window, cx)).into()),
+        HTTP => Some(cx.new(|cx| http::config::HttpConfig::new(ws, cx)).into()),
+        CLIPBOARD => Some(cx.new(clipboard::ClipboardConfig::new).into()),
+        MEDIA => Some(cx.new(media::MediaConfig::new).into()),
+        _ => None,
+    }
+}
+
+/// The plugin needs setting up before it does anything (its page opens on Configuración).
+pub fn needs_setup(id: &str) -> bool {
+    id == GOOGLE && !google::auth::connected()
+}
+
 /// Built-ins first, then external plugins.
 pub fn all() -> Vec<Manifest> {
     let mut v = builtins();
@@ -190,6 +277,9 @@ struct Stored {
     /// plugin id → setting key → value.
     #[serde(default)]
     settings: BTreeMap<String, BTreeMap<String, bool>>,
+    /// plugin id → choice setting key → chosen value.
+    #[serde(default)]
+    choices: BTreeMap<String, BTreeMap<String, String>>,
     /// "<id>" or "<id>.<key>" → Unix time it was switched off (delayed plugins only).
     #[serde(default)]
     off_since: BTreeMap<String, i64>,
@@ -253,7 +343,7 @@ pub fn wanted(id: &str) -> bool {
 }
 
 fn is_builtin(id: &str) -> bool {
-    [MEDIA, WHATSAPP, TWO_FACTOR, SSH, AI_USAGE, WEBSITE_BLOCKER].contains(&id)
+    [MEDIA, WHATSAPP, TWO_FACTOR, SSH, AI_USAGE, WEBSITE_BLOCKER, CLIPBOARD, GOOGLE, HTTP].contains(&id)
 }
 
 /// Whether the plugin is active right now.
@@ -286,6 +376,34 @@ pub fn setting(id: &str, key: &str) -> bool {
         Some(v) => effective(Some(v), v, &format!("{id}.{key}"), &s, is_delayed(id)),
         None => setting_default(id, key),
     }
+}
+
+fn setting_spec(id: &str, key: &str) -> Option<SettingSpec> {
+    let specs = if is_builtin(id) { builtins() } else { external() };
+    specs.into_iter().find(|m| m.id == id)?.settings.into_iter().find(|x| x.key == key)
+}
+
+/// Value of a choice setting (its default when unset or no longer offered).
+pub fn choice_value(id: &str, key: &str) -> String {
+    let spec = setting_spec(id, key);
+    let stored = stored().choices.get(id).and_then(|m| m.get(key)).cloned();
+    match (stored, spec) {
+        (Some(v), Some(sp)) if sp.choices.iter().any(|c| c.value == v) => v,
+        (_, Some(sp)) => sp.default_value(),
+        (Some(v), None) => v,
+        (None, None) => String::new(),
+    }
+}
+
+/// A numeric choice (e.g. days); `None` for non-numeric values like "never".
+pub fn choice_number(id: &str, key: &str) -> Option<u64> {
+    choice_value(id, key).parse().ok()
+}
+
+pub fn set_choice(id: &str, key: &str, value: &str) -> std::io::Result<()> {
+    let mut s = load();
+    s.choices.entry(id.to_string()).or_default().insert(key.to_string(), value.to_string());
+    save(&s)
 }
 
 /// When a delayed "off" switch takes effect (Unix time), if it's still pending.
@@ -346,7 +464,8 @@ pub fn plugin_env(m: &Manifest) -> Vec<(String, String)> {
     ];
     for s in &m.settings {
         let name: String = s.key.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
-        env.push((format!("FRAGUA_SETTING_{name}"), if setting(&m.id, &s.key) { "1".into() } else { "0".into() }));
+        let value = if s.is_choice() { choice_value(&m.id, &s.key) } else if setting(&m.id, &s.key) { "1".into() } else { "0".into() };
+        env.push((format!("FRAGUA_SETTING_{name}"), value));
     }
     env
 }
@@ -417,6 +536,7 @@ pub fn uninstall(m: &Manifest) -> anyhow::Result<()> {
     let mut s = load();
     s.enabled.remove(&m.id);
     s.settings.remove(&m.id);
+    s.choices.remove(&m.id);
     save(&s)?;
     Ok(())
 }

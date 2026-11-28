@@ -11,6 +11,19 @@ pub mod wa_reply;
 pub mod wa_ui;
 pub mod whatsapp_panel;
 
+pub const ABOUT: &str = r#"## Qué hace
+Tus chats de WhatsApp dentro de Fragua, sin abrir otra app.
+
+- Pestaña **WhatsApp** en la barra lateral con los chats y el número de no leídos.
+- Cada chat se abre como una pestaña: fotos, audios, videos, documentos y notas de voz.
+- **Pedir a Claude…** en un chat: Claude lee la conversación y te deja un borrador.
+- Claude también puede leer, buscar y preparar mensajes con las herramientas MCP
+  (`whatsapp_list_chats`, `whatsapp_read_chat`, `whatsapp_search`, `whatsapp_send`).
+  Los mensajes de Claude quedan en el compositor para que tú los envíes.
+
+## Conexión
+La primera vez escaneas un código QR desde WhatsApp › Dispositivos vinculados."#;
+
 use super::{Manifest, builtin, spec};
 
 pub fn manifest() -> Manifest {

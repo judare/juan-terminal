@@ -172,6 +172,9 @@ pub struct Music {
     /// Exact length (googlevideo's `dur=`, else search metadata). AVPlayer's own estimate
     /// for fragmented MP4 can be far off, so it's only a fallback.
     known_duration: Option<f64>,
+    /// `known_duration` is the stream's real length (`dur=` in the URL / `.dur` file), not
+    /// search metadata: AVPlayer can report longer (2× for some cached m4a), so it wins.
+    exact_duration: bool,
     pub video_on: bool,
     pub video_loading: bool,
     video_loaded: Option<String>,
@@ -196,6 +199,8 @@ pub struct Music {
     prefetching: HashSet<String>,
     /// The weekly "refresh preferences" Claude task, run by hand.
     pub renewing: bool,
+    /// Looking for something to play after the queue ran out.
+    autoplaying: bool,
     /// Podcasts / videos kept on disk (offline), newest first.
     library: Vec<LibraryEntry>,
     /// Ids whose local copy is complete.
@@ -229,6 +234,7 @@ pub fn init(cx: &mut App) {
     std::thread::spawn(prune_song_cache);
     let music = cx.new(|cx| {
         let mut m = Music::new();
+        m.prune_old_downloads();
         m.downloaded = m.library.iter().filter(|e| is_complete(&e.track)).map(|e| e.track.id.clone()).collect();
         m.refresh_disk_usage(cx);
         // Library thumbnails are on disk already: offline lists show them too.
@@ -323,6 +329,8 @@ impl Music {
             position: 0.,
             duration: 0.,
             known_duration: None,
+            exact_duration: false,
+            autoplaying: false,
             video_on: false,
             video_loading: false,
             video_loaded: None,
@@ -411,6 +419,7 @@ impl Music {
         self.position = 0.;
         self.duration = track.duration.unwrap_or(0.);
         self.known_duration = track.duration;
+        self.exact_duration = false;
         self.playing = true;
         self.resolving = true;
         self.buffering = false;
@@ -430,6 +439,7 @@ impl Music {
                 self.resolving = false;
                 if let Some(d) = dur {
                     self.known_duration = Some(d);
+                    self.exact_duration = true;
                     self.duration = d;
                 }
                 self.audio.load_file(&path);
@@ -451,8 +461,8 @@ impl Music {
         let id = track.id.clone();
         // Short songs are cached while they play (replays need no network); podcasts are
         // downloaded into the library, to resume offline.
-        let keep_song = track.mode == Mode::Music && track.duration.is_none_or(|d| d <= 15. * 60.);
-        let keep_podcast = track.mode == Mode::Podcast;
+        let keep_song = track.mode == Mode::Music && track.duration.is_none_or(|d| d <= 15. * 60.) && song_cache_days() > 0;
+        let keep_podcast = track.mode == Mode::Podcast && crate::plugins::setting(crate::plugins::MEDIA, "podcast_autodownload");
         self._resolve = Some(cx.spawn(async move |this, cx| {
             let url = match cached {
                 Some(u) => Ok(u),
@@ -474,6 +484,7 @@ impl Music {
                         m.urls.insert((id.clone(), false), (url.clone(), at));
                         if let Some(d) = url_duration(&url) {
                             m.known_duration = Some(d);
+                            m.exact_duration = true;
                             m.duration = d;
                         }
                         if keep_song {
@@ -615,6 +626,54 @@ impl Music {
         }
     }
 
+    /// The queue ran out: keep playing something related (plugin setting "autoplay"). The
+    /// suggestions for this kind of media first, else a search by the same artist / channel.
+    /// Returns false when there's nothing to play.
+    fn autoplay(&mut self, cx: &mut Context<Self>) -> bool {
+        if !crate::plugins::setting(crate::plugins::MEDIA, "autoplay") {
+            return false;
+        }
+        let Some(track) = self.current().cloned() else { return false };
+        let mut seen: HashSet<String> = self.queue.iter().map(|t| t.id.clone()).collect();
+        seen.extend(self.history.iter().take(100).map(|t| t.id.clone()));
+        seen.extend(self.ratings.iter().filter(|(_, g)| !**g).map(|(id, _)| id.clone()));
+        if track.mode != Mode::Music {
+            seen.extend(self.progress.iter().filter(|(_, p)| p.finished).map(|(id, _)| id.clone()));
+        }
+        let from_suggestions = self.suggestions.get(&track.mode).and_then(|(_, s)| s.tracks.iter().find(|t| !seen.contains(&t.id)).cloned());
+        if let Some(t) = from_suggestions {
+            self.queue.push(t);
+            self.next(cx);
+            return true;
+        }
+        let generation = self.generation;
+        self.autoplaying = true;
+        let (mode, query) = (track.mode, if track.channel.is_empty() { track.title.clone() } else { track.channel.clone() });
+        cx.spawn(async move |this, cx| {
+            let found = cx.background_executor().spawn(async move { search(mode, &query, true) }).await;
+            let _ = this.update(cx, |m, cx| {
+                m.autoplaying = false;
+                // Something else started meanwhile.
+                if m.generation != generation {
+                    return;
+                }
+                match found.ok().and_then(|v| v.into_iter().find(|t| !seen.contains(&t.id))) {
+                    Some(t) => {
+                        m.queue.push(t);
+                        m.next(cx);
+                    }
+                    None => {
+                        m.playing = false;
+                        m.sync_now_playing();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
     pub fn previous(&mut self, cx: &mut Context<Self>) {
         match self.index {
             Some(i) if i > 0 && self.audio.time() < 4. => {
@@ -753,7 +812,7 @@ impl Music {
             self._tick = None;
             return false;
         }
-        if self.resolving {
+        if self.resolving || self.autoplaying {
             return true;
         }
         let before = (self.position as i64, self.buffering, self.duration as i64);
@@ -769,16 +828,36 @@ impl Music {
             return true;
         }
         self.position = self.audio.time();
-        if let Some(d) = self.known_duration.or_else(|| self.audio.duration()) {
+        // The search metadata's length can be short (4:31 for a 4:38 stream): once the clock
+        // passes it, trust AVPlayer's length if it covers the position, else the position.
+        let player_d = self.audio.duration();
+        let exact = self.exact_duration.then_some(self.known_duration).flatten();
+        let (d, trusted) = match self.known_duration.or(player_d) {
+            Some(k) if exact.is_some() || self.position <= k + 1. => (k, true),
+            _ => match player_d.filter(|p| *p + 1. >= self.position) {
+                Some(p) => (p, true),
+                None => (self.position, false),
+            },
+        };
+        if d > 0. {
+            if trusted && self.known_duration.is_some_and(|k| k < d) {
+                self.known_duration = Some(d);
+            }
             self.duration = d;
         }
-        self.buffering = self.playing && self.audio.time_control() == 1;
-        // Ended: advance through the queue.
-        if self.playing && self.duration > 0. && self.position >= self.duration - 1. && self.audio.time_control() != 2 {
+        let tc = self.audio.time_control();
+        self.buffering = self.playing && tc == 1;
+        // Ended: advance through the queue (or into suggestions). With an untrusted length
+        // only a real stop counts (AVPlayer pauses at the end).
+        // An exact length ends the track even if AVPlayer keeps going (it believes a longer one).
+        let at_end = self.duration > 0.
+            && self.position >= self.duration - 1.
+            && if exact.is_some() { tc != 2 || self.position >= self.duration - 0.2 } else if trusted { tc != 2 } else { tc == 0 };
+        if self.playing && at_end {
             self.record_progress(true);
             if self.has_next() {
                 self.next(cx);
-            } else {
+            } else if !self.autoplay(cx) {
                 self.playing = false;
                 self.sync_now_playing();
                 cx.notify();
@@ -939,7 +1018,9 @@ impl Music {
             for (_, s) in self.suggestions.values_mut() {
                 s.tracks.retain(|t| t.id != track.id);
             }
-            self.forget_download(&track.id);
+            if crate::plugins::setting(crate::plugins::MEDIA, "delete_finished") {
+                self.forget_download(&track.id);
+            }
         }
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         self.progress.insert(track.id.clone(), Progress { track, pos, dur: self.duration, finished, at });
@@ -1021,7 +1102,7 @@ impl Music {
     pub fn toggle_later(&mut self, track: &Track, cx: &mut Context<Self>) {
         let later = !self.is_later(&track.id);
         self.add_to_library(track, Some(later));
-        if later {
+        if later && crate::plugins::setting(crate::plugins::MEDIA, "later_download") {
             self.start_download(track.clone(), true, None, cx);
         }
         cx.notify();
@@ -1090,6 +1171,17 @@ impl Music {
             self.save_library();
         }
         remove_cached_song(id);
+    }
+
+    /// Plugin setting "Borrar descargas después de N días": podcasts / videos downloaded that
+    /// long ago go (except "Ver después").
+    pub fn prune_old_downloads(&mut self) {
+        let Some(days) = crate::plugins::choice_number(crate::plugins::MEDIA, "download_days") else { return };
+        let limit = now_secs() - days as i64 * 86_400;
+        let old: Vec<String> = self.library.iter().filter(|e| !e.later && e.at < limit).map(|e| e.track.id.clone()).collect();
+        for id in old {
+            self.forget_download(&id);
+        }
     }
 
     fn save_library(&self) {
@@ -1297,7 +1389,7 @@ impl Music {
 
 // ---- yt-dlp -------------------------------------------------------------------------------------
 
-fn music_dir() -> PathBuf {
+pub(crate) fn music_dir() -> PathBuf {
     workspace_state::state_dir().join("music")
 }
 
@@ -1364,7 +1456,9 @@ async fn wait_until_valid(resolved: Instant, cx: &mut gpui::AsyncApp) {
 fn stream_url(id: &str, video: bool) -> Result<String, String> {
     let url = format!("https://www.youtube.com/watch?v={id}");
     // AVPlayer plays MP4/AAC/H.264 only. Low bitrates on purpose: starts sooner, less data.
-    let format = if video { "bestvideo[vcodec^=avc1][height<=480][ext=mp4]/18" } else { "140/139/bestaudio[ext=m4a]/18" };
+    let height = crate::plugins::choice_number(crate::plugins::MEDIA, "video_quality").unwrap_or(480);
+    let video_format = format!("bestvideo[vcodec^=avc1][height<={height}][ext=mp4]/18");
+    let format = if video { video_format.as_str() } else { "140/139/bestaudio[ext=m4a]/18" };
     let out = run_ytdlp(&["-f", format, "-g", &url])?;
     out.lines().map(str::trim).find(|l| l.starts_with("http")).map(str::to_string).ok_or_else(|| "sin URL de audio".to_string())
 }
@@ -1813,7 +1907,10 @@ pub fn preferences_updated() -> Option<String> {
 
 // ---- song cache (30 days) ------------------------------------------------------------------------
 
-const SONG_CACHE_DAYS: u64 = 30;
+/// Days a played song stays cached (plugin setting; 0 = no cache).
+fn song_cache_days() -> u64 {
+    crate::plugins::choice_number(crate::plugins::MEDIA, "song_cache_days").unwrap_or(30)
+}
 
 fn song_cache_dir() -> PathBuf {
     music_dir().join("cache")
@@ -2042,7 +2139,7 @@ fn run_download(track: &Track, url: Option<(String, Instant)>, progress: &Atomic
 fn prune_song_cache() {
     let Ok(entries) = std::fs::read_dir(song_cache_dir()) else { return };
     let keep: HashSet<String> = load_library().into_iter().map(|e| e.track.id).collect();
-    let max_age = Duration::from_secs(SONG_CACHE_DAYS * 86_400);
+    let max_age = Duration::from_secs(song_cache_days() * 86_400);
     for e in entries.flatten() {
         let path = e.path();
         let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("");

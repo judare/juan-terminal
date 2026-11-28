@@ -31,6 +31,8 @@ pub fn commands() -> Vec<Command> {
     v.retain(|c| match &c.run {
         Run::Action(a) if a.partial_eq(&w::ShowUsage) => plugins::enabled(plugins::AI_USAGE),
         Run::Action(a) if a.partial_eq(&w::ToggleMusic) => plugins::enabled(plugins::MEDIA),
+        Run::Action(a) if a.partial_eq(&w::OpenClipboardHistory) => plugins::enabled(plugins::CLIPBOARD),
+        Run::Action(a) if a.partial_eq(&w::OpenAgenda) => plugins::enabled(plugins::GOOGLE),
         _ => true,
     });
     for m in plugins::external().into_iter().filter(|m| plugins::enabled(&m.id)) {
@@ -89,6 +91,9 @@ fn builtin_commands() -> Vec<Command> {
         c("View: Reset Font Size", "⌘0", Box::new(w::ResetFontSize)),
         c("View: Música, podcasts y videos", "⌘⇧M", Box::new(w::ToggleMusic)),
         c("App: Plugins (activar, configurar, instalar)", "", Box::new(w::ShowPlugins)),
+        c("HTTP: Cliente HTTP (colecciones de Postman)", "", Box::new(w::OpenHttpClient)),
+        c("Portapapeles: Historial", "⌃⌘V", Box::new(w::OpenClipboardHistory)),
+        c("Google: Agenda y correo", "", Box::new(w::OpenAgenda)),
         c("App: Settings (schedules, blocked websites)", "⌘,", Box::new(w::OpenSettings)),
         c("Project: Keep Project Open 1 More Hour (emergency)", "", Box::new(w::ExtendProjectHours)),
         c("App: Quit", "⌘Q", Box::new(w::Quit)),

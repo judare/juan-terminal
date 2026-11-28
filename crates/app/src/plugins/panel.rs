@@ -1,7 +1,8 @@
-//! Sidebar "Plugins" view: every plugin with an on/off switch, its settings, and for external
-//! plugins update / folder / remove, plus "install from git".
+//! Sidebar "Plugins" view: every plugin as a compact row with an on/off switch, plus "install
+//! from git". A click opens the plugin's page (`detail.rs`): description, settings, update /
+//! remove.
 
-use gpui::{ClickEvent, Context, Entity, EventEmitter, Focusable, PromptLevel, Render, SharedString, Subscription, Window, div, prelude::*, px};
+use gpui::{ClickEvent, Context, Entity, EventEmitter, Focusable, Render, SharedString, Subscription, Window, div, prelude::*, px};
 
 use super::Manifest;
 use crate::git_panel::{Tooltip, icon_action};
@@ -11,8 +12,8 @@ use crate::theme;
 pub enum PluginsPanelEvent {
     /// A plugin was switched on/off, reconfigured, installed, updated or removed.
     Changed,
-    /// Open settings.toml (website blocker lists and schedules).
-    OpenSettings,
+    /// Open the plugin's page (details and settings) in a tab.
+    Open(String),
 }
 
 struct InstallForm {
@@ -57,16 +58,6 @@ impl PluginsPanel {
             self.message = Some(("Se desactiva en 24 h (sin desbloqueos por impulso). Vuelve a activarlo para cancelar.".into(), false));
         }
         let res = super::set_enabled(&id, on);
-        self.changed(res, cx);
-    }
-
-    fn toggle_setting(&mut self, id: String, key: String, cx: &mut Context<Self>) {
-        let on = !super::setting_wanted(&id, &key);
-        self.message = None;
-        if !on && super::manifest(&id).is_some_and(|m| m.delayed_off) {
-            self.message = Some(("Este cambio se aplica en 24 h. Vuelve a activarlo para cancelar.".into(), false));
-        }
-        let res = super::set_setting(&id, &key, on);
         self.changed(res, cx);
     }
 
@@ -120,163 +111,75 @@ impl PluginsPanel {
         self.run("Instalando…", cx, move || super::install_from_git(&url).map(|m| format!("Instalado: {} {}", m.name, m.version)));
     }
 
-    fn update(&mut self, m: Manifest, cx: &mut Context<Self>) {
-        self.run("Actualizando…", cx, move || {
-            let summary = super::update(&m)?;
-            let now = m.dir.as_deref().and_then(super::read_manifest).map(|n| n.version).unwrap_or_default();
-            Ok(match (summary.is_empty(), now == m.version) {
-                (_, false) => format!("{} actualizado a {now}", m.name),
-                (true, true) => format!("{} ya está al día", m.name),
-                (false, true) => format!("{}: {summary}", m.name),
-            })
-        });
-    }
-
-    fn confirm_uninstall(&mut self, m: Manifest, window: &mut Window, cx: &mut Context<Self>) {
-        let answer = window.prompt(PromptLevel::Warning, &format!("¿Quitar el plugin “{}”?", m.name), Some("Su carpeta va a la Papelera."), &["Quitar", "Cancelar"], cx);
-        cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            let _ = this.update(cx, |this, cx| {
-                let name = m.name.clone();
-                this.run("Quitando…", cx, move || super::uninstall(&m).map(|_| format!("{name} quitado")));
-            });
-        })
-        .detach();
-    }
-
+    /// Compact row (icon, name, one-line description, switch); a click opens its page.
     fn render_plugin(&self, m: &Manifest, cx: &mut Context<Self>) -> gpui::AnyElement {
         let id = m.id.clone();
         let wanted = super::wanted(&id);
         let active = super::enabled(&id);
         let pending = super::pending_off(&id, None);
-        let version = if m.builtin { format!("v{} · incluido", m.version) } else if m.version.is_empty() { m.author.clone() } else if m.author.is_empty() { format!("v{}", m.version) } else { format!("v{} · {}", m.version, m.author) };
-        let mut card = div()
+        let sub = match pending {
+            Some(t) => format!("Se desactiva {}", when(t)),
+            None => m.description.clone(),
+        };
+        div()
+            .id(SharedString::from(format!("plg-row-{id}")))
             .flex()
-            .flex_col()
-            .gap(px(6.))
-            .mx(px(8.))
-            .mb(px(6.))
-            .p(px(10.))
-            .rounded(px(8.))
-            .bg(theme::rgb(theme::HOVER))
-            .border_1()
-            .border_color(theme::rgb(theme::BORDER))
+            .items_center()
+            .gap(px(10.))
+            .mx(px(6.))
+            .px(px(8.))
+            .py(px(7.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+            .child(
+                div()
+                    .size(px(30.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.))
+                    .bg(theme::rgb(if active { theme::BRAND_TINT } else { theme::HOVER }))
+                    .child(gpui::svg().path(m.icon).size(px(16.)).text_color(theme::rgb(if active { theme::ACCENT } else { theme::TEXT_FAINT }))),
+            )
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(gpui::svg().path(m.icon).size(px(16.)).flex_none().text_color(theme::rgb(if active { theme::ACCENT } else { theme::TEXT_FAINT })))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.5)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })).child(m.name.clone()))
-                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(version)),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("plg-on-{id}")))
-                            .cursor_pointer()
-                            .child(switch(wanted))
-                            .tooltip(move |_, cx| cx.new(|_| Tooltip(if wanted { "Desactivar" } else { "Activar" })).into())
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _: &ClickEvent, _, cx| this.toggle(id.clone(), cx)
-                            })),
-                    ),
-            );
-        if !m.description.is_empty() {
-            card = card.child(div().text_size(px(11.)).line_height(px(15.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(m.description.clone()));
-        }
-        if let Some(t) = pending {
-            card = card.child(note(format!("Se desactiva {}", when(t))));
-        }
-        if wanted {
-            for s in &m.settings {
-                let on = super::setting_wanted(&id, &s.key);
-                let pending = super::pending_off(&id, Some(&s.key));
-                let (i2, k2) = (id.clone(), s.key.clone());
-                card = card.child(
-                    div()
-                        .id(SharedString::from(format!("plg-set-{id}-{}", s.key)))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .pl(px(24.))
-                        .py(px(2.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|st| st.bg(theme::rgb(theme::SELECTED)))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .child(div().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT)).child(s.label.clone()))
-                                .when(!s.help.is_empty(), |d| d.child(div().text_size(px(10.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(s.help.clone())))
-                                .when_some(pending, |d, t| d.child(div().text_size(px(10.)).text_color(theme::rgb(theme::MODIFIED)).child(format!("Se apaga {}", when(t))))),
-                        )
-                        .child(switch(on))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_setting(i2.clone(), k2.clone(), cx))),
-                );
-            }
-        }
-        if wanted && !m.commands.is_empty() {
-            let names: Vec<String> = m.commands.iter().map(|c| c.title.clone()).collect();
-            card = card.child(div().pl(px(24.)).text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("Comandos (⌘⇧P): {}", names.join(", "))));
-        }
-        if m.mcp.is_some() && wanted {
-            card = card.child(div().pl(px(24.)).text_size(px(10.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Servidor MCP para las sesiones nuevas de Claude"));
-        }
-        let mut actions = div().flex().items_center().gap(px(2.)).pl(px(18.));
-        let mut any_action = false;
-        if m.id == super::WEBSITE_BLOCKER {
-            any_action = true;
-            actions = actions.child(
-                icon_action("plg-blocker-lists", "icons/edit.svg", "Editar listas y horarios (settings.toml)")
-                    .child("Listas")
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PluginsPanelEvent::OpenSettings))),
-            );
-        }
-        if !m.builtin {
-            any_action = true;
-            let (m1, m2) = (m.clone(), m.clone());
-            let dir = m.dir.clone();
-            actions = actions
-                .child(icon_action(SharedString::from(format!("plg-up-{id}")), "icons/pull.svg", "Actualizar (git pull)").child("Actualizar").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.update(m1.clone(), cx))))
-                .child(icon_action(SharedString::from(format!("plg-dir-{id}")), "icons/finder.svg", "Abrir carpeta").on_click(move |_, _, _| {
-                    if let Some(d) = &dir {
-                        let _ = std::process::Command::new("/usr/bin/open").arg(d).spawn();
-                    }
-                }))
-                .child(icon_action(SharedString::from(format!("plg-rm-{id}")), "icons/trash.svg", "Quitar").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| this.confirm_uninstall(m2.clone(), w, cx))));
-        }
-        if any_action {
-            card = card.child(actions);
-        }
-        card.into_any_element()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.5)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED })).child(m.name.clone()))
+                    .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(10.5)).text_color(theme::rgb(if pending.is_some() { theme::MODIFIED } else { theme::TEXT_FAINT })).child(sub)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("plg-on-{id}")))
+                    .cursor_pointer()
+                    .child(switch(wanted))
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip(if wanted { "Desactivar" } else { "Activar" })).into())
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle(id.clone(), cx)
+                        }
+                    })),
+            )
+            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.emit(PluginsPanelEvent::Open(id.clone()))))
+            .into_any_element()
     }
 }
 
 /// "en ~N h" / "en ~N min" until Unix time `t`.
-fn when(t: i64) -> String {
+pub(crate) fn when(t: i64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let left = (t - now).max(0);
     if left >= 3600 { format!("en ~{} h", (left + 3599) / 3600) } else { format!("en ~{} min", (left + 59) / 60) }
 }
 
-fn note(text: String) -> gpui::Div {
-    div().text_size(px(10.5)).text_color(theme::rgb(theme::MODIFIED)).child(text)
-}
-
 /// iOS-style on/off switch.
-fn switch(on: bool) -> gpui::Div {
+pub(crate) fn switch(on: bool) -> gpui::Div {
     div()
         .flex_none()
         .w(px(26.))

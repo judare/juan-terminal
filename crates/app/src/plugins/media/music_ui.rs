@@ -1279,42 +1279,35 @@ impl Render for MusicCard {
                                     .gap(px(4.))
                                     .child(plain_button("card-prev", "icons/skip-prev.svg", 13.).tooltip(tip("Anterior (⌃⌥⇧←)")).on_click(on(|m, cx| m.previous(cx))))
                                     .child(plain_button("card-play", play_icon, 17.).tooltip(tip("Reproducir / pausa (⌃⌥Space)")).on_click(on(|m, cx| m.toggle(cx))))
-                                    .child(plain_button("card-next", "icons/skip-next.svg", 13.).when(!m.has_next(), |d| d.opacity(0.4)).tooltip(tip("Siguiente (⌃⌥⇧→)")).on_click(on(|m, cx| m.next(cx)))),
+                                    .child(plain_button("card-next", "icons/skip-next.svg", 13.).when(!m.has_next(), |d| d.opacity(0.4)).tooltip(tip("Siguiente (⌃⌥⇧→)")).on_click(on(|m, cx| m.next(cx))))
+                                    .child(div().flex_1())
+                                    // Rate / search / close: on the controls row, so they never
+                                    // cover the title.
+                                    .children([true, false].map(|good| {
+                                        let rating = m.rating(&track.id);
+                                        let (path, label) = rate_icon(good, rating);
+                                        let music = music.clone();
+                                        let t = track.clone();
+                                        div()
+                                            .id(if good { "music-card-up" } else { "music-card-down" })
+                                            .flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .justify_center()
+                                            .size(px(22.))
+                                            .rounded(px(11.))
+                                            .cursor_pointer()
+                                            .hover(|s| s.glass_hover())
+                                            .child(icon(path, 12., if rating == Some(good) { theme::ACCENT } else { theme::TEXT_MUTED }))
+                                            .tooltip(tip(label))
+                                            .on_click(move |_: &ClickEvent, _, cx| music.update(cx, |m, cx| m.rate(&t, good, cx)))
+                                    }))
+                                    .child(round_button("music-card-search", "icons/search.svg", 22., 12.).flex_none().tooltip(tip("Buscar (⌘⇧M)")).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(MusicCardEvent::OpenSearch))))
+                                    .child(round_button("music-card-close", "icons/close.svg", 22., 12.).flex_none().tooltip(tip("Cerrar reproductor")).on_click(on(|m, cx| m.stop(cx)))),
                             ),
                     ),
             )
             .child(seek_bar(&music, m, "music-card-progress"))
-            // Rate / search / close: top-right, shown on hover.
-            .child(
-                div()
-                    .absolute()
-                    .top(px(6.))
-                    .right(px(6.))
-                    .flex()
-                    .items_center()
-                    .invisible()
-                    .group_hover("music-card", |s| s.visible())
-                    .children([true, false].map(|good| {
-                        let rating = m.rating(&track.id);
-                        let (path, label) = rate_icon(good, rating);
-                        let music = music.clone();
-                        let t = track.clone();
-                        div()
-                            .id(if good { "music-card-up" } else { "music-card-down" })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(22.))
-                            .rounded(px(11.))
-                            .cursor_pointer()
-                            .hover(|s| s.glass_hover())
-                            .child(icon(path, 12., if rating == Some(good) { theme::ACCENT } else { theme::TEXT }))
-                            .tooltip(tip(label))
-                            .on_click(move |_: &ClickEvent, _, cx| music.update(cx, |m, cx| m.rate(&t, good, cx)))
-                    }))
-                    .child(round_button("music-card-search", "icons/search.svg", 22., 12.).tooltip(tip("Buscar (⌘⇧M)")).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(MusicCardEvent::OpenSearch))))
-                    .child(round_button("music-card-close", "icons/close.svg", 22., 12.).tooltip(tip("Cerrar reproductor")).on_click(on(|m, cx| m.stop(cx)))),
-            )
             .into_any_element()
     }
 }

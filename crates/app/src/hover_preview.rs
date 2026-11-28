@@ -21,7 +21,7 @@ pub enum Preview {
 
 const CODE_LINES: usize = 20;
 
-fn human_size(n: u64) -> String {
+pub(crate) fn human_size(n: u64) -> String {
     match n {
         0..=1023 => format!("{n} B"),
         1024..=1_048_575 => format!("{:.1} KB", n as f64 / 1024.),

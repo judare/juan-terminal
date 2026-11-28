@@ -103,6 +103,9 @@ actions!(
         ShowUsage,
         ToggleMusic,
         ShowPlugins,
+        OpenHttpClient,
+        OpenClipboardHistory,
+        OpenAgenda,
     ]
 );
 
@@ -217,7 +220,6 @@ enum SidebarMode {
     Search,
     Git,
     Tools,
-    Ports,
     Servers,
     WhatsApp,
     Claude,
@@ -268,6 +270,8 @@ pub struct Workspace {
     pub(crate) claude_sessions: usize,
     /// Chat picked in the WhatsApp panel, opened on the next render (needs the window).
     pending_chat: Option<(String, String)>,
+    /// Postman files picked from a plugin page, imported on the next render (needs the window).
+    pending_import: Vec<PathBuf>,
     /// "Pedir a Claude…" on a chat, prepared and waiting for the window to open its terminal.
     pending_ask: Option<crate::wa_reply::AskPlan>,
     _ask_task: Option<Task<()>>,
@@ -405,6 +409,7 @@ impl Workspace {
             claude_pending: None,
             claude_sessions: 0,
             pending_chat: None,
+            pending_import: Vec::new(),
             pending_ask: None,
             _ask_task: None,
             next_terminal_id: 1,
@@ -1257,6 +1262,7 @@ impl Workspace {
         };
         sp.update(cx, |p, cx| p.set_servers(servers, cx));
         self.sync_dev(cx);
+        self.sync_ports(cx);
         cx.notify();
     }
 
@@ -1288,20 +1294,45 @@ impl Workspace {
         use crate::plugins::panel::{PluginsPanel, PluginsPanelEvent};
         let panel = cx.new(PluginsPanel::new);
         let sub = cx.subscribe_in(&panel, window, |this, _, e: &PluginsPanelEvent, window, cx| match e {
-            PluginsPanelEvent::Changed => {
-                this.plugins_changed(true, window, cx);
-                let me = window.window_handle();
-                for w in workspace_windows(cx) {
-                    if AnyWindowHandle::from(w) != me {
-                        let _ = w.update(cx, |ws, window, cx| ws.plugins_changed(false, window, cx));
-                    }
-                }
-            }
-            PluginsPanelEvent::OpenSettings => this.open_settings(&OpenSettings, window, cx),
+            PluginsPanelEvent::Changed => this.plugins_changed_everywhere(window, cx),
+            PluginsPanelEvent::Open(id) => this.open_plugin_page(id, window, cx),
         });
         self._subscriptions.push(sub);
         self.plugins_panel = Some(panel.clone());
         panel
+    }
+
+    /// A plugin changed here: apply it app-wide once and bring every window in line.
+    pub(crate) fn plugins_changed_everywhere(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.plugins_changed(true, window, cx);
+        let me = window.window_handle();
+        for w in workspace_windows(cx) {
+            if AnyWindowHandle::from(w) != me {
+                let _ = w.update(cx, |ws, window, cx| ws.plugins_changed(false, window, cx));
+            }
+        }
+    }
+
+    /// Re-read the plugins list (after a page installed / updated / removed one).
+    pub(crate) fn reload_plugins_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(pp) = self.plugins_panel.clone() {
+            pp.update(cx, |p, cx| p.reload(cx));
+        }
+    }
+
+    /// The plugin's page (details + settings), like an extension page in VS Code.
+    pub(crate) fn open_plugin_page(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = crate::plugins::manifest(id) else { return };
+        let ws = cx.weak_entity();
+        let key = format!("plugin:{id}");
+        let k = key.clone();
+        self.open_page_in_slot(&k, Some("plugin:"), window, cx, move |window, cx| {
+            let icon = m.icon;
+            let title: SharedString = m.name.clone().into();
+            let view = cx.new(|cx| crate::plugins::detail::PluginPage::new(m, ws, window, cx));
+            let focus = view.read(cx).focus.clone();
+            crate::editor_view::Page { key, title, icon, color: theme::ACCENT, view: view.into(), focus: Some(focus) }
+        });
     }
 
     fn show_plugins_action(&mut self, _: &ShowPlugins, _: &mut Window, cx: &mut Context<Self>) {
@@ -1349,6 +1380,14 @@ impl Workspace {
             } else {
                 crate::wa_bridge::refresh_dock();
             }
+            if plugins::enabled(plugins::CLIPBOARD) {
+                crate::plugins::clipboard::history::init(cx);
+                crate::launcher::ensure_clipboard_hotkey(cx);
+                if let Some(h) = crate::plugins::clipboard::history::global(cx) {
+                    h.update(cx, |h, cx| h.apply_settings(cx));
+                }
+            }
+            crate::plugins::google::init_if_enabled(cx);
         }
         // Media: card / theater / search follow the switch.
         if media && self.music_card.is_none() {
@@ -1436,6 +1475,139 @@ impl Workspace {
         self._subscriptions.push(obs);
         self.whatsapp_panel = Some(panel.clone());
         panel
+    }
+
+    /// Open (or focus) a plugin page as an editor tab; `build` makes it the first time.
+    pub(crate) fn open_page(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<Self>) -> crate::editor_view::Page,
+    ) -> Entity<EditorView> {
+        self.open_page_in_slot(key, None, window, cx, build)
+    }
+
+    /// Like `open_page`, but a tab whose key starts with `slot` (and isn't `key`) is replaced
+    /// in place instead of adding another tab: one shared tab for a family of pages.
+    pub(crate) fn open_page_in_slot(
+        &mut self,
+        key: &str,
+        slot: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<Self>) -> crate::editor_view::Page,
+    ) -> Entity<EditorView> {
+        self.diff_active = false;
+        let k = self.active_key();
+        let existing = self.editors.get(&k).and_then(|t| t.tabs.iter().position(|e| e.read(cx).page_key() == Some(key)));
+        let reuse = match (existing, slot) {
+            (None, Some(prefix)) => self
+                .editors
+                .get(&k)
+                .and_then(|t| t.tabs.iter().position(|e| e.read(cx).page_key().is_some_and(|pk| pk.starts_with(prefix)))),
+            _ => None,
+        };
+        if let Some(ix) = reuse {
+            let page = build(window, cx);
+            let font_size = self.font_size;
+            let view = cx.new(|cx| EditorView::new_page(page, font_size, cx));
+            self.subscribe_editor(&view, window, cx);
+            let tabs = self.editors.entry(k).or_default();
+            tabs.tabs[ix] = view.clone();
+            tabs.active = ix;
+            window.focus(&view.focus_handle(cx));
+            cx.notify();
+            return view;
+        }
+        let view = match existing {
+            Some(ix) => {
+                let tabs = self.editors.entry(k).or_default();
+                tabs.active = ix;
+                tabs.tabs[ix].clone()
+            }
+            None => {
+                let page = build(window, cx);
+                let font_size = self.font_size;
+                let view = cx.new(|cx| EditorView::new_page(page, font_size, cx));
+                self.subscribe_editor(&view, window, cx);
+                let tabs = self.editors.entry(k).or_default();
+                tabs.tabs.push(view.clone());
+                tabs.active = tabs.tabs.len() - 1;
+                view
+            }
+        };
+        window.focus(&view.focus_handle(cx));
+        cx.notify();
+        view
+    }
+
+    pub(crate) fn queue_import(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.pending_import.extend(paths);
+        cx.notify();
+    }
+
+    /// HTTP client tab (turns the plugin on when it's off: it was asked for explicitly).
+    pub(crate) fn open_http(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<crate::plugins::http::page::HttpPage>> {
+        use crate::plugins::{self, HTTP};
+        if !plugins::enabled(HTTP) {
+            let _ = plugins::set_enabled(HTTP, true);
+            self.plugins_changed_everywhere(window, cx);
+        }
+        let ws = cx.weak_entity();
+        let view = self.open_page("http", window, cx, move |window, cx| {
+            let view = cx.new(|cx| crate::plugins::http::page::HttpPage::new(ws, window, cx));
+            let focus = view.read(cx).focus.clone();
+            crate::editor_view::Page { key: "http".into(), title: "HTTP".into(), icon: "icons/send.svg", color: crate::plugins::http::page::method_color("GET"), view: view.into(), focus: Some(focus) }
+        });
+        view.read(cx).page.as_ref().and_then(|p| p.view.clone().downcast::<crate::plugins::http::page::HttpPage>().ok())
+    }
+
+    /// Import Postman collections / environments, switch the HTTP plugin on and show them.
+    pub(crate) fn import_postman(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        use crate::plugins::http::store::{self, Kind};
+        let mut imported = Vec::new();
+        let mut problems = Vec::new();
+        for p in paths {
+            match store::import(p) {
+                Ok(r) => imported.push(r),
+                Err(e) => problems.push(format!("{e:#}")),
+            }
+        }
+        if !imported.is_empty() {
+            if let Some(page) = self.open_http(window, cx) {
+                page.update(cx, |pg, cx| {
+                    pg.reload(cx);
+                    for (kind, file, _) in &imported {
+                        match kind {
+                            Kind::Environment => pg.set_active_env_by_file(file, cx),
+                            Kind::Collection => pg.reveal_collection(file, window, cx),
+                        }
+                    }
+                });
+            }
+        }
+        self.error = (!problems.is_empty()).then(|| problems.join(" · ").into());
+        cx.notify();
+    }
+
+    /// Clipboard history tab.
+    pub(crate) fn open_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_page("clipboard", window, cx, |window, cx| {
+            let view = cx.new(|cx| crate::plugins::clipboard::page::ClipboardPage::new(window, cx));
+            let focus = view.read(cx).focus_handle(cx);
+            crate::editor_view::Page { key: "clipboard".into(), title: "Portapapeles".into(), icon: "icons/clipboard.svg", color: theme::INFO, view: view.into(), focus: Some(focus) }
+        });
+    }
+
+    /// Google agenda + unread mail tab.
+    pub(crate) fn open_agenda(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ws = cx.weak_entity();
+        self.open_page("agenda", window, cx, move |_, cx| {
+            let view = cx.new(|cx| crate::plugins::google::page::AgendaPage::new(ws, cx));
+            let focus = view.read(cx).focus.clone();
+            crate::editor_view::Page { key: "agenda".into(), title: "Agenda y correo".into(), icon: "icons/calendar.svg", color: 0x4285f4, view: view.into(), focus: Some(focus) }
+        });
     }
 
     /// Open (or focus) a WhatsApp conversation as an editor tab.
@@ -1547,16 +1719,28 @@ impl Workspace {
         .detach();
     }
 
-    fn show_ports(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_visible = true;
-        self.sidebar_mode = SidebarMode::Ports;
+    /// Ports section at the end of the Servers panel: listeners of this project and others.
+    fn sync_ports(&mut self, cx: &mut Context<Self>) {
+        let Some(sp) = self.servers_panel.clone() else { return };
         let roots = self.port_roots();
-        let pp = self.ports_panel.get_or_insert_with(|| cx.new(crate::ports::PortsPanel::new)).clone();
+        let pp = self
+            .ports_panel
+            .get_or_insert_with(|| {
+                cx.new(|cx| {
+                    let mut p = crate::ports::PortsPanel::new(cx);
+                    p.embedded = true;
+                    p
+                })
+            })
+            .clone();
         pp.update(cx, |p, cx| {
             p.set_roots(roots, cx);
             p.refresh(cx);
         });
-        cx.notify();
+        sp.update(cx, |s, cx| {
+            s.ports = Some(pp);
+            cx.notify();
+        });
     }
 
     /// Project folders (repos + root) used to tag which listeners belong to this project.
@@ -2054,6 +2238,15 @@ impl Workspace {
     /// Open files dropped on the window or handed over by Finder/Dock ("Open With").
     /// Folders and files that can't be opened are reported instead of silently ignored.
     pub fn open_dropped(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        // Postman exports go to the HTTP client (and switch it on).
+        let (postman, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths.iter().cloned().partition(|p| p.is_file() && crate::plugins::http::store::is_postman_file(p));
+        if !postman.is_empty() {
+            self.import_postman(&postman, window, cx);
+            if paths.is_empty() {
+                return;
+            }
+        }
+        let paths = paths.as_slice();
         let (files, skipped): (Vec<&PathBuf>, Vec<&PathBuf>) = paths.iter().partition(|p| p.is_file());
         let mut problems: Vec<String> = Vec::new();
         let dirs = skipped.iter().filter(|p| p.is_dir()).count();
@@ -2289,6 +2482,7 @@ impl Workspace {
             let servers = self.active_project().map(|p| p.servers.clone()).unwrap_or_default();
             sp.update(cx, |p, cx| p.set_servers(servers, cx));
             self.sync_dev(cx);
+            self.sync_ports(cx);
         }
         self.persist(cx);
         if let Some((pid, action)) = self.pending_launch.take() {
@@ -2544,7 +2738,7 @@ impl Workspace {
         }
     }
 
-    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         match workspace_state::ensure_settings_file() {
             Ok(path) => {
                 self.open_file(&path, true, window, cx);
@@ -3820,7 +4014,6 @@ impl Workspace {
         let git_total = self.git_panel.as_ref().map(|g| g.read(cx).total_changes()).unwrap_or(0);
         let problems = self.tools_panel.as_ref().map(|t| t.read(cx).total_problems()).unwrap_or(0);
         let tools_panel = (self.sidebar_mode == SidebarMode::Tools).then(|| self.tools_panel.clone()).flatten();
-        let ports_panel = (self.sidebar_mode == SidebarMode::Ports).then(|| self.ports_panel.clone()).flatten();
         let servers_panel = (self.sidebar_mode == SidebarMode::Servers).then(|| self.servers_panel.clone()).flatten();
         let whatsapp_panel = (self.sidebar_mode == SidebarMode::WhatsApp).then(|| self.whatsapp_panel.clone()).flatten();
         let plugins_panel = (self.sidebar_mode == SidebarMode::Plugins).then(|| self.ensure_plugins_panel(window, cx));
@@ -3833,7 +4026,7 @@ impl Workspace {
         let claude_board = (self.sidebar_mode == SidebarMode::Claude).then(|| self.render_claude_board(window, cx));
         // The ports list polls only while it's on screen.
         if let Some(pp) = self.ports_panel.clone() {
-            let on = self.sidebar_mode == SidebarMode::Ports && self.sidebar_visible;
+            let on = self.sidebar_mode == SidebarMode::Servers && self.sidebar_visible;
             if pp.read(cx).active != on {
                 pp.update(cx, |p, _| p.active = on);
             }
@@ -3950,15 +4143,20 @@ impl Workspace {
                                     .on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.toggle_usage(&ShowUsage, w, cx))),
                             ))
                             .child(
-                                icon_button("plugins", "icons/plugin.svg")
-                                    .when(self.sidebar_mode == SidebarMode::Plugins, |d| d.bg(theme::rgb(theme::SELECTED)))
-                                    .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Plugins")).into())
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        if this.sidebar_mode == SidebarMode::Plugins {
+                                icon_button("tools", "icons/gear.svg")
+                                    .relative()
+                                    .when(self.sidebar_mode == SidebarMode::Tools, |d| d.bg(theme::rgb(theme::SELECTED)))
+                                    .when(problems > 0, |d| d.child(div().absolute().top(px(2.)).right(px(2.)).size(px(6.)).rounded_full().bg(theme::rgb(theme::DELETED))))
+                                    .tooltip(move |_, cx| {
+                                        let label: SharedString = if problems > 0 { format!("Tools · {problems} problemas").into() } else { "Tools".into() };
+                                        cx.new(|_| crate::git_panel::DynTooltip(label)).into()
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                                        if this.sidebar_mode == SidebarMode::Tools {
                                             this.sidebar_mode = SidebarMode::Files;
                                             cx.notify();
                                         } else {
-                                            this.show_plugins(cx);
+                                            this.show_tools(w, cx);
                                         }
                                     })),
                             )
@@ -3995,15 +4193,12 @@ impl Workspace {
                         this.sidebar_mode = SidebarMode::Claude;
                         cx.notify();
                     })))
-                    .child(mode_tab("mode-tools", "icons/gear.svg", "Tools", self.sidebar_mode == SidebarMode::Tools).when(problems > 0, |d| d.child(
-                        mode_badge(problems, 0x8c2f39, 0xffffff),
-                    )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_tools(w, cx))))
+                    .child(mode_tab("mode-plugins", "icons/plugin.svg", "Plugins", self.sidebar_mode == SidebarMode::Plugins).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_plugins(cx))))
                     .child(mode_tab("mode-git", "icons/git.svg", "Git", self.sidebar_mode == SidebarMode::Git).when(git_total > 0, |d| d.child(
                         mode_badge(git_total, 0x2f5fb3, 0xffffff),
                     )).on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
                         this.show_git(w, cx);
                     })))
-                    .child(mode_tab("mode-ports", "icons/ports.svg", "Ports", self.sidebar_mode == SidebarMode::Ports).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_ports(cx))))
                     .child(mode_tab("mode-servers", "icons/server.svg", "Servers", self.sidebar_mode == SidebarMode::Servers).on_click(cx.listener(|this, _: &ClickEvent, w, cx| this.show_servers(w, cx))))
                     .when(wa_on, |d| d.child(mode_tab("mode-whatsapp", "icons/whatsapp.svg", "WhatsApp", self.sidebar_mode == SidebarMode::WhatsApp).when(wa_unread > 0, |d| d.child(
                         mode_badge(wa_unread, 0x1f9d55, 0xffffff),
@@ -4012,7 +4207,6 @@ impl Workspace {
             .when_some(search_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when_some(git_panel, |d, gp| d.child(div().flex_1().min_h_0().child(gp)))
             .when_some(tools_panel, |d, tp| d.child(div().flex_1().min_h_0().child(tp)))
-            .when_some(ports_panel, |d, pp| d.child(div().flex_1().min_h_0().child(pp)))
             .when_some(servers_panel, |d, sp| d.child(div().flex_1().min_h_0().child(sp)))
             .when_some(whatsapp_panel, |d, wp| d.child(div().flex_1().min_h_0().child(wp)))
             .when_some(plugins_panel, |d, pp| d.child(div().flex_1().min_h_0().child(pp)))
@@ -4031,6 +4225,7 @@ impl Workspace {
                 .w_full()
                 .pb(px(8.)),
             ))
+            .children(crate::plugins::google::sidebar_card(cx))
             .children(music_card)
             .when(bottom_panels, |d| {
                 d.child(
@@ -4161,7 +4356,10 @@ impl Workspace {
             let e = tab.read(cx);
             let (title, dirty, preview) = (e.title(), e.is_dirty(), e.preview);
             let (errors, warnings) = e.problem_counts();
-            let (icon_path, icon_color) = crate::assets::file_icon(&title);
+            let (icon_path, icon_color) = match &e.page {
+                Some(p) => (p.icon, p.color),
+                None => crate::assets::file_icon(&title),
+            };
             let full_path: Option<SharedString> = e.path().map(|p| p.display().to_string().into());
             let chat = e.chat_badge(cx);
             let tab_ref = tab.clone();
@@ -4233,7 +4431,14 @@ impl Workspace {
         let content: AnyElement = match (self.diff.as_ref().filter(|_| self.diff_active), self.active_editor()) {
             (Some(d), _) => d.clone().into_any_element(),
             (None, Some(e)) => e.clone().into_any_element(),
-            (None, None) => empty_state("No file open", "Pick a file in the sidebar  ·  ⌘P to search files").into_any_element(),
+            (None, None) => empty_state("No file open", "Pick a file in the sidebar  ·  ⌘P to search files  ·  double-click for a new file")
+                .id("editor-empty")
+                .on_click(cx.listener(|this, e: &ClickEvent, w, cx| {
+                    if e.click_count() == 2 {
+                        this.new_untitled(w, cx);
+                    }
+                }))
+                .into_any_element(),
         };
         div()
             .id("editor-area")
@@ -4478,6 +4683,10 @@ impl Render for Workspace {
         if let Some((jid, name)) = self.pending_chat.take() {
             self.open_chat(&jid, &name, window, cx);
         }
+        if !self.pending_import.is_empty() {
+            let paths = std::mem::take(&mut self.pending_import);
+            self.import_postman(&paths, window, cx);
+        }
         if let Some(plan) = self.pending_ask.take() {
             self.open_claude_ask(plan, window, cx);
         }
@@ -4534,6 +4743,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_usage))
             .on_action(cx.listener(Self::toggle_music))
             .on_action(cx.listener(Self::show_plugins_action))
+            .on_action(cx.listener(|this, _: &OpenHttpClient, w, cx| {
+                this.open_http(w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenClipboardHistory, w, cx| this.open_clipboard(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenAgenda, w, cx| this.open_agenda(w, cx)))
             .on_action(cx.listener(Self::close_diff))
             .on_action(cx.listener(|this, _: &ShowGit, w, cx| this.show_git(w, cx)))
             .on_action(cx.listener(|this, _: &ShowTools, w, cx| this.show_tools(w, cx)))

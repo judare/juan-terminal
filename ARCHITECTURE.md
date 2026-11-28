@@ -25,9 +25,10 @@ the `app` crate composes them. No IPC or serialization between in-process module
 
 ## Plugins
 
-Optional features (music/videos, WhatsApp, 2FA, SSH servers, AI usage metrics, website blocker)
-are plugins under `crates/app/src/plugins/<plugin>/`, switched on/off and configured from the
-Plugins view; external plugins live in `<state>/plugins/<plugin>/plugin.json`. See
+Optional features (music/videos, WhatsApp, Google Calendar + Gmail, HTTP client, clipboard
+history, 2FA, SSH servers, AI usage metrics, website blocker) are plugins under
+`crates/app/src/plugins/<plugin>/`, switched on/off from the Plugins view and configured on
+each plugin's page (an editor tab); external plugins live in `<state>/plugins/<plugin>/plugin.json`. See
 [docs/PLUGINS.md](docs/PLUGINS.md).
 
 ## Data flow: terminal

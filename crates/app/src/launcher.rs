@@ -296,7 +296,29 @@ pub enum Pick {
     Copy(String),
     /// Play a downloaded song / podcast / video.
     Media(crate::music::Track),
+    /// Clipboard history entry: copy it and paste it into the app in front.
+    Paste(String),
+    /// A plugin tab in the last used window.
+    Page(PageKind),
     Project(String, ProjectAction),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PageKind {
+    Http,
+    Agenda,
+    Clipboard,
+}
+
+/// A result from a plugin (clipboard, Google, HTTP).
+#[derive(Clone)]
+struct Extra {
+    title: String,
+    subtitle: String,
+    icon: &'static str,
+    color: u32,
+    badge: &'static str,
+    pick: Pick,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -438,6 +460,8 @@ enum Item {
     Project(usize, Vec<usize>),
     File(usize, Vec<usize>),
     Cmd(usize),
+    /// Plugin result (index into `extras`).
+    Extra(usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -472,6 +496,13 @@ pub struct Launcher {
     calc: Option<crate::calc::Answer>,
     /// The calc card has the selection (Enter copies); ↓ moves into the list.
     calc_selected: bool,
+    /// Clipboard history (snapshot when the launcher opened).
+    clips: Vec<crate::plugins::clipboard::history::Clip>,
+    /// Today's / tomorrow's events and unread mail (snapshot).
+    events: Vec<crate::plugins::google::sync::Event>,
+    mails: Vec<crate::plugins::google::sync::Mail>,
+    /// Plugin results of the current query.
+    extras: Vec<Extra>,
 }
 
 impl EventEmitter<LauncherEvent> for Launcher {}
@@ -591,6 +622,10 @@ impl Launcher {
                 .unwrap_or_default(),
             calc: None,
             calc_selected: false,
+            clips: crate::plugins::clipboard::history::global(cx).filter(|_| crate::plugins::enabled(crate::plugins::CLIPBOARD)).map(|h| h.read(cx).entries.clone()).unwrap_or_default(),
+            events: crate::plugins::google::sync::global(cx).filter(|_| crate::plugins::setting(crate::plugins::GOOGLE, "launcher_results")).map(|g| g.read(cx).events.clone()).unwrap_or_default(),
+            mails: crate::plugins::google::sync::global(cx).filter(|_| crate::plugins::setting(crate::plugins::GOOGLE, "launcher_results")).map(|g| g.read(cx).mails.clone()).unwrap_or_default(),
+            extras: Vec::new(),
         };
         this.update_items(cx);
         this
@@ -646,6 +681,14 @@ impl Launcher {
             let first_l = first.to_lowercase();
             let keyword = (!empty && ALL_KEYWORDS.iter().any(|k| k.keywords().contains(&first_l.as_str()))).then_some(first_l.clone());
 
+            self.extras.clear();
+            let plugin = self.plugin_results(&first_l, rest);
+            if let Some((title, v)) = plugin {
+                section(&mut items, title, v);
+            } else {
+            // Next meeting (empty query) / pinned snippets and events matching the query.
+            let ambient = self.ambient_results(&query);
+            section(&mut items, if empty { "Agenda".into() } else { "Portapapeles y agenda".into() }, ambient);
             let cmds: Vec<usize> = if empty {
                 Vec::new()
             } else if let Some(kw) = &keyword {
@@ -738,6 +781,7 @@ impl Launcher {
                 };
                 section(&mut items, title, files.into_iter().map(|(i, p)| Item::File(i, p)).collect());
             }
+            }
         }
         self.calc = if self.scope.is_none() { crate::calc::answer(&query) } else { None };
         self.calc_selected = self.calc.is_some();
@@ -751,6 +795,106 @@ impl Launcher {
         cx.notify();
     }
 
+    fn push_extra(&mut self, x: Extra) -> Item {
+        self.extras.push(x);
+        Item::Extra(self.extras.len() - 1)
+    }
+
+    fn clip_extra(c: &crate::plugins::clipboard::history::Clip) -> Extra {
+        let first: String = c.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(90).collect();
+        let lines = c.text.lines().count();
+        let mut sub = crate::plugins::clipboard::history::ago(c.at);
+        if !c.app.is_empty() {
+            sub = format!("{sub} · {}", c.app);
+        }
+        if lines > 1 {
+            sub = format!("{sub} · {lines} líneas");
+        }
+        Extra { title: first, subtitle: sub, icon: if c.pinned { "icons/bookmark-fill.svg" } else { "icons/clipboard.svg" }, color: if c.pinned { theme::ACCENT } else { theme::INFO }, badge: if c.pinned { "Fijado" } else { "Pegar" }, pick: Pick::Paste(c.text.clone()) }
+    }
+
+    fn event_extra(e: &crate::plugins::google::sync::Event, join: bool) -> Extra {
+        use crate::plugins::google::sync;
+        let time = if e.all_day { "todo el día".to_string() } else { format!("{} · {}", sync::fmt_time(e.start), sync::fmt_until(e.start, e.end)) };
+        match (&e.meeting, join) {
+            (Some(url), true) => Extra { title: format!("Unirse: {}", e.title), subtitle: time, icon: "icons/video-camera.svg", color: 0x34a853, badge: "Reunión", pick: Pick::Open(url.clone()) },
+            _ => Extra { title: e.title.clone(), subtitle: time, icon: "icons/calendar.svg", color: e.color, badge: "Evento", pick: Pick::Open(if e.link.is_empty() { "https://calendar.google.com".into() } else { e.link.clone() }) },
+        }
+    }
+
+    /// Results for a plugin keyword: `clip …`, `meet`, `agenda`, `mail …`, `http`.
+    fn plugin_results(&mut self, first: &str, rest: &str) -> Option<(String, Vec<Item>)> {
+        use crate::plugins::google::sync;
+        let now = sync::now();
+        match first {
+            "clip" | "cb" | "portapapeles" | "pegar" | "paste" if crate::plugins::enabled(crate::plugins::CLIPBOARD) => {
+                let mut v: Vec<(i64, crate::plugins::clipboard::history::Clip)> = self
+                    .clips
+                    .iter()
+                    .filter_map(|c| {
+                        if rest.is_empty() {
+                            return Some((0, c.clone()));
+                        }
+                        let hay: String = c.text.chars().take(400).collect();
+                        let s = fuzzy_match(rest, &hay).map(|x| x.0).or_else(|| hay.to_lowercase().contains(&rest.to_lowercase()).then_some(0))?;
+                        Some((s, c.clone()))
+                    })
+                    .collect();
+                // Pinned first, then by score (newest first when there's no query).
+                v.sort_by(|a, b| b.1.pinned.cmp(&a.1.pinned).then(b.0.cmp(&a.0)));
+                let mut items: Vec<Item> = v.into_iter().take(60).map(|(_, c)| self.push_extra(Self::clip_extra(&c))).collect();
+                items.push(self.push_extra(Extra { title: "Ver todo el historial".into(), subtitle: String::new(), icon: "icons/history.svg", color: theme::TEXT_MUTED, badge: "Portapapeles", pick: Pick::Page(PageKind::Clipboard) }));
+                Some(("Portapapeles · Enter pega".into(), items))
+            }
+            "meet" | "reunion" | "reunión" | "llamada" | "zoom" if crate::plugins::enabled(crate::plugins::GOOGLE) => {
+                let events: Vec<_> = self.events.iter().filter(|e| e.meeting.is_some() && e.end > now && !e.all_day).cloned().collect();
+                let mut items: Vec<Item> = events.iter().take(8).map(|e| self.push_extra(Self::event_extra(e, true))).collect();
+                if items.is_empty() {
+                    items.push(self.push_extra(Extra { title: "No hay reuniones con link hoy ni mañana".into(), subtitle: String::new(), icon: "icons/calendar.svg", color: theme::TEXT_FAINT, badge: "Agenda", pick: Pick::Page(PageKind::Agenda) }));
+                }
+                Some(("Reuniones".into(), items))
+            }
+            "agenda" | "cal" | "calendar" | "calendario" | "hoy" if crate::plugins::enabled(crate::plugins::GOOGLE) => {
+                let events: Vec<_> = self.events.iter().filter(|e| e.end > now && (rest.is_empty() || fuzzy_match(rest, &e.title).is_some())).cloned().collect();
+                let mut items: Vec<Item> = events.iter().take(20).map(|e| self.push_extra(Self::event_extra(e, false))).collect();
+                items.push(self.push_extra(Extra { title: "Abrir Agenda y correo".into(), subtitle: String::new(), icon: "icons/calendar.svg", color: 0x4285f4, badge: "Google", pick: Pick::Page(PageKind::Agenda) }));
+                Some(("Agenda".into(), items))
+            }
+            "mail" | "correo" | "gmail" | "inbox" if crate::plugins::enabled(crate::plugins::GOOGLE) => {
+                let mails: Vec<_> = self.mails.iter().filter(|m| rest.is_empty() || fuzzy_match(rest, &format!("{} {}", m.from, m.subject)).is_some()).cloned().collect();
+                let mut items: Vec<Item> = mails
+                    .iter()
+                    .map(|m| self.push_extra(Extra { title: format!("{} — {}", m.from, m.subject), subtitle: m.snippet.clone(), icon: "icons/mail.svg", color: 0xea4335, badge: "Gmail", pick: Pick::Open(sync::mail_url(&m.thread)) }))
+                    .collect();
+                items.push(self.push_extra(Extra { title: "Abrir Gmail".into(), subtitle: String::new(), icon: "icons/external.svg", color: theme::TEXT_MUTED, badge: "Gmail", pick: Pick::Open(sync::mail_url("")) }));
+                Some((format!("Sin leer · {}", self.mails.len()), items))
+            }
+            "http" | "api" | "postman" | "rest" => {
+                let item = self.push_extra(Extra { title: "Abrir cliente HTTP".into(), subtitle: "Colecciones y entornos de Postman".into(), icon: "icons/send.svg", color: theme::ADDED, badge: "HTTP", pick: Pick::Page(PageKind::Http) });
+                Some(("HTTP".into(), vec![item]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Without a keyword: the meeting now / within 15 min (empty query), or pinned snippets
+    /// and today's events matching the query.
+    fn ambient_results(&mut self, query: &str) -> Vec<Item> {
+        let now = crate::plugins::google::sync::now();
+        if query.is_empty() {
+            let next = self.events.iter().filter(|e| !e.all_day && e.end > now && e.start - now < 15 * 60).min_by_key(|e| e.start).cloned();
+            return next.map(|e| vec![self.push_extra(Self::event_extra(&e, true))]).unwrap_or_default();
+        }
+        if query.chars().count() < 3 {
+            return Vec::new();
+        }
+        let pinned: Vec<_> = self.clips.iter().filter(|c| c.pinned && fuzzy_match(query, &c.text.chars().take(200).collect::<String>()).is_some()).take(3).cloned().collect();
+        let events: Vec<_> = self.events.iter().filter(|e| e.end > now && fuzzy_match(query, &e.title).is_some_and(|(s, _)| s > 0)).take(3).cloned().collect();
+        let mut v: Vec<Item> = pinned.iter().map(|c| self.push_extra(Self::clip_extra(c))).collect();
+        v.extend(events.iter().map(|e| self.push_extra(Self::event_extra(e, e.meeting.is_some()))));
+        v
+    }
+
     /// Identity of a row across rebuilds (only while the query is unchanged).
     fn item_key(&self, item: &Item) -> String {
         match item {
@@ -760,6 +904,7 @@ impl Launcher {
             Item::App(i, _) => format!("a{i}"),
             Item::Project(i, _) => format!("p{i}"),
             Item::File(i, _) => format!("f{i}"),
+            Item::Extra(i) => format!("x{}{}", self.extras[*i].badge, self.extras[*i].title),
             Item::Cmd(i) => {
                 let c = &self.cmds[*i];
                 format!("c{}-{:?}-{}-{}", c.project, c.repo, c.repo_level, c.title)
@@ -805,6 +950,7 @@ impl Launcher {
             Item::App(i, _) => Pick::App(self.apps[*i].path.clone()),
             Item::Project(i, _) => Pick::Project(self.projects[*i].id.clone(), ProjectAction::Open),
             Item::File(i, _) => Pick::File(self.files[*i].path.clone()),
+            Item::Extra(i) => self.extras[*i].pick.clone(),
             Item::Cmd(i) => return self.cmd_pick(&self.cmds[*i]),
         })
     }
@@ -1014,6 +1160,10 @@ impl Launcher {
                 let (icon, color) = crate::assets::file_icon(name);
                 let offset = f.display[..split].chars().count();
                 (svg_icon(icon, color), hl(name, p, offset), f.display[..split].trim_end_matches('/').to_string(), "File", false)
+            }
+            Item::Extra(i) => {
+                let x = &self.extras[*i];
+                (svg_icon(x.icon, x.color), plain(&x.title), x.subtitle.clone(), x.badge, false)
             }
             Item::Cmd(i) => {
                 let c = &self.cmds[*i];
@@ -1244,6 +1394,7 @@ pub fn init(workspace: WindowHandle<Workspace>, cx: &mut App) {
         Err(e) => crate::startup_log(&format!("launcher hotkey: {e}")),
     }
     ensure_music_hotkey(cx);
+    ensure_clipboard_hotkey(cx);
     // Manual testing without the hotkey.
     if std::env::var_os("JT_LAUNCHER_AT_START").is_some() {
         toggle(cx);
@@ -1304,10 +1455,16 @@ fn target_bounds(cx: &App) -> Option<(gpui::DisplayId, Bounds<gpui::Pixels>)> {
 }
 
 pub fn toggle(cx: &mut App) {
+    toggle_with(None, cx);
+}
+
+/// Open the launcher with `query` typed in (or close it when it's open).
+pub fn toggle_with(query: Option<&str>, cx: &mut App) {
     if cx.global::<LauncherGlobal>().window.is_some() {
         close(cx);
         return;
     }
+    let query = query.map(str::to_string);
     let Some(ws) = last_workspace(cx) else { return };
     let Ok(mut sources) = ws.read_with(cx, |w, cx| w.launcher_sources(cx)) else { return };
     // Projects open in any window count as open.
@@ -1335,7 +1492,16 @@ pub fn toggle(cx: &mut App) {
             ..Default::default()
         },
         |window, cx| {
-            let launcher = cx.new(|cx| Launcher::new(sources, window, cx));
+            let launcher = cx.new(|cx| {
+                let l = Launcher::new(sources, window, cx);
+                if let Some(q) = &query {
+                    l.input.update(cx, |i, cx| {
+                        i.set_text(q, cx);
+                        i.move_end(cx);
+                    });
+                }
+                l
+            });
             cx.subscribe(&launcher, |_, event: &LauncherEvent, cx| match event {
                 LauncherEvent::Dismiss => close(cx),
                 LauncherEvent::Pick(pick) => {
@@ -1385,6 +1551,30 @@ pub fn ensure_music_hotkey(cx: &mut App) {
     }
 }
 
+/// ⌃⌘V system-wide: the launcher on the clipboard history. Registered once, when the
+/// clipboard plugin and its hotkey setting are on.
+pub fn ensure_clipboard_hotkey(cx: &mut App) {
+    static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::plugins::setting(crate::plugins::CLIPBOARD, "global_hotkey") || REGISTERED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    match crate::hotkey::register(crate::hotkey::KVK_V, crate::hotkey::CMD_KEY | crate::hotkey::CONTROL_KEY, "⌃⌘V") {
+        Ok(mut rx) => {
+            cx.spawn(async move |cx| {
+                while rx.next().await.is_some() {
+                    let _ = cx.update(|cx| {
+                        if crate::plugins::setting(crate::plugins::CLIPBOARD, "global_hotkey") && cx.has_global::<LauncherGlobal>() {
+                            toggle_with(Some("clip "), cx);
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+        Err(e) => crate::startup_log(&format!("clipboard hotkey: {e}")),
+    }
+}
+
 /// ⌘⇧M: inside the app it toggles the search on the focused window, like the local binding;
 /// from another app it brings juan-terminal to the front with the search open.
 fn toggle_music(cx: &mut App) {
@@ -1418,6 +1608,21 @@ fn run(pick: Pick, cx: &mut App) {
         Pick::Open(u) => open(u.as_ref()),
         Pick::App(p) => open(p.as_os_str()),
         Pick::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
+        Pick::Paste(text) => crate::plugins::clipboard::history::paste(text, cx),
+        Pick::Page(kind) => {
+            let Some(ws) = last_workspace(cx) else { return };
+            cx.activate(true);
+            let _ = ws.update(cx, |w, window, cx| {
+                window.activate_window();
+                match kind {
+                    PageKind::Http => {
+                        w.open_http(window, cx);
+                    }
+                    PageKind::Agenda => w.open_agenda(window, cx),
+                    PageKind::Clipboard => w.open_clipboard(window, cx),
+                }
+            });
+        }
         Pick::Media(track) => {
             let Some(music) = crate::music::global(cx) else { return };
             let video = track.mode == crate::music::Mode::Videos;

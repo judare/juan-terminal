@@ -196,12 +196,14 @@ pub struct PortsPanel {
     loaded: bool,
     /// Set by the workspace: polling pauses while the panel isn't visible.
     pub active: bool,
+    /// Rendered inline at the end of the Servers panel (no own scroll, top border).
+    pub embedded: bool,
     _poll: Option<Task<()>>,
 }
 
 impl PortsPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut this = Self { listeners: Vec::new(), error: None, show_system: false, roots: Vec::new(), busy: false, loaded: false, active: true, _poll: None };
+        let mut this = Self { listeners: Vec::new(), error: None, show_system: false, roots: Vec::new(), busy: false, loaded: false, active: true, embedded: false, _poll: None };
         this.refresh(cx);
         // Cheap (two lsof + one ps); only repaints when the list changed.
         this._poll = Some(cx.spawn(async move |this, cx| {
@@ -431,10 +433,11 @@ impl Render for PortsPanel {
         let system: Vec<Listener> = self.listeners.iter().filter(|l| !l.ours && l.system).cloned().collect();
         let show_system = self.show_system;
 
-        let mut list = div().id("ports-panel").flex().flex_col().size_full().overflow_y_scroll().pb(px(16.));
+        let mut list = div().id("ports-panel").flex().flex_col();
+        list = if self.embedded { list } else { list.size_full().overflow_y_scroll().pb(px(16.)) };
         let ours_pids: Vec<i32> = ours.iter().map(|l| l.pid).collect();
         list = list.child(
-            section("ports-ours", "FRAGUA", "started from your terminals", ours.len(), true)
+            section("ports-ours", "FRAGUA", "started from your terminals", ours.len(), !self.embedded)
                 .when(!ours_pids.is_empty(), |d| {
                     d.child(kill_all_button("ports-kill-ours").on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                         let n = ours_pids.len();

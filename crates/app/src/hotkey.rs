@@ -47,6 +47,7 @@ pub const OPTION_KEY: u32 = 1 << 11;
 pub const CONTROL_KEY: u32 = 1 << 12;
 pub const KVK_SPACE: u32 = 49;
 pub const KVK_M: u32 = 46;
+pub const KVK_V: u32 = 9;
 pub const KVK_LEFT: u32 = 123;
 pub const KVK_RIGHT: u32 = 124;
 

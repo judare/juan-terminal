@@ -117,6 +117,18 @@ pub enum EditorEvent {
     OpenChat { jid: String, name: String },
 }
 
+/// A view shown as an editor tab instead of a file (plugin details, HTTP client, agenda…).
+/// `key` identifies it, so opening the same page again focuses the existing tab.
+pub struct Page {
+    pub key: String,
+    pub title: SharedString,
+    pub icon: &'static str,
+    pub color: u32,
+    pub view: gpui::AnyView,
+    /// Focused when the tab is selected.
+    pub focus: Option<FocusHandle>,
+}
+
 /// Oxfmt/Oxlint found for the repository containing this file.
 #[derive(Clone, Default)]
 pub struct FileTools {
@@ -269,6 +281,8 @@ pub struct EditorView {
     asset_dirty: bool,
     /// .docx edited as Markdown: the Word model that saves the text back into the file.
     pub docx: Option<crate::office::docx::DocxModel>,
+    /// A plugin page (plugin details, HTTP client, agenda, clipboard) shown instead of a file.
+    pub page: Option<Page>,
     /// Markdown/Word → corporate PDF dialog.
     export: Option<Entity<crate::md_export::ExportDialog>>,
     focus_handle: FocusHandle,
@@ -360,6 +374,7 @@ impl EditorView {
             asset_dirty: false,
             docx: None,
             export: None,
+            page: None,
             focus_handle: cx.focus_handle(),
             spans: Vec::new(),
             spans_version: u64::MAX,
@@ -456,6 +471,17 @@ impl EditorView {
         this.chat_title = Some(chat.read(cx).name.clone().into());
         this.chat = Some(chat);
         this
+    }
+
+    /// A plugin page as a tab (see `Page`).
+    pub fn new_page(page: Page, font_size: f32, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(Document::from_str("", Language::PlainText), font_size, cx);
+        this.page = Some(page);
+        this
+    }
+
+    pub fn page_key(&self) -> Option<&str> {
+        self.page.as_ref().map(|p| p.key.as_str())
     }
 
     /// WhatsApp tab: (picture, unread count).
@@ -846,6 +872,9 @@ impl EditorView {
         if let Some(name) = &self.chat_title {
             return name.clone();
         }
+        if let Some(p) = &self.page {
+            return p.title.clone();
+        }
         self.doc
             .path
             .as_ref()
@@ -861,7 +890,7 @@ impl EditorView {
 
     /// New buffer (⌘N) that has never been saved.
     pub fn is_untitled(&self) -> bool {
-        self.doc.path.is_none() && self.asset.is_none() && self.chat.is_none()
+        self.doc.path.is_none() && self.asset.is_none() && self.chat.is_none() && self.page.is_none()
     }
 
     /// Give an untitled buffer its file: the language follows the new extension.
@@ -1804,7 +1833,7 @@ impl EditorView {
 
 impl Focusable for EditorView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+        self.page.as_ref().and_then(|p| p.focus.clone()).unwrap_or_else(|| self.focus_handle.clone())
     }
 }
 
@@ -1850,6 +1879,9 @@ impl Render for EditorView {
         }
         let table_toolbar = self.render_table_toolbar(cx);
         let slash_menu = if self.markdown_live { self.render_slash_menu(cx) } else { None };
+        if let Some(p) = &self.page {
+            return div().id("editor").size_full().child(p.view.clone());
+        }
         if let Some(chat) = self.chat.clone() {
             let name: SharedString = chat.read(cx).name.clone().into();
             self.chat_title = Some(name);

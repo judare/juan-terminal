@@ -60,6 +60,8 @@ struct NamePrompt {
 }
 
 pub struct ServersPanel {
+    /// Ports section rendered last (set by the workspace).
+    pub ports: Option<Entity<crate::ports::PortsPanel>>,
     dev: Vec<crate::ports::DevCommand>,
     dev_running: HashSet<PathBuf>,
     /// Listening ports of running dev servers (by folder).
@@ -118,7 +120,7 @@ fn human_size(n: u64) -> String {
 
 impl ServersPanel {
     pub fn new() -> Self {
-        Self { dev: Vec::new(), dev_running: HashSet::new(), dev_ports: HashMap::new(), dev_poll: None, servers: Vec::new(), open: HashSet::new(), browsers: HashMap::new(), form: None, prompt: None, totp: Totp::default() }
+        Self { ports: None, dev: Vec::new(), dev_running: HashSet::new(), dev_ports: HashMap::new(), dev_poll: None, servers: Vec::new(), open: HashSet::new(), browsers: HashMap::new(), form: None, prompt: None, totp: Totp::default() }
     }
 
     /// Dev scripts of the project and which of them run now (their terminal tabs).
@@ -1286,6 +1288,9 @@ impl Render for ServersPanel {
         if crate::plugins::enabled(crate::plugins::TWO_FACTOR) {
             self.ensure_totp(cx);
             list = list.child(self.render_totp(cx));
+        }
+        if let Some(pp) = self.ports.clone() {
+            list = list.child(pp);
         }
         list
     }

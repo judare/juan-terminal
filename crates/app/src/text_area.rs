@@ -553,9 +553,12 @@ impl Element for AreaElement {
             }
             if empty {
                 let style = window.text_style();
-                let run = TextRun { len: placeholder.len(), font: style.font(), color: theme::rgb(theme::TEXT_FAINT), background_color: None, underline: None, strikethrough: None };
-                let line = window.text_system().shape_line(placeholder, style.font_size.to_pixels(window.rem_size()), &[run], None);
-                let _ = line.paint(origin, lh, window, cx);
+                // One shaped line per `\n` (shape_line doesn't break lines).
+                for (i, text) in placeholder.split('\n').enumerate() {
+                    let run = TextRun { len: text.len(), font: style.font(), color: theme::rgb(theme::TEXT_FAINT), background_color: None, underline: None, strikethrough: None };
+                    let line = window.text_system().shape_line(SharedString::from(text.to_string()), style.font_size.to_pixels(window.rem_size()), &[run], None);
+                    let _ = line.paint(point(origin.x, origin.y + lh * i as f32), lh, window, cx);
+                }
             }
             for (_, line, y) in &layout.paras {
                 let _ = line.paint(point(origin.x, origin.y + *y), lh, TextAlign::Left, Some(bounds), window, cx);

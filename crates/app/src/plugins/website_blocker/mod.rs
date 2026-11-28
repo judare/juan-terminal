@@ -5,6 +5,19 @@
 pub mod brave_guard;
 pub mod website_block;
 
+pub const ABOUT: &str = r#"## Qué hace
+Bloquea sitios que te distraen o que no quieres ver.
+
+- **Sistema**: los sitios de `blocked_websites` no abren en ninguna app (vía `/etc/hosts`).
+- **Brave**: sitios bloqueados, horarios por sitio y páginas de video ocultas.
+- **Filtro adulto**: bloquea páginas con mucho contenido adulto aunque la URL sea nueva.
+
+## Sin desbloqueos por impulso
+Desactivar el plugin o una de sus partes tarda **24 horas**. Si te arrepientes, vuelve a
+activarlo y se cancela. Activar es inmediato.
+
+Las listas y horarios se editan en Settings (⌘,)."#;
+
 use super::{Manifest, builtin, spec};
 
 pub fn manifest() -> Manifest {

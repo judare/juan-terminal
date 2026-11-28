@@ -10,13 +10,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub enum Source {
     WhatsApp,
     Claude,
+    /// No image attached (calendar, mail…): the app icon only.
+    Plain,
 }
 
 impl Source {
-    fn png(self) -> (&'static str, &'static [u8]) {
+    fn png(self) -> Option<(&'static str, &'static [u8])> {
         match self {
-            Source::WhatsApp => ("whatsapp", include_bytes!("../assets/notify/whatsapp.png")),
-            Source::Claude => ("claude", include_bytes!("../assets/notify/claude.png")),
+            Source::WhatsApp => Some(("whatsapp", include_bytes!("../assets/notify/whatsapp.png"))),
+            Source::Claude => Some(("claude", include_bytes!("../assets/notify/claude.png"))),
+            Source::Plain => None,
         }
     }
 }
@@ -114,10 +117,10 @@ fn post(source: Source, title: &str, subtitle: &str, body: &str) -> bool {
     // The attachment file is moved into the notification store: hand over a fresh copy.
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let (name, bytes) = source.png();
+    let (name, bytes) = source.png().unwrap_or(("", &[]));
     let dir = workspace_state::state_dir().join("notify");
     let file = dir.join(format!("{name}-{stamp}-{seq}.png"));
-    let have_image = std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, bytes).is_ok();
+    let have_image = !bytes.is_empty() && std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, bytes).is_ok();
     objc::rc::autoreleasepool(|| unsafe {
         let center: *mut Object = msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
         if center.is_null() {

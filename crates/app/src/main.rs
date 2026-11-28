@@ -180,6 +180,10 @@ fn main() {
         if plugins::enabled(plugins::MEDIA) {
             music::init(cx);
         }
+        if plugins::enabled(plugins::CLIPBOARD) {
+            plugins::clipboard::history::init(cx);
+        }
+        plugins::google::init_if_enabled(cx);
         music_ui::bind_keys(cx);
         text_input::bind_keys(cx);
         chat_view::bind_keys(cx);
@@ -249,6 +253,9 @@ fn main() {
                     MenuItem::action("Agent Usage", workspace::ShowUsage),
                     MenuItem::action("Música, podcasts y videos…", workspace::ToggleMusic),
                     MenuItem::action("Plugins", workspace::ShowPlugins),
+                    MenuItem::action("Cliente HTTP", workspace::OpenHttpClient),
+                    MenuItem::action("Portapapeles", workspace::OpenClipboardHistory),
+                    MenuItem::action("Agenda y correo", workspace::OpenAgenda),
                     MenuItem::action("Command Palette…", workspace::ToggleCommandPalette),
                     MenuItem::action("Go to File…", workspace::ToggleQuickOpen),
                     MenuItem::action("Search in Project", workspace::SearchInProject),
