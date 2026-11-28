@@ -291,6 +291,8 @@ pub struct ChatView {
     /// This chat's decoded images (RAM + GPU atlas), freed when the chat closes. gpui's global
     /// cache never evicts, so photos seen in old chats would pile up for the whole session.
     images: Entity<gpui::RetainAllImageCache>,
+    /// Measured height of the floating composer (bottom padding of the message list).
+    composer_h: Rc<std::cell::Cell<f32>>,
     recorder: Option<crate::voice::Recorder>,
     error: Option<SharedString>,
     reload_pending: bool,
@@ -338,6 +340,7 @@ impl ChatView {
             TextAreaEvent::Submit => this.send(cx),
             TextAreaEvent::Changed => this.composing(cx),
             TextAreaEvent::Cancel => {
+                this.info = None;
                 this.reply_to = None;
                 this.stickers_open = false;
                 cx.notify();
@@ -406,6 +409,7 @@ impl ChatView {
             thumbs: HashMap::new(),
             previews: HashMap::new(),
             images: gpui::RetainAllImageCache::new(cx),
+            composer_h: Rc::new(std::cell::Cell::new(64.)),
             recorder: None,
             error: None,
             reload_pending: false,
@@ -1092,11 +1096,14 @@ impl ChatView {
             let big2 = big.clone();
             div()
                 .id("info-photo")
-                .size(px(168.))
+                .size(px(132.))
                 .rounded_full()
                 .overflow_hidden()
-                .when(big.is_some(), |d| d.cursor_pointer())
-                .child(wa_ui::avatar(big.as_ref(), &self.name, 168.))
+                .border_2()
+                .border_color(crate::glass::edge())
+                .shadow(crate::glass::shadow())
+                .when(big.is_some(), |d| d.cursor_pointer().hover(|s| s.opacity(0.9)))
+                .child(wa_ui::avatar(big.as_ref(), &self.name, 132.))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     if let Some(p) = big2.clone() {
                         this.zoom = Some(p);
@@ -1111,12 +1118,14 @@ impl ChatView {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .px(px(10.))
-                .py(px(5.))
-                .rounded(px(8.))
+                .mt(px(2.))
+                .px(px(12.))
+                .py(px(4.))
+                .rounded_full()
                 .cursor_pointer()
-                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
-                .child(div().text_size(px(14.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(if is_lid { format!("Usuario de WhatsApp · {ph}") } else { ph }))
+                .glass_button()
+                .hover(|s| s.glass_hover())
+                .child(div().text_size(px(13.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(if is_lid { format!("Usuario de WhatsApp · {ph}") } else { ph }))
                 .child(if copied {
                     div().text_size(px(11.5)).text_color(theme::rgb(wa_ui::GREEN)).child("Copiado").into_any_element()
                 } else {
@@ -1149,14 +1158,14 @@ impl ChatView {
                 .flex_1()
                 .flex()
                 .justify_center()
-                .gap(px(4.))
-                .py(px(8.))
+                .gap(px(5.))
+                .py(px(5.))
+                .rounded_full()
                 .text_size(px(12.5))
                 .cursor_pointer()
                 .text_color(theme::rgb(if active { theme::TEXT } else { theme::TEXT_MUTED }))
-                .border_b_2()
-                .border_color(if active { theme::rgb(wa_ui::GREEN) } else { gpui::transparent_black() })
-                .hover(|s| s.text_color(theme::rgb(theme::TEXT)))
+                .when(active, |d| d.glass_button())
+                .when(!active, |d| d.hover(|s| s.text_color(theme::rgb(theme::TEXT))))
                 .child(label)
                 .when(n > 0, |d| d.child(div().text_color(theme::rgb(theme::TEXT_FAINT)).child(n.to_string())))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1228,16 +1237,17 @@ impl ChatView {
                 InfoTab::Media => div()
                     .flex()
                     .flex_wrap()
-                    .gap(px(3.))
-                    .p(px(3.))
+                    .gap(px(6.))
+                    .px(px(16.))
+                    .py(px(10.))
                     .children(items.iter().enumerate().map(|(i, m)| {
                         let src = media_srcs.get(i).cloned().flatten();
                         let msg = m.clone();
                         div()
                             .id(("info-media", i))
                             .relative()
-                            .size(px(104.))
-                            .rounded(px(4.))
+                            .size(px(124.))
+                            .rounded(px(10.))
                             .overflow_hidden()
                             .bg(theme::rgb(theme::SELECTED))
                             .cursor_pointer()
@@ -1373,81 +1383,110 @@ impl ChatView {
                     .into_any_element(),
             }
         };
+        let title = if self.is_group { "Info. del grupo" } else { "Info. del contacto" };
         Some(
             div()
-                .id("chat-info")
+                .id("chat-info-backdrop")
                 .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .w(px(352.))
+                .inset_0()
                 .flex()
-                .flex_col()
-                .bg(theme::rgb(theme::SIDEBAR_BG))
-                .border_l_1()
-                .border_color(theme::rgb(theme::BORDER))
-                .shadow_lg()
+                .items_center()
+                .justify_center()
+                .p(px(32.))
+                .bg(gpui::hsla(0., 0., 0., 0.42))
                 .occlude()
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.info = None;
+                    cx.notify();
+                }))
                 .child(
+                    // Solid-ish base so the chat doesn't bleed through, glass sheen on top.
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .px(px(12.))
-                        .h(px(56.))
-                        .flex_none()
-                        .border_b_1()
-                        .border_color(theme::rgb(theme::BORDER))
+                        .id("chat-info")
+                        .w(px(436.))
+                        .max_w_full()
+                        .h(px(640.))
+                        .max_h_full()
+                        .rounded(px(20.))
+                        .overflow_hidden()
+                        .bg(theme::rgb(theme::SIDEBAR_BG).opacity(0.96))
+                        .border_1()
+                        .border_color(crate::glass::edge())
+                        .shadow(vec![
+                            gpui::BoxShadow { color: gpui::hsla(0., 0., 0., 0.45), offset: gpui::point(px(0.), px(18.)), blur_radius: px(48.), spread_radius: px(0.) },
+                            gpui::BoxShadow { color: gpui::hsla(0., 0., 0., 0.25), offset: gpui::point(px(0.), px(2.)), blur_radius: px(6.), spread_radius: px(0.) },
+                        ])
+                        // Clicks inside don't close it.
+                        .on_click(|_, _, cx| cx.stop_propagation())
                         .child(
                             div()
-                                .id("info-close")
-                                .size(px(28.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(6.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
-                                .child(gpui::svg().path("icons/close.svg").size(px(12.)).text_color(theme::rgb(theme::TEXT_MUTED)))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.info = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(div().text_size(px(14.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(if self.is_group { "Info. del grupo" } else { "Info. del contacto" })),
-                )
-                .child(
-                    div()
-                        .id("info-scroll")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .child(
-                            div()
+                                .relative()
+                                .size_full()
                                 .flex()
                                 .flex_col()
-                                .items_center()
-                                .gap(px(4.))
-                                .pt(px(24.))
-                                .pb(px(16.))
-                                .child(photo)
-                                .child(div().mt(px(12.)).px(px(16.)).text_center().text_size(px(19.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(self.name.trim_start_matches('~').to_string()))
-                                .children(copy_row)
-                                .children(push_label.map(|p| div().text_size(px(12.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("~{p}"))))
-                                .when(self.is_group, |d| d.child(div().text_size(px(13.)).text_color(theme::rgb(theme::TEXT_MUTED)).child("Grupo"))),
-                        )
-                        .child(div().h(px(8.)).bg(theme::rgb(theme::APP_BG)))
-                        .child(
-                            div()
-                                .flex()
-                                .border_b_1()
-                                .border_color(theme::rgb(theme::BORDER))
-                                .when(self.is_group, |d| d.child(tab_btn("info-tab-members", "Integrantes", n_members, InfoTab::Members)))
-                                .child(tab_btn("info-tab-media", "Multimedia", n_media, InfoTab::Media))
-                                .child(tab_btn("info-tab-docs", "Archivos", n_docs, InfoTab::Docs))
-                                .child(tab_btn("info-tab-links", "Enlaces", n_links, InfoTab::Links)),
-                        )
-                        .child(body),
+                                .bg(crate::glass::fill())
+                                .child(
+                                    div()
+                                        .id("info-scroll")
+                                        .flex_1()
+                                        .min_h_0()
+                                        .overflow_y_scroll()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .pt(px(40.))
+                                                .pb(px(18.))
+                                                .px(px(20.))
+                                                .child(photo)
+                                                .child(div().mt(px(10.)).text_center().text_size(px(20.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(self.name.trim_start_matches('~').to_string()))
+                                                .children(copy_row)
+                                                .children(push_label.map(|p| div().text_size(px(12.)).text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("~{p}"))))
+                                                .when(self.is_group, |d| d.child(div().text_size(px(12.5)).text_color(theme::rgb(theme::TEXT_FAINT)).child("Grupo"))),
+                                        )
+                                        .child(
+                                            div()
+                                                .mx(px(16.))
+                                                .p(px(3.))
+                                                .flex()
+                                                .gap(px(2.))
+                                                .rounded_full()
+                                                .bg(gpui::hsla(0., 0., 0., if theme::is_light() { 0.05 } else { 0.22 }))
+                                                .border_1()
+                                                .border_color(crate::glass::edge())
+                                                .when(self.is_group, |d| d.child(tab_btn("info-tab-members", "Integrantes", n_members, InfoTab::Members)))
+                                                .child(tab_btn("info-tab-media", "Multimedia", n_media, InfoTab::Media))
+                                                .child(tab_btn("info-tab-docs", "Archivos", n_docs, InfoTab::Docs))
+                                                .child(tab_btn("info-tab-links", "Enlaces", n_links, InfoTab::Links)),
+                                        )
+                                        .child(div().pt(px(4.)).pb(px(12.)).child(body)),
+                                )
+                                // Floating close button (top-right), over the scroll area.
+                                .child(
+                                    div()
+                                        .id("info-close")
+                                        .absolute()
+                                        .top(px(12.))
+                                        .right(px(12.))
+                                        .size(px(30.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .cursor_pointer()
+                                        .glass_button()
+                                        .hover(|s| s.glass_hover())
+                                        .child(gpui::svg().path("icons/close.svg").size(px(11.)).text_color(theme::rgb(theme::TEXT_MUTED)))
+                                        .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip("Cerrar (Esc)")).into())
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.info = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(div().absolute().top(px(18.)).left(px(20.)).text_size(px(11.)).font_weight(gpui::FontWeight::MEDIUM).text_color(theme::rgb(theme::TEXT_FAINT)).child(title.to_uppercase())),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -1861,6 +1900,13 @@ impl ChatView {
         };
         let msg = m.clone();
         let radius = px(14.);
+        // Liquid-glass bubble: own colors, a touch translucent, lit from the top.
+        let base = theme::rgb(bubble_bg);
+        let bubble_fill = gpui::linear_gradient(
+            180.,
+            gpui::linear_color_stop(gpui::Hsla { l: (base.l + 0.035).min(1.), a: 0.93, ..base }, 0.),
+            gpui::linear_color_stop(gpui::Hsla { a: 0.93, ..base }, 1.),
+        );
         let offset = self.swipe.as_ref().filter(|(i, _)| *i == m.id).map(|(_, o)| *o).unwrap_or(0.);
         let hovered = self.hovered_msg.as_deref() == Some(m.id.as_str()) && self.swipe.is_none() && m.kind != MsgKind::Revoked;
         let bubble = div()
@@ -1875,7 +1921,10 @@ impl ChatView {
                     .rounded(radius)
                     .when(tail && mine, |d| d.rounded_br(px(4.)))
                     .when(tail && !mine, |d| d.rounded_bl(px(4.)))
-                    .bg(theme::rgb(bubble_bg))
+                    .bg(bubble_fill)
+                    .shadow(vec![gpui::BoxShadow { color: gpui::hsla(0., 0., 0., if theme::is_light() { 0.08 } else { 0.22 }), offset: gpui::point(px(0.), px(1.)), blur_radius: px(3.), spread_radius: px(0.) }])
+                    // Specular highlight along the top edge.
+                    .child(div().absolute().top_0().left(radius).right(radius).h(px(1.)).bg(gpui::hsla(0., 0., 1., if theme::is_light() { 0.5 } else { 0.07 })))
                     .when(visual, |d| d.p(px(4.)))
                     .when(!visual, |d| d.px(px(11.)).py(px(7.)))
             })
@@ -1894,7 +1943,7 @@ impl ChatView {
                         .h(px(16.))
                         .when(mine, |d| d.right(px(-7.)))
                         .when(!mine, |d| d.left(px(-7.)))
-                        .text_color(theme::rgb(bubble_bg)),
+                        .text_color(gpui::Hsla { a: 0.93, ..base }),
                 )
             })
             .on_mouse_down(
@@ -3257,6 +3306,7 @@ impl ChatView {
                             .justify_center()
                             .cursor_pointer()
                             .glass_button()
+                            .bg(frosted())
                             .hover(|s| s.glass_hover())
                             .child(gpui::svg().path("icons/plus.svg").size(px(18.)).text_color(theme::rgb(theme::TEXT)))
                             .tooltip(|_, cx| cx.new(|_| crate::git_panel::Tooltip("Adjuntar archivos")).into())
@@ -3273,6 +3323,7 @@ impl ChatView {
                             .pr(px(4.))
                             .rounded(px(20.))
                             .glass()
+                            .bg(frosted())
                             .child(div().flex_1().min_w_0().py(px(10.)).text_size(px(14.)).child(self.composer.clone()))
                             .child(div().pb(px(3.)).child(round("wa-stickers", "icons/smile.svg", "Emojis y stickers").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.stickers_open = !this.stickers_open;
@@ -3290,6 +3341,7 @@ impl ChatView {
                             .items_center()
                             .justify_center()
                             .glass_button()
+                            .bg(frosted())
                             .child(if busy {
                                 div().text_size(px(15.)).text_color(theme::rgb(0xd97757)).child("…").into_any_element()
                             } else {
@@ -3541,6 +3593,15 @@ impl Render for ChatView {
             .size_full()
             .bg(theme::rgb(wa_ui::CHAT_BG))
             .on_action(cx.listener(|this, _: &SearchInChat, w, cx| this.open_search(w, cx)))
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
+                if e.keystroke.key == "escape" && (this.info.is_some() || this.zoom.is_some()) {
+                    if this.zoom.take().is_none() {
+                        this.info = None;
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
             // A click anywhere drops the text selection (a click on text starts a new one).
             .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
@@ -3580,12 +3641,13 @@ impl Render for ChatView {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .px(px(16.))
-                    .h(px(60.))
+                    .px(px(10.))
+                    .h(px(62.))
                     .flex_none()
                     .bg(theme::rgb(theme::SIDEBAR_BG))
                     .border_b_1()
-                    .border_color(theme::rgb(theme::BORDER))
+                    .border_color(crate::glass::edge())
+                    .shadow(crate::glass::shadow_sm())
                     .child(
                         div()
                             .id("chat-profile")
@@ -3593,17 +3655,33 @@ impl Render for ChatView {
                             .flex_1()
                             .min_w_0()
                             .items_center()
-                            .gap(px(12.))
+                            .gap(px(11.))
+                            .pl(px(5.))
+                            .pr(px(14.))
+                            .py(px(5.))
+                            .rounded_full()
                             .cursor_pointer()
-                            .child(wa_ui::avatar(self.avatar.as_ref(), &self.name, 40.))
+                            .when(info_open, |d| d.glass_button())
+                            .hover(|s| s.glass_hover())
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(crate::glass::edge())
+                                    .shadow(crate::glass::shadow_sm())
+                                    .child(wa_ui::avatar(self.avatar.as_ref(), &self.name, 40.)),
+                            )
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .min_w_0()
-                                    .child(div().text_size(px(15.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).truncate().child(self.name.clone()))
-                                    .child(div().text_size(px(12.)).truncate().text_color(theme::rgb(if typing.is_some() { wa_ui::GREEN } else { theme::TEXT_FAINT })).child(subtitle)),
+                                    .gap(px(1.))
+                                    .child(div().text_size(px(14.5)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).truncate().child(self.name.trim_start_matches('~').to_string()))
+                                    .child(div().text_size(px(11.5)).truncate().text_color(theme::rgb(if typing.is_some() { wa_ui::GREEN } else { theme::TEXT_FAINT })).child(subtitle)),
                             )
+                            .tooltip(move |_, cx| cx.new(|_| crate::git_panel::Tooltip("Ver info. del contacto")).into())
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_info(cx))),
                     )
                     .child(
@@ -3633,8 +3711,38 @@ impl Render for ChatView {
                     .flex_1()
                     .min_h_0()
                     .child(wa_ui::wallpaper_layer())
-                    .child(messages)
-                    .children(error.map(|e| {
+                    // Room under the last message for the floating composer.
+                    .child(messages.pb(px(self.composer_h.get() + 6.)))
+                    .child({
+                        let composer_h = self.composer_h.clone();
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .flex()
+                            .flex_col()
+                            // Fade so bubbles slide under the bar instead of being cut off.
+                            .bg(gpui::linear_gradient(
+                                180.,
+                                gpui::linear_color_stop(gpui::Hsla { a: 0., ..theme::rgb(wa_ui::CHAT_BG) }, 0.),
+                                gpui::linear_color_stop(gpui::Hsla { a: 0.55, ..theme::rgb(wa_ui::CHAT_BG) }, 1.),
+                            ))
+                            .child(
+                                gpui::canvas(
+                                    move |bounds, window, _| {
+                                        let h = f32::from(bounds.size.height);
+                                        if (composer_h.get() - h).abs() > 0.5 {
+                                            composer_h.set(h);
+                                            window.refresh();
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .children(error.map(|e| {
                         div()
                             .id("chat-error")
                             .mx(px(12.))
@@ -3652,9 +3760,10 @@ impl Render for ChatView {
                                 cx.notify();
                             }))
                     }))
-                    .child(self.render_composer(cx))
-                    .children(info),
+                            .child(self.render_composer(cx))
+                    }),
             )
+            .children(info)
             .children(zoom)
             .children(self.render_ask(cx))
             .children(self.render_forward(cx))
@@ -3697,4 +3806,12 @@ mod tests {
         assert!(find_links("correo@www.no").is_empty());
         assert!(find_links("ñandú http://á.com fin").len() == 1);
     }
+}
+
+/// Frosted surface for controls floating over the messages: mostly opaque so text stays
+/// readable, with the glass top-light (GPUI can't blur what's behind an element).
+fn frosted() -> gpui::Background {
+    let base = theme::rgb(theme::SIDEBAR_BG);
+    let top = if theme::is_light() { gpui::Hsla { l: (base.l + 0.02).min(1.), a: 0.9, ..base } } else { gpui::Hsla { l: (base.l + 0.05).min(1.), a: 0.88, ..base } };
+    gpui::linear_gradient(180., gpui::linear_color_stop(top, 0.), gpui::linear_color_stop(gpui::Hsla { a: 0.84, ..base }, 1.))
 }

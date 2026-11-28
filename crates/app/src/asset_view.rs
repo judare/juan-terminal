@@ -4,9 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, ClickEvent, ClipboardItem, Context, EventEmitter, FocusHandle, Global, ListHorizontalSizingBehavior, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels, Point, Render, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Task, UniformListScrollHandle, WeakEntity, Window, div, img, point, prelude::*, px, uniform_list,
+    App, ClickEvent, ClipboardItem, Context, EventEmitter, FocusHandle, ListHorizontalSizingBehavior, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Task, UniformListScrollHandle,
+    Window, div, point, prelude::*, px, uniform_list,
 };
 
 use std::collections::BTreeMap;
@@ -91,14 +91,8 @@ pub struct AssetView {
     table: Option<Table>,
     loading: bool,
     error: Option<String>,
-    /// `None` = fit (natural size, scaled down if needed); `Some(z)` = explicit zoom factor.
-    zoom: Option<f32>,
-    /// Natural pixel size of the image (from its header).
-    natural: Option<(f32, f32)>,
-    scroll: ScrollHandle,
-    hovered: bool,
-    /// Last mouse position in window coordinates (zoom anchor for pinch).
-    mouse: Option<Point<Pixels>>,
+    /// Image zoom/pan (natural size from the file header).
+    zp: crate::zoom_view::ZoomPan,
     _task: Option<Task<()>>,
     /// Shared with the owning editor so the tab keeps keyboard focus.
     focus: FocusHandle,
@@ -134,8 +128,6 @@ pub struct AssetView {
     player: Option<std::rc::Rc<crate::video_player::NativePlayer>>,
     /// What `img()` loads: the file itself, or a PNG converted with `sips` (HEIC/AVIF).
     display: PathBuf,
-    /// Click-drag panning of a zoomed image: (mouse at press, scroll offset at press).
-    pan: Option<(Point<Pixels>, Point<Pixels>)>,
     /// Right-click menu position.
     menu: Option<Point<Pixels>>,
 }
@@ -170,11 +162,7 @@ impl AssetView {
             table: None,
             loading: false,
             error: None,
-            zoom: None,
-            natural,
-            scroll: ScrollHandle::new(),
-            hovered: false,
-            mouse: None,
+            zp: crate::zoom_view::ZoomPan::new(natural, false),
             _task: None,
             focus,
             sheets: Vec::new(),
@@ -198,7 +186,6 @@ impl AssetView {
             find_last: String::new(),
             player,
             display,
-            pan: None,
             menu: None,
         };
         if kind == AssetKind::Pdf {
@@ -215,7 +202,7 @@ impl AssetView {
         }
         this.editable = kind == AssetKind::Table && crate::office::xlsx::is_editable(&this.path);
         if kind == AssetKind::Image {
-            pinch::register(cx.weak_entity(), cx);
+            crate::zoom_view::register_pinch(cx.weak_entity(), cx);
         }
         if kind == AssetKind::Table {
             this.load_sheet(0, cx);
@@ -686,54 +673,7 @@ impl AssetView {
     }
 }
 
-const MIN_ZOOM: f32 = 0.05;
-const MAX_ZOOM: f32 = 32.;
-const PAD: f32 = 16.;
-
 impl AssetView {
-    /// Scale currently on screen: the explicit zoom, or the fit scale.
-    fn current_scale(&self) -> f32 {
-        if let Some(z) = self.zoom {
-            return z;
-        }
-        let Some((w, h)) = self.natural else { return 1. };
-        let b = self.scroll.bounds();
-        let (vw, vh) = (f32::from(b.size.width) - 2. * PAD, f32::from(b.size.height) - 2. * PAD);
-        if vw <= 0. || vh <= 0. {
-            return 1.;
-        }
-        (vw / w).min(vh / h).min(1.)
-    }
-
-    /// Zoom by `factor`, keeping the image point under `anchor` (window coords) fixed.
-    fn zoom_by(&mut self, factor: f32, anchor: Option<Point<Pixels>>, cx: &mut Context<Self>) {
-        let Some((w, h)) = self.natural else { return };
-        let z0 = self.current_scale();
-        let z1 = (z0 * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        if (z1 - z0).abs() < f32::EPSILON {
-            return;
-        }
-        let b = self.scroll.bounds();
-        let (vw, vh) = (f32::from(b.size.width), f32::from(b.size.height));
-        let anchor = anchor.filter(|p| b.contains(p)).unwrap_or_else(|| b.center());
-        let (ax, ay) = (f32::from(anchor.x - b.origin.x), f32::from(anchor.y - b.origin.y));
-        let off = if self.zoom.is_some() { self.scroll.offset() } else { point(px(0.), px(0.)) };
-        // Image origin inside the scroll content (centered when smaller than the viewport).
-        let origin = |z: f32, view: f32, natural: f32| ((view - natural * z) / 2.).max(PAD);
-        let (ix0, iy0) = (origin(z0, vw, w), origin(z0, vh, h));
-        // Image-pixel coordinate under the anchor.
-        let cx_img = (ax - f32::from(off.x) - ix0) / z0;
-        let cy_img = (ay - f32::from(off.y) - iy0) / z0;
-        let (ix1, iy1) = (origin(z1, vw, w), origin(z1, vh, h));
-        let max_x = (w * z1 + 2. * PAD - vw).max(0.);
-        let max_y = (h * z1 + 2. * PAD - vh).max(0.);
-        let nx = (ax - ix1 - cx_img * z1).clamp(-max_x, 0.);
-        let ny = (ay - iy1 - cy_img * z1).clamp(-max_y, 0.);
-        self.zoom = Some(z1);
-        self.scroll.set_offset(point(px(nx), px(ny)));
-        cx.notify();
-    }
-
     /// Image bytes for the clipboard (the converted PNG for HEIC/AVIF).
     fn clipboard_image(&self) -> Option<gpui::Image> {
         let ext = self.display.extension()?.to_str()?.to_ascii_lowercase();
@@ -817,80 +757,6 @@ impl AssetView {
             })));
         Some(gpui::deferred(gpui::anchored().position(position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
     }
-
-    fn set_zoom(&mut self, zoom: Option<f32>, cx: &mut Context<Self>) {
-        self.zoom = zoom;
-        self.scroll.set_offset(point(px(0.), px(0.)));
-        cx.notify();
-    }
-}
-
-/// Trackpad pinch (NSEvent magnify). GPUI doesn't surface it, so we add
-/// `magnifyWithEvent:` to GPUI's NSView class and forward the deltas to the hovered image view.
-mod pinch {
-    use super::*;
-    use futures::{StreamExt, channel::mpsc};
-    use std::sync::OnceLock;
-
-    static TX: OnceLock<mpsc::UnboundedSender<f64>> = OnceLock::new();
-
-    #[derive(Default)]
-    struct Targets(Vec<WeakEntity<AssetView>>);
-    impl Global for Targets {}
-
-    pub fn register(view: WeakEntity<AssetView>, cx: &mut App) {
-        if !cx.has_global::<Targets>() {
-            cx.set_global(Targets::default());
-            let (tx, mut rx) = mpsc::unbounded::<f64>();
-            if TX.set(tx).is_ok() {
-                install_magnify_hook();
-            }
-            cx.spawn(async move |cx| {
-                while let Some(mut m) = rx.next().await {
-                    // Coalesce queued deltas into one zoom step.
-                    while let Ok(more) = rx.try_recv() {
-                        m += more;
-                    }
-                    let _ = cx.update(|cx| {
-                        let targets = cx.global::<Targets>().0.clone();
-                        if let Some(t) = targets.iter().rev().filter_map(|w| w.upgrade()).find(|e| e.read(cx).hovered) {
-                            t.update(cx, |v, cx| {
-                                let anchor = v.mouse;
-                                v.zoom_by((1. + m as f32).max(0.1), anchor, cx);
-                            });
-                        }
-                    });
-                }
-            })
-            .detach();
-        }
-        let t = cx.global_mut::<Targets>();
-        t.0.retain(|w| w.upgrade().is_some());
-        t.0.push(view);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[allow(unexpected_cfgs)]
-    fn install_magnify_hook() {
-        use objc::runtime::{Class, Object, Sel, class_addMethod};
-        use objc::{msg_send, sel, sel_impl};
-
-        extern "C" fn magnify(_this: &Object, _sel: Sel, event: *mut Object) {
-            let m: f64 = unsafe { msg_send![event, magnification] };
-            if let Some(tx) = TX.get() {
-                let _ = tx.unbounded_send(m);
-            }
-        }
-
-        let Some(cls) = Class::get("GPUIView") else { return };
-        unsafe {
-            let imp: extern "C" fn(&Object, Sel, *mut Object) = magnify;
-            class_addMethod(cls as *const Class as *mut Class, sel!(magnifyWithEvent:), std::mem::transmute(imp), c"v@:@".as_ptr());
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn install_magnify_hook() {}
 }
 
 fn table_from_text(text: &str, path: &Path) -> Table {
@@ -1549,7 +1415,7 @@ fn button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
 }
 
 /// Compact toolbar control: flat, highlights on hover (icon or short text).
-fn tool(id: &'static str, icon: Option<&'static str>, label: &'static str, tip: &'static str) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn tool(id: &'static str, icon: Option<&'static str>, label: &'static str, tip: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -1598,105 +1464,12 @@ impl Render for AssetView {
                 )
             })
             .child(div().flex_1())
-            .when(self.kind == AssetKind::Image && self.natural.is_some(), |d| {
-                let pct = format!("{:.0}%", self.current_scale() * 100.);
-                let fit = self.zoom.is_none();
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(1.))
-                        .p(px(2.))
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(theme::rgb(theme::BORDER))
-                        .child(tool("asset-zoom-out", Some("icons/minus.svg"), "", "Zoom out (⌘ + wheel)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_by(1. / 1.25, None, cx))))
-                        .child(div().w(px(40.)).flex().justify_center().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT)).child(pct))
-                        .child(tool("asset-zoom-in", Some("icons/plus.svg"), "", "Zoom in (⌘ + wheel)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_by(1.25, None, cx))))
-                        .child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme::rgb(theme::BORDER)))
-                        .child(tool("asset-zoom-100", None, "1:1", "Actual size").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.set_zoom(Some(1.), cx))))
-                        .child(tool("asset-zoom-fit", None, "Fit", "Fit to window").when(fit, |d| d.bg(theme::rgb(theme::SELECTED)).text_color(theme::rgb(theme::TEXT))).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.set_zoom(None, cx)))),
-                )
-            })
+            .when(self.kind == AssetKind::Image && self.zp.natural.is_some(), |d| d.child(self.zp.toolbar(cx)))
             .child(tool("asset-open", Some("icons/external.svg"), "", "Open with default app").on_click(cx.listener(|this, _: &ClickEvent, _, cx| cx.open_with_system(&this.path))))
             .child(tool("asset-reveal", Some("icons/finder.svg"), "", "Reveal in Finder").on_click(cx.listener(|this, _: &ClickEvent, _, cx| cx.reveal_path(&this.path))));
 
         let body = match self.kind {
-            AssetKind::Image => {
-                let base = div()
-                    .id("image-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_scroll()
-                    .track_scroll(&self.scroll)
-                    // Neutral background so transparent images are readable.
-                    .bg(theme::rgb(0x1d1f23))
-                    .on_hover(cx.listener(|this, h: &bool, _, _| this.hovered = *h))
-                    .when(self.zoom.is_some(), |d| d.cursor(if self.pan.is_some() { gpui::CursorStyle::ClosedHand } else { gpui::CursorStyle::OpenHand }))
-                    // Click-drag pans the zoomed image.
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                            if this.zoom.is_some() {
-                                this.pan = Some((e.position, this.scroll.offset()));
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                        this.mouse = Some(e.position);
-                        this.hovered = true;
-                        if let Some((start, off)) = this.pan {
-                            if e.pressed_button != Some(MouseButton::Left) {
-                                this.pan = None;
-                                cx.notify();
-                                return;
-                            }
-                            let max = this.scroll.max_offset();
-                            let d = e.position - start;
-                            let x = (off.x + d.x).clamp(-max.width, px(0.));
-                            let y = (off.y + d.y).clamp(-max.height, px(0.));
-                            this.scroll.set_offset(point(x, y));
-                            cx.notify();
-                        }
-                    }))
-                    // ⌘/Ctrl + wheel zooms (plain wheel scrolls the zoomed image).
-                    .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
-                        if !(e.modifiers.platform || e.modifiers.control) {
-                            return;
-                        }
-                        let dy = f32::from(e.delta.pixel_delta(px(20.)).y);
-                        this.zoom_by((dy * 0.005).exp(), Some(e.position), cx);
-                        cx.stop_propagation();
-                    }));
-                match (self.zoom, self.natural) {
-                    (Some(z), Some((w, h))) => base
-                        .child(
-                            // Explicit size so the scroll area measures the whole image (with only
-                            // min_w_full the row stayed viewport-wide: no horizontal scroll/pan).
-                            div()
-                                .w(px(w * z + 2. * PAD))
-                                .h(px(h * z + 2. * PAD))
-                                .min_w_full()
-                                .min_h_full()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .p(px(PAD))
-                                .child(img(self.display.clone()).flex_none().w(px(w * z)).h(px(h * z)).object_fit(ObjectFit::Fill)),
-                        )
-                        .into_any_element(),
-                    // Fit: natural size, scaled down only if it doesn't fit.
-                    _ => base
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .p(px(PAD))
-                        .child(img(self.display.clone()).size_full().object_fit(ObjectFit::ScaleDown))
-                        .into_any_element(),
-                }
-            }
+            AssetKind::Image => self.zp.viewport(self.display.clone(), cx),
             AssetKind::Table => self.render_table(cx),
             AssetKind::Pdf if self.pdf.is_some() => self.pdf.clone().unwrap().into_any_element(),
             AssetKind::Slides if self.pptx.is_some() => self.pptx.clone().unwrap().into_any_element(),
@@ -1737,18 +1510,8 @@ impl Render for AssetView {
             .flex()
             .flex_col()
             .bg(theme::rgb(theme::EDITOR_BG))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.drag = None;
-                if this.pan.take().is_some() {
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.drag = None;
-                if this.pan.take().is_some() {
-                    cx.notify();
-                }
-            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
             // Right-click: copy / copy path / reveal in Finder (tables keep it on the header only,
             // their grid has its own selection).
             .when(self.kind != AssetKind::Table, |d| {
@@ -1827,3 +1590,9 @@ mod tests {
     }
 }
 
+
+impl crate::zoom_view::Zoomable for AssetView {
+    fn zoom_pan(&mut self) -> &mut crate::zoom_view::ZoomPan {
+        &mut self.zp
+    }
+}

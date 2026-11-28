@@ -61,6 +61,7 @@ mod website_block;
 mod brave_guard;
 mod whatsapp_panel;
 mod workspace;
+mod zoom_view;
 
 use std::time::Instant;
 

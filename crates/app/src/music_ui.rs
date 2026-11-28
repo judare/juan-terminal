@@ -14,6 +14,7 @@ use gpui::{
 
 use crate::music::{self, Mode, Music, SKIP_SECONDS, Track, fmt_ago, fmt_time, fmt_views};
 use crate::text_input::{TextInput, TextInputEvent};
+use crate::glass::GlassExt;
 use crate::theme;
 
 actions!(music, [SelectNext, SelectPrevious, NextMode, PreviousMode, ModeMusic, ModePodcast, ModeVideos, TogglePlay, Forward, Back, NextTrack, PreviousTrack, CloseTheater]);
@@ -80,8 +81,8 @@ fn round_button(id: impl Into<gpui::ElementId>, path: &'static str, size: f32, i
         .size(px(size))
         .rounded(px(size / 2.))
         .cursor_pointer()
-        .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
-        .child(icon(path, icon_size, theme::TEXT_MUTED))
+        .hover(|s| s.glass_hover())
+        .child(icon(path, icon_size, theme::TEXT))
 }
 
 fn tip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
@@ -101,7 +102,7 @@ fn transport(music: &Entity<Music>, m: &Music, big: bool, prefix: &'static str) 
         .flex()
         .items_center()
         .justify_center()
-        .gap(px(6. * s))
+        .gap(px(8. * s))
         .child(round_button(SharedString::from(format!("{prefix}-back")), "icons/back-15.svg", 26. * s, 15. * s).tooltip(tip("−15 s (⌃⌥←)")).on_click(on(|m, cx| m.seek_by(-SKIP_SECONDS, cx))))
         .child(round_button(SharedString::from(format!("{prefix}-prev")), "icons/skip-prev.svg", 26. * s, 13. * s).tooltip(tip("Anterior (⌃⌥⇧←)")).on_click(on(|m, cx| m.previous(cx))))
         .child(
@@ -111,12 +112,19 @@ fn transport(music: &Entity<Music>, m: &Music, big: bool, prefix: &'static str) 
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(px(32. * s))
-                .rounded(px(16. * s))
+                .size(px(38. * s))
+                .rounded(px(19. * s))
                 .cursor_pointer()
-                .bg(theme::rgb(accent))
-                .hover(|st| st.opacity(0.85))
-                .child(gpui::svg().path(play_icon).size(px(14. * s)).text_color(gpui::white()))
+                .bg(gpui::linear_gradient(
+                    180.,
+                    gpui::linear_color_stop(gpui::Hsla { l: (theme::rgb(accent).l + 0.06).min(1.), ..theme::rgb(accent) }, 0.),
+                    gpui::linear_color_stop(theme::rgb(accent), 1.),
+                ))
+                .border_1()
+                .border_color(gpui::hsla(0., 0., 1., 0.18))
+                .shadow(vec![gpui::BoxShadow { color: gpui::Hsla { a: 0.35, ..theme::rgb(accent) }, offset: gpui::point(px(0.), px(3.)), blur_radius: px(10.), spread_radius: px(0.) }])
+                .hover(|st| st.opacity(0.9))
+                .child(gpui::svg().path(play_icon).size(px(15. * s)).text_color(gpui::white()))
                 .tooltip(tip("Reproducir / pausa (⌃⌥Space)"))
                 .on_click(on(|m, cx| m.toggle(cx))),
         )
@@ -222,16 +230,31 @@ fn progress(music: &Entity<Music>, m: &Music, id: &'static str) -> gpui::Div {
                         .w_full()
                         .h(px(3.))
                         .group_hover("progress", |s| s.h(px(5.)))
-                        .rounded(px(2.))
-                        .bg(theme::rgb(theme::SELECTED))
-                        .child(div().h_full().rounded(px(2.)).bg(theme::rgb(accent)).w(gpui::relative(frac))),
+                        .rounded_full()
+                        .bg(gpui::hsla(0., 0., if theme::is_light() { 0. } else { 1. }, 0.12))
+                        .child(div().h_full().rounded_full().bg(theme::rgb(accent)).w(gpui::relative(frac))),
+                )
+                // Scrubber knob, shown on hover.
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(1.))
+                        .left(gpui::relative(frac))
+                        .ml(px(-5.))
+                        .size(px(10.))
+                        .rounded_full()
+                        .bg(gpui::white())
+                        .shadow(crate::glass::shadow_sm())
+                        .invisible()
+                        .group_hover("progress", |s| s.visible()),
                 ),
         )
         .child(
             div()
                 .flex()
                 .justify_between()
-                .text_size(px(10.5))
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme::rgb(theme::TEXT_FAINT))
                 .child(fmt_time(m.position))
                 .when_some(status, |d, st| {
@@ -1209,33 +1232,36 @@ impl Render for MusicCard {
             .flex()
             .flex_col()
             .flex_none()
-            .gap(px(8.))
+            .gap(px(10.))
             .mx(px(8.))
             .mb(px(8.))
-            .p(px(10.))
-            .rounded(px(10.))
-            .bg(theme::rgb(theme::HOVER))
-            .border_1()
-            .border_color(theme::rgb(theme::BORDER))
+            .px(px(12.))
+            .pt(px(12.))
+            .pb(px(10.))
+            .rounded(px(16.))
+            .glass()
+            .group("music-card")
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(9.))
+                    .gap(px(10.))
                     .child(
                         div()
                             .id("music-card-thumb")
                             .relative()
                             .cursor_pointer()
                             .group("thumb")
-                            .child(thumb_el(m, &track, 38., 38., 6.))
+                            .rounded(px(8.))
+                            .shadow(crate::glass::shadow())
+                            .child(thumb_el(m, &track, 44., 44., 8.))
                             .child(
                                 div()
                                     .absolute()
                                     .top_0()
                                     .left_0()
-                                    .size(px(38.))
-                                    .rounded(px(6.))
+                                    .size(px(44.))
+                                    .rounded(px(8.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -1253,23 +1279,17 @@ impl Render for MusicCard {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
-                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(12.5)).font_weight(gpui::FontWeight::SEMIBOLD).child(track.title.clone()))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .min_w_0()
-                                    .child(icon(track.mode.icon(), 10., track.mode.color()))
-                                    .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.)).text_color(theme::rgb(theme::TEXT_MUTED)).child(track.channel.clone())),
-                            ),
+                            .gap(px(1.))
+                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(track.title.clone()))
+                            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.5)).text_color(theme::rgb(theme::TEXT_MUTED)).child(track.channel.clone())),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .flex_none()
+                            .opacity(0.55)
+                            .group_hover("music-card", |s| s.opacity(1.))
                             .children([true, false].map(|good| {
                                 let rating = m.rating(&track.id);
                                 let (path, label) = rate_icon(good, rating);
@@ -1283,8 +1303,8 @@ impl Render for MusicCard {
                                     .size(px(22.))
                                     .rounded(px(11.))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(theme::rgb(theme::SELECTED)))
-                                    .child(icon(path, 12., if rating == Some(good) { track.mode.color() } else { theme::TEXT_MUTED }))
+                                    .hover(|s| s.glass_hover())
+                                    .child(icon(path, 12., if rating == Some(good) { theme::ACCENT } else { theme::TEXT }))
                                     .tooltip(tip(label))
                                     .on_click(move |_: &ClickEvent, _, cx| music.update(cx, |m, cx| m.rate(&t, good, cx)))
                             }))

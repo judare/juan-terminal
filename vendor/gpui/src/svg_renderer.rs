@@ -101,4 +101,21 @@ impl SvgRenderer {
 
         Ok(pixmap)
     }
+
+    /// Intrinsic size of an SVG document (its width/height or viewBox).
+    pub fn svg_size(&self, bytes: &[u8]) -> Result<(f32, f32), usvg::Error> {
+        let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+        Ok((tree.size().width(), tree.size().height()))
+    }
+
+    /// Rasterize an SVG document at `scale` × its intrinsic size, ready for `img()`.
+    /// Lets zoomed previews stay sharp (an `ImageFormat::Svg` image is rasterized once at 1×).
+    pub fn render_image(&self, bytes: &[u8], scale: f32) -> Result<std::sync::Arc<crate::RenderImage>, usvg::Error> {
+        let pixmap = self.render_pixmap(bytes, SvgSize::ScaleFactor(scale))?;
+        let mut buffer = image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).ok_or(usvg::Error::InvalidSize)?;
+        for pixel in buffer.chunks_exact_mut(4) {
+            crate::color::swap_rgba_pa_to_bgra(pixel);
+        }
+        Ok(std::sync::Arc::new(crate::RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(buffer), 1))))
+    }
 }

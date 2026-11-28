@@ -90,6 +90,8 @@ struct Row {
     window: WindowHandle<Workspace>,
     mine: bool,
     project: String,
+    /// Project icon file (configured or by convention), if any.
+    icon: Option<std::path::PathBuf>,
     terminal_id: String,
     title: SharedString,
     activity: ClaudeActivity,
@@ -98,6 +100,7 @@ struct Row {
 
 fn rows_of(ws: &Workspace, window: WindowHandle<Workspace>, mine: bool, cx: &App) -> Vec<Row> {
     let project = ws.active_project().map(|p| p.name.clone()).unwrap_or_else(|| "Sin proyecto".into());
+    let icon = ws.active_project().and_then(|p| p.icon_path());
     ws.terminals
         .values()
         .flat_map(|t| t.tabs.iter())
@@ -107,6 +110,7 @@ fn rows_of(ws: &Workspace, window: WindowHandle<Workspace>, mine: bool, cx: &App
             window,
             mine,
             project: project.clone(),
+            icon: icon.clone(),
             terminal_id: t.jt_id.clone(),
             title: t.repository.clone().map(SharedString::from).unwrap_or_else(|| t.title()),
             activity: t.activity.clone(),
@@ -279,14 +283,26 @@ impl Workspace {
             .cursor_pointer()
             .hover(|s| s.bg(theme::rgb(theme::HOVER)))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.jump_to_session(target, mine, id.clone(), window, cx)))
+            // Project: icon + name, so each card says at a glance where it runs.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(match r.icon.clone() {
+                        Some(path) => gpui::img(path).size(px(16.)).flex_none().rounded(px(4.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                        None => gpui::svg().path("icons/repo.svg").size(px(14.)).flex_none().text_color(theme::rgb(theme::ACCENT)).into_any_element(),
+                    })
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT_MUTED)).child(r.project.clone()))
+                    .child(div().flex_none().text_size(px(11.)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_MUTED)).child(right)),
+            )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(7.))
                     .child(div().size(px(8.)).flex_none().rounded_full().bg(theme::rgb(dot)))
-                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(r.title.clone()))
-                    .child(div().flex_none().text_size(px(11.)).font_family(theme::MONO_FONT).text_color(theme::rgb(theme::TEXT_MUTED)).child(right)),
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::rgb(theme::TEXT)).child(r.title.clone())),
             )
             .child(
                 div()
@@ -294,7 +310,6 @@ impl Workspace {
                     .gap(px(6.))
                     .text_size(px(11.))
                     .child(div().text_color(theme::rgb(dot)).child(label))
-                    .when(!r.mine, |d| d.child(div().text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("· {}", r.project))))
                     .when(a.tools > 0, |d| d.child(div().text_color(theme::rgb(theme::TEXT_FAINT)).child(format!("· {} tools", a.tools)))),
             )
             .when_some(a.prompt.clone(), |d, p| {

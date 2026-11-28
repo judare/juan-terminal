@@ -57,7 +57,8 @@ impl Mode {
 
     pub fn color(self) -> u32 {
         match self {
-            Mode::Music => 0xf7768e,
+            // Fragua brand red (was pink).
+            Mode::Music => crate::theme::ACCENT,
             Mode::Podcast => 0xe0af68,
             Mode::Videos => 0x7aa2f7,
         }

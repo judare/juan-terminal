@@ -301,7 +301,14 @@ pub struct EditorView {
     pub tools: Option<FileTools>,
     /// SVG files show the rendered image by default (Preview/Source toggle).
     svg_preview: bool,
-    svg_image: Option<(u64, std::sync::Arc<gpui::Image>)>,
+    /// Zoom/pan of the SVG preview (natural size = the SVG's intrinsic size).
+    svg_zoom: crate::zoom_view::ZoomPan,
+    /// Doc version `svg_zoom.natural` was measured for.
+    svg_size_ver: Option<u64>,
+    /// Rasterized preview: (doc version, raster scale, image). Re-rendered sharp as the zoom changes.
+    svg_raster: Option<(u64, f32, std::sync::Arc<gpui::RenderImage>)>,
+    /// In-flight rasterization: (doc version, raster scale, task).
+    svg_task: Option<(u64, f32, Task<()>)>,
     diagnostics: Vec<code_quality::Diagnostic>,
     hover: Option<(usize, Point<Pixels>)>,
     save_task: Option<Task<()>>,
@@ -378,7 +385,10 @@ impl EditorView {
             ide_fingerprint: (usize::MAX, 0, 0, 0),
             tools: None,
             svg_preview: false,
-            svg_image: None,
+            svg_zoom: crate::zoom_view::ZoomPan::new(None, true),
+            svg_size_ver: None,
+            svg_raster: None,
+            svg_task: None,
             diagnostics: Vec::new(),
             hover: None,
             save_task: None,
@@ -396,6 +406,9 @@ impl EditorView {
         };
         this.markdown_live = this.doc.language == Language::Markdown && this.doc.line_count() < 5000;
         this.svg_preview = this.is_svg();
+        if this.svg_preview {
+            crate::zoom_view::register_pinch(cx.weak_entity(), cx);
+        }
         this.schedule_highlight(Duration::ZERO, cx);
         this
     }
@@ -558,16 +571,38 @@ impl EditorView {
         self.doc.path.as_ref().and_then(|p| p.extension()).is_some_and(|e| e.eq_ignore_ascii_case("svg"))
     }
 
-    fn svg_image(&mut self) -> std::sync::Arc<gpui::Image> {
+    /// Rasterized SVG for the preview at the current zoom (`dpr` = window scale factor).
+    /// Returns the latest finished raster (maybe stale) while a sharper one renders.
+    fn svg_raster(&mut self, dpr: f32, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui::RenderImage>> {
         let v = self.doc.version();
-        if let Some((ver, img)) = &self.svg_image {
-            if *ver == v {
-                return img.clone();
-            }
+        if self.svg_size_ver != Some(v) {
+            self.svg_size_ver = Some(v);
+            self.svg_zoom.natural = cx.svg_renderer().svg_size(self.doc.text().as_bytes()).ok().filter(|(w, h)| *w > 0. && *h > 0.);
         }
-        let img = std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, self.doc.text().into_bytes()));
-        self.svg_image = Some((v, img.clone()));
-        img
+        let (w, h) = self.svg_zoom.natural?;
+        // Next power of two ≥ on-screen pixels per SVG unit, capped at ~16 MP.
+        let want = (self.svg_zoom.current_scale() * dpr).max(1. / 64.);
+        let scale = 2f32.powf(want.log2().ceil()).min((16_000_000. / (w * h)).sqrt());
+        let current = self.svg_raster.as_ref().is_some_and(|(rv, rs, _)| *rv == v && *rs == scale);
+        let pending = self.svg_task.as_ref().is_some_and(|(tv, ts, _)| *tv == v && *ts == scale);
+        if !current && !pending {
+            let bytes = self.doc.text().into_bytes();
+            let renderer = cx.svg_renderer();
+            let task = cx.spawn(async move |this, cx| {
+                let image = cx.background_executor().spawn(async move { renderer.render_image(&bytes, scale).ok() }).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.svg_task = None;
+                    if let Some(image) = image {
+                        if let Some((_, _, old)) = this.svg_raster.replace((v, scale, image)) {
+                            cx.drop_image(old, None);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+            self.svg_task = Some((v, scale, task));
+        }
+        self.svg_raster.as_ref().map(|(_, _, i)| i.clone())
     }
 
     // ---- markdown tables ------------------------------------------------------------------
@@ -1784,7 +1819,30 @@ macro_rules! cmd {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, win: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let svg_mode = self.svg_preview && self.is_svg();
+        let svg_view = svg_mode.then(|| {
+            let raster = self.svg_raster(win.scale_factor(), cx);
+            let toolbar = self.svg_zoom.natural.is_some().then(|| self.svg_zoom.toolbar(cx));
+            let body = match raster {
+                Some(r) => self.svg_zoom.viewport(r, cx),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme::rgb(0x1d1f23))
+                    .text_size(px(13.))
+                    .text_color(theme::rgb(theme::TEXT_FAINT))
+                    .child(if self.svg_zoom.natural.is_none() { "Invalid SVG" } else { "" })
+                    .into_any_element(),
+            };
+            (toolbar, body)
+        });
+        let (svg_toolbar, svg_body) = match svg_view {
+            Some((t, b)) => (t, Some(b)),
+            None => (None, None),
+        };
         let fp = (self.doc.selection.anchor, self.doc.selection.head, self.doc.version(), self.diagnostics.len());
         if fp != self.ide_fingerprint {
             self.ide_fingerprint = fp;
@@ -2062,6 +2120,7 @@ impl Render for EditorView {
                         .gap(px(2.))
                         .px(px(10.))
                         .pt(px(6.))
+                        .when_some(svg_toolbar, |d, t| d.child(t).child(div().flex_1()))
                         .child(md_toggle("md-live", if csv { "Table" } else if svg { "Preview" } else { "Live" }, on).on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
                             if !on {
                                 this.toggle_markdown_live(&ToggleMarkdownLive, w, cx)
@@ -2084,11 +2143,14 @@ impl Render for EditorView {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .cursor(CursorStyle::IBeam)
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-                    .on_mouse_move(cx.listener(Self::mouse_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+                    .when(!svg_mode, |d| {
+                        d.cursor(CursorStyle::IBeam)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+                            .on_mouse_move(cx.listener(Self::mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+                            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+                    })
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if !*hovered {
                             this.clear_lsp_hover(cx);
@@ -2097,17 +2159,8 @@ impl Render for EditorView {
                             }
                         }
                     }))
-                    .on_scroll_wheel(cx.listener(Self::scroll_wheel))
-                    .child(if self.svg_preview && self.is_svg() {
-                        div()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .p(px(24.))
-                            .bg(theme::rgb(0x1d1f23))
-                            .child(gpui::img(self.svg_image()).size_full().object_fit(gpui::ObjectFit::ScaleDown))
-                            .into_any_element()
+                    .child(if let Some(body) = svg_body {
+                        div().size_full().flex().child(body).into_any_element()
                     } else if self.markdown_live {
                         crate::markdown_live::MarkdownElement { view: focused_editor }.into_any_element()
                     } else {
@@ -2685,5 +2738,11 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].len, 3);
         assert_eq!(runs[0].color, theme::rgb(theme::syntax_color("keyword")));
+    }
+}
+
+impl crate::zoom_view::Zoomable for EditorView {
+    fn zoom_pan(&mut self) -> &mut crate::zoom_view::ZoomPan {
+        &mut self.svg_zoom
     }
 }
