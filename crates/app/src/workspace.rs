@@ -7,9 +7,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable, MouseButton,
+    AnyElement, AnyWindowHandle, App, ClickEvent, Context, Entity, FocusHandle, Focusable, MouseButton,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, PromptLevel, Render, SharedString,
-    Subscription, Task, Window, WindowBounds, WindowHandle, actions, div, point, prelude::*, px, uniform_list,
+    Subscription, Task, Window, WindowBounds, WindowHandle, actions, div, prelude::*, px, uniform_list,
 };
 use project_search::{IndexedFile, Root, list_files};
 use terminal_engine::{SessionConfig, TermDims, TerminalSession};
@@ -228,6 +228,8 @@ pub struct Workspace {
     context_menu: Option<ContextMenu>,
     /// "+" on the terminal tab bar: Terminal / Claude Code / the project's SSH servers.
     new_tab_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// Project dropdown under the sidebar title (anchor position).
+    project_menu: Option<gpui::Point<gpui::Pixels>>,
     name_prompt: Option<NamePrompt>,
     sidebar_mode: SidebarMode,
     /// Repaints the Claude sessions board every second while it's visible.
@@ -387,6 +389,7 @@ impl Workspace {
             window_title: String::new(),
             context_menu: None,
             new_tab_menu: None,
+            project_menu: None,
             name_prompt: None,
             sidebar_mode: SidebarMode::Files,
             board_tick: None,
@@ -2175,14 +2178,16 @@ impl Workspace {
         true
     }
 
-    /// Open `id` (None = empty) in a new window, cascaded from this one.
+    /// Open `id` (None = empty) in a new window, filling this window's screen from its top-left.
     fn open_project_window(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.persist(cx);
         let pending = self.pending_launch.take().filter(|(pid, _)| Some(pid) == id.as_ref());
         let mut state = self.store.load();
         state.active_project = id;
-        let b = window.bounds();
-        let bounds = Bounds::new(point(b.origin.x + px(28.), b.origin.y + px(28.)), b.size);
+        let bounds = match window.display(cx).or_else(|| cx.primary_display()) {
+            Some(d) => d.bounds(),
+            None => window.bounds(),
+        };
         let store = StateStore::new(self.store.path().parent().map(Path::to_path_buf).unwrap_or_default());
         cx.defer(move |cx| match crate::open_workspace_window(store, state, bounds, false, cx) {
             Ok(handle) => {
@@ -2216,6 +2221,12 @@ impl Workspace {
 
     /// Ask before leaving a project that has live terminals or unsaved files.
     fn request_switch_project(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_or_new_window(id, false, window, cx);
+    }
+
+    /// Switch to `id` or open it in a new window. `always_ask`: offer "New Window" even when
+    /// nothing would be lost by switching (project dropdown in the title).
+    fn switch_or_new_window(&mut self, id: String, always_ask: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.active_project.as_deref() == Some(id.as_str()) {
             return;
         }
@@ -2232,7 +2243,7 @@ impl Workspace {
             .get(&old)
             .map(|t| t.tabs.iter().filter(|e| e.read(cx).is_dirty()).cloned().collect())
             .unwrap_or_default();
-        if terminals == 0 && dirty.is_empty() {
+        if terminals == 0 && dirty.is_empty() && !always_ask {
             self.switch_project(&id, window, cx);
             return;
         }
@@ -2253,7 +2264,7 @@ impl Workspace {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Switch to “{new_name}”?"),
-            Some(&detail),
+            (!detail.is_empty()).then_some(detail.as_str()),
             &["Switch", "New Window", "Cancel"],
             cx,
         );
@@ -2749,6 +2760,61 @@ impl Workspace {
                 this.open_claude(Some(cwd), None, w, cx);
             })));
         Some(gpui::deferred(gpui::anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
+    }
+
+    fn render_project_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let position = self.project_menu?;
+        let active = self.state.active_project.clone();
+        let projects: Vec<(String, String, Option<PathBuf>)> = self.state.projects.iter().map(|p| (p.id.clone(), p.name.clone(), p.icon_path())).collect();
+        let mut list = div()
+            .id("project-menu")
+            .w(px(260.))
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(theme::rgb(0x202227))
+            .border_1()
+            .border_color(theme::rgb(0x33363d))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.project_menu = None;
+                cx.notify();
+            }));
+        for (ix, (id, name, icon_path)) in projects.into_iter().enumerate() {
+            let current = active.as_deref() == Some(id.as_str());
+            list = list.child(
+                div()
+                    .id(("project-menu-item", ix))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(28.))
+                    .px(px(8.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(theme::rgb(theme::TEXT))
+                    .when(current, |d| d.bg(theme::rgb(theme::HOVER)))
+                    .hover(|s| s.bg(theme::rgb(theme::BRAND_DEEP)))
+                    .child(match icon_path {
+                        Some(path) => gpui::img(path).size(px(16.)).flex_none().rounded(px(3.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                        None => icon("icons/project-empty.svg", theme::TEXT_MUTED),
+                    })
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(name))
+                    .when(current, |d| d.child(gpui::svg().path("icons/check.svg").size(px(12.)).flex_none().text_color(theme::rgb(theme::ACCENT))))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, w, cx| {
+                        this.project_menu = None;
+                        cx.notify();
+                        if !current {
+                            this.switch_or_new_window(id.clone(), true, w, cx);
+                        }
+                    })),
+            );
+        }
+        Some(gpui::deferred(gpui::anchored().position(position).snap_to_window_with_margin(px(8.)).child(list)).with_priority(1).into_any_element())
     }
 
     fn render_new_tab_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3629,6 +3695,7 @@ impl Workspace {
         }
         // Active project's icon + name next to the traffic lights.
         let title_project = self.active_project().map(|p| (p.icon_path(), SharedString::from(p.name.clone())));
+        let menu_open = self.project_menu.is_some();
         div()
             .flex()
             .flex_col()
@@ -3653,21 +3720,43 @@ impl Workspace {
                         }
                     })
                     .when_some(title_project, |d, (icon_path, name)| {
-                        d.child(match icon_path {
-                            Some(path) => gpui::img(path).size(px(18.)).flex_none().rounded(px(4.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
-                            None => icon("icons/project-empty.svg", theme::TEXT_MUTED),
-                        })
-                        .child(
+                        d.child(
                             div()
-                                .flex_1()
+                                .id("project-switcher")
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
                                 .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_size(px(14.))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme::rgb(theme::TEXT))
-                                .child(name),
+                                .h(px(28.))
+                                .px(px(6.))
+                                .ml(px(-6.))
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .when(menu_open, |d| d.bg(theme::rgb(theme::HOVER)))
+                                .hover(|s| s.bg(theme::rgb(theme::HOVER)))
+                                .child(match icon_path {
+                                    Some(path) => gpui::img(path).size(px(18.)).flex_none().rounded(px(4.)).object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                                    None => icon("icons/project-empty.svg", theme::TEXT_MUTED),
+                                })
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(14.))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme::rgb(theme::TEXT))
+                                        .child(name),
+                                )
+                                .child(gpui::svg().path("icons/chevron-down.svg").size(px(11.)).flex_none().text_color(theme::rgb(theme::TEXT_FAINT)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    // Anchored under the switcher (it starts right after the traffic lights).
+                                    this.project_menu = if this.project_menu.is_some() { None } else { Some(gpui::point(px(74.), px(TOP_BAR_HEIGHT))) };
+                                    cx.notify();
+                                })),
                         )
                     }),
             )
@@ -4229,12 +4318,13 @@ impl Render for Workspace {
         let sidebar = self.sidebar_visible.then(|| self.render_sidebar(window, cx));
         let context_menu = self.render_context_menu(cx);
         let new_tab_menu = self.render_new_tab_menu(cx);
+        let project_menu = self.render_project_menu(cx);
         let name_prompt = self.render_name_prompt(cx);
         let center = self.render_editor_area(cx);
         let right = self.terminal_visible.then(|| self.render_terminal_panel(cx));
         let resizing = self.resizing_sidebar || self.resizing_terminal || self.resizing_actions;
         // Native video players sit above GPUI content: hide them while an overlay is open.
-        let overlay = self.palette.is_some() || self.quick_open.is_some() || self.usage.is_some() || self.music_search.is_some() || context_menu.is_some() || new_tab_menu.is_some() || name_prompt.is_some();
+        let overlay = self.palette.is_some() || self.quick_open.is_some() || self.usage.is_some() || self.music_search.is_some() || context_menu.is_some() || new_tab_menu.is_some() || project_menu.is_some() || name_prompt.is_some();
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -4457,6 +4547,7 @@ impl Render for Workspace {
             })
             .children(context_menu)
             .children(new_tab_menu)
+            .children(project_menu)
             .children(name_prompt)
             .when_some(self.quick_open.as_ref().map(|(q, _)| q.clone()), |d, qo| {
                 d.child(
