@@ -429,6 +429,8 @@ fn build_cmds(projects: &[ProjectEntry]) -> Vec<Cmd> {
 #[derive(Clone)]
 enum Item {
     Header(SharedString),
+    /// Calculator / currency answer: (copied value, shown result, interpretation).
+    Calc(String, String, String),
     Url(String),
     App(usize, Vec<usize>),
     Project(usize, Vec<usize>),
@@ -548,6 +550,14 @@ impl Launcher {
                 this.update_items(cx);
             });
         });
+        // Exchange rates for "1 usd to cop" (disk cache, refreshed when stale).
+        cx.spawn(async move |this, cx| {
+            let changed = cx.background_executor().spawn(async { crate::calc::refresh_rates() }).await;
+            if changed {
+                let _ = this.update(cx, |this, cx| this.update_items(cx));
+            }
+        })
+        .detach();
         let cmds = build_cmds(&sources.projects);
         let mut this = Self {
             input,
@@ -603,6 +613,9 @@ impl Launcher {
             };
             section(&mut items, title, v.into_iter().map(|(_, i)| Item::Cmd(i)).collect());
         } else {
+            if let Some(a) = crate::calc::answer(&query) {
+                items.push(Item::Calc(a.value, a.display, a.detail));
+            }
             if let Some(url) = as_url(&query) {
                 items.push(Item::Url(url));
             }
@@ -695,6 +708,7 @@ impl Launcher {
         match item {
             Item::Header(t) => format!("h{t}"),
             Item::Url(u) => format!("u{u}"),
+            Item::Calc(..) => "calc".into(),
             Item::App(i, _) => format!("a{i}"),
             Item::Project(i, _) => format!("p{i}"),
             Item::File(i, _) => format!("f{i}"),
@@ -739,6 +753,7 @@ impl Launcher {
         Some(match self.items.get(ix)? {
             Item::Header(_) => return None,
             Item::Url(u) => Pick::Open(u.clone()),
+            Item::Calc(v, ..) => Pick::Copy(v.clone()),
             Item::App(i, _) => Pick::App(self.apps[*i].path.clone()),
             Item::Project(i, _) => Pick::Project(self.projects[*i].id.clone(), ProjectAction::Open),
             Item::File(i, _) => Pick::File(self.files[*i].path.clone()),
@@ -883,6 +898,13 @@ impl Launcher {
         let (icon, title, subtitle, kind, drill): (gpui::AnyElement, StyledText, String, &str, bool) = match item {
             Item::Header(_) => unreachable!(),
             Item::Url(u) => (svg_icon("icons/external.svg", theme::ACCENT), plain(&format!("Open {u}")), String::new(), "Website", false),
+            Item::Calc(_, shown, detail) => (
+                div().text_size(px(16.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::rgb(theme::ACCENT)).child("=").into_any_element(),
+                StyledText::new(SharedString::from(shown.clone())).with_highlights([(0..shown.len(), HighlightStyle { font_weight: Some(gpui::FontWeight::SEMIBOLD), ..Default::default() })]),
+                detail.clone(),
+                "↵ copy",
+                false,
+            ),
             Item::App(i, p) => {
                 let a = &self.apps[*i];
                 let icon = if a.icon.exists() {

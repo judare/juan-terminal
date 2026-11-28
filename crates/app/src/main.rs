@@ -9,6 +9,7 @@ mod office;
 mod pdf_view;
 mod pptx_view;
 mod brave;
+mod calc;
 mod chat_view;
 mod claude_board;
 mod claude_bridge;
